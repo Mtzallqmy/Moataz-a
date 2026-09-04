@@ -96,5 +96,7 @@ async def telegram_webhook(
 
 
 if __name__ == "__main__":
-    # APP_PORT is supported locally; Railway injects PORT and config.py maps it automatically.
-    uvicorn.run("app.main:app", host=settings.app_host, port=settings.app_port, reload=False)
+    # Pass the ASGI app object directly. Using the import string here would import
+    # app.main a second time after `python -m app.main`, which re-creates the
+    # Dispatcher and tries to attach the same aiogram Router twice.
+    uvicorn.run(app, host=settings.app_host, port=settings.app_port, reload=False)
