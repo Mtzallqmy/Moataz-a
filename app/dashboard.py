@@ -15,11 +15,25 @@ from app.db import DownloadJob, JobStatus, SessionLocal, User, WorkerNode
 
 settings = get_settings()
 router = APIRouter()
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
-def require_admin(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+def _dashboard_ws_token() -> str:
+    # One optional password is enough for a simple deployment. A dedicated token can still be set.
+    return settings.dashboard_ws_token or settings.dashboard_password
+
+
+def require_admin(credentials: HTTPBasicCredentials | None = Depends(security)) -> str:
+    # No dashboard secret configured => dashboard is disabled, not exposed with a default password.
+    if not settings.dashboard_password:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dashboard disabled")
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     valid_user = secrets.compare_digest(credentials.username, settings.dashboard_username)
     valid_password = secrets.compare_digest(credentials.password, settings.dashboard_password)
     if not (valid_user and valid_password):
@@ -100,7 +114,7 @@ async def dashboard(request: Request, _: str = Depends(require_admin)):
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context={"app_name": settings.app_name, "ws_token": settings.dashboard_ws_token},
+        context={"app_name": settings.app_name, "ws_token": _dashboard_ws_token()},
     )
 
 
@@ -137,8 +151,9 @@ async def update_user_access(
 
 @router.websocket("/ws/jobs")
 async def jobs_ws(websocket: WebSocket):
+    expected = _dashboard_ws_token()
     token = websocket.query_params.get("token", "")
-    if not secrets.compare_digest(token, settings.dashboard_ws_token):
+    if not settings.dashboard_password or not expected or not secrets.compare_digest(token, expected):
         await websocket.close(code=4401)
         return
     await websocket.accept()
