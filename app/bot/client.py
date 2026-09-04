@@ -9,7 +9,10 @@ settings = get_settings()
 
 def create_bot() -> Bot:
     if settings.telegram_local_api_url:
-        api = TelegramAPIServer.from_base(settings.telegram_local_api_url.rstrip("/"), is_local=True)
+        api = TelegramAPIServer.from_base(
+            settings.telegram_local_api_url.rstrip("/"),
+            is_local=True,
+        )
         session = AiohttpSession(api=api)
         return Bot(settings.bot_token, session=session)
     return Bot(settings.bot_token)
