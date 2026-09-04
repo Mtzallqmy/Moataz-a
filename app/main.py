@@ -16,15 +16,17 @@ from app.config import get_settings
 from app.dashboard import router as dashboard_router
 from app.db import init_db
 
+RELEASE = "2026.09.04-telegram-fix"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 dispatcher = create_dispatcher()
 bot: Bot | None = None
 polling_task: asyncio.Task | None = None
+active_mode = "polling"
 
 
 async def _run_polling_forever(bot_instance: Bot) -> None:
-    """Keep polling alive without taking down the web process on transient API failures."""
+    """Keep polling alive without taking down the web process on Telegram API failures."""
     while True:
         try:
             await bot_instance.delete_webhook(drop_pending_updates=False)
@@ -35,8 +37,9 @@ async def _run_polling_forever(bot_instance: Bot) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Never log the request URL here because Telegram URLs contain the bot token.
             logger.warning(
-                "Telegram polling bootstrap failed with %s; retrying in 5 seconds",
+                "Telegram polling failed with %s; retrying in 5 seconds",
                 type(exc).__name__,
             )
             await asyncio.sleep(5)
@@ -44,12 +47,13 @@ async def _run_polling_forever(bot_instance: Bot) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    global bot, polling_task
+    global bot, polling_task, active_mode
     if not settings.bot_token.strip():
         raise RuntimeError("BOT_TOKEN is required")
 
     await init_db()
     bot = create_bot()
+    logger.info("Starting Moataz Media Bot release %s", RELEASE)
 
     use_webhook = settings.app_mode == "webhook" and bool(settings.webhook_base_url.strip())
     if use_webhook:
@@ -59,9 +63,19 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         }
         if settings.webhook_secret:
             webhook_kwargs["secret_token"] = settings.webhook_secret
-        await bot.set_webhook(settings.webhook_url, **webhook_kwargs)
+        try:
+            await bot.set_webhook(settings.webhook_url, **webhook_kwargs)
+            active_mode = "webhook"
+        except Exception as exc:
+            # An optional webhook setting must never make Railway crash.
+            logger.warning(
+                "Webhook setup failed with %s; falling back to polling",
+                type(exc).__name__,
+            )
+            active_mode = "polling"
+            polling_task = asyncio.create_task(_run_polling_forever(bot))
     else:
-        # Polling is the safe default. Missing/stale webhook variables cannot crash startup.
+        active_mode = "polling"
         polling_task = asyncio.create_task(_run_polling_forever(bot))
 
     try:
@@ -85,15 +99,16 @@ async def root():
     return {
         "name": settings.app_name,
         "status": "ok",
+        "release": RELEASE,
         "dashboard": "/dashboard",
-        "mode": "webhook" if settings.app_mode == "webhook" and settings.webhook_base_url else "polling",
+        "mode": active_mode,
         "queue": settings.queue_backend,
     }
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "release": RELEASE}
 
 
 @app.post("/telegram/webhook")
@@ -101,7 +116,7 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
-    if settings.app_mode != "webhook" or not settings.webhook_base_url:
+    if active_mode != "webhook":
         raise HTTPException(status_code=404, detail="Webhook mode disabled")
     if settings.webhook_secret and x_telegram_bot_api_secret_token != settings.webhook_secret:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
