@@ -11,7 +11,8 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.db import DownloadJob, JobStatus, SessionLocal, User, WorkerNode
+from app.db import DownloadJob, SessionLocal, User, WorkerNode
+from app.jobs import RUNNING_STATUSES
 
 settings = get_settings()
 router = APIRouter()
@@ -51,16 +52,7 @@ async def _snapshot() -> dict:
         active_jobs = await session.scalar(
             select(func.count())
             .select_from(DownloadJob)
-            .where(
-                DownloadJob.status.in_(
-                    [
-                        JobStatus.QUEUED.value,
-                        JobStatus.DOWNLOADING.value,
-                        JobStatus.PROCESSING.value,
-                        JobStatus.UPLOADING.value,
-                    ]
-                )
-            )
+            .where(DownloadJob.status.in_(list(RUNNING_STATUSES)))
         ) or 0
         user_count = await session.scalar(select(func.count()).select_from(User)) or 0
         jobs = (
