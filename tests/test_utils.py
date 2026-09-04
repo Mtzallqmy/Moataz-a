@@ -42,11 +42,11 @@ def test_media_url_rejects_ssrf_and_unknown_hosts():
     assert not validate_media_url("https://evil.example/youtube.com")
 
 
-def test_invalid_telegram_local_api_url_is_ignored():
-    settings = Settings(_env_file=None, telegram_local_api_url="Moataz ai")
-    assert settings.telegram_local_api_url == ""
+def test_stale_local_telegram_api_setting_is_ignored():
+    settings = Settings(_env_file=None, telegram_local_api_url="Moatax ai")
+    assert not hasattr(settings, "telegram_local_api_url")
 
 
-def test_valid_telegram_local_api_url_is_kept():
-    settings = Settings(_env_file=None, telegram_local_api_url="http://telegram-bot-api:8081/")
-    assert settings.telegram_local_api_url == "http://telegram-bot-api:8081"
+def test_invalid_app_mode_falls_back_to_polling():
+    settings = Settings(_env_file=None, app_mode="broken-value")
+    assert settings.app_mode == "polling"
