@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moataz-media-bot"
-version = "0.1.1"
-description = "Private bilingual Telegram media downloader with dashboard, progress tracking and FFmpeg clipping."
+version = "0.2.0"
+description = "Bilingual Telegram media manager with resilient jobs, progress tracking, retries, cancellation and FFmpeg clipping."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = {text = "MIT"}
