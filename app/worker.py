@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import func, select
@@ -24,7 +25,7 @@ from app.jobs import (
 )
 from app.queue import redis_settings
 from app.services.downloader import download_media
-from app.services.media import cut_media
+from app.services.media import cut_media, fit_media_for_upload
 from app.utils import progress_bar
 
 settings = get_settings()
@@ -178,14 +179,15 @@ async def _cleanup_loop() -> None:
                         )
                     )
                 )
-            cutoff = time.time() - 6 * 60 * 60
-            for path in settings.download_dir.iterdir():
-                if not path.is_dir() or not path.name.isdigit():
-                    continue
-                if int(path.name) in active_ids:
-                    continue
-                if path.stat().st_mtime < cutoff:
-                    shutil.rmtree(path, ignore_errors=True)
+            if settings.download_dir.exists():
+                cutoff = time.time() - 6 * 60 * 60
+                for path in settings.download_dir.iterdir():
+                    if not path.is_dir() or not path.name.isdigit():
+                        continue
+                    if int(path.name) in active_ids:
+                        continue
+                    if path.stat().st_mtime < cutoff:
+                        shutil.rmtree(path, ignore_errors=True)
         except Exception:
             pass
         await asyncio.sleep(30 * 60)
@@ -196,10 +198,10 @@ async def _download_with_retries(
     language: str,
     source_url: str,
     quality: str,
-    job_dir,
+    job_dir: Path,
     progress_hook,
     cancel_event: threading.Event,
-):
+) -> Path:
     for attempt in range(settings.job_max_retries + 1):
         if await _cancelled(job_id, cancel_event):
             raise JobCancelled
@@ -244,7 +246,7 @@ async def _download_with_retries(
     raise RuntimeError("Download retry loop exhausted")
 
 
-async def _upload_once(job_id: int, output) -> None:
+async def _upload_once(job_id: int, output: Path) -> None:
     chat_id = await _get_chat_id(job_id)
     bot = create_bot()
     try:
@@ -279,7 +281,7 @@ async def _upload_once(job_id: int, output) -> None:
 async def _upload_with_retries(
     job_id: int,
     language: str,
-    output,
+    output: Path,
     cancel_event: threading.Event,
 ) -> None:
     for attempt in range(settings.job_max_retries + 1):
@@ -319,6 +321,58 @@ async def _upload_with_retries(
             )
             await asyncio.sleep(delay)
     raise RuntimeError("Upload retry loop exhausted")
+
+
+async def _prepare_output_for_upload(
+    job_id: int,
+    language: str,
+    output: Path,
+    job_dir: Path,
+    cancel_event: threading.Event,
+) -> tuple[Path, int]:
+    raw_size = output.stat().st_size
+    if raw_size > settings.max_file_size_bytes:
+        raise RuntimeError(
+            f"Output is {raw_size / 1024 / 1024:.1f} MB, above MAX_FILE_SIZE_MB"
+        )
+
+    upload_limit = settings.telegram_upload_limit_bytes
+    if raw_size <= upload_limit:
+        return output, raw_size
+    if not settings.auto_compress_enabled:
+        raise RuntimeError("File exceeds the configured Telegram upload limit")
+
+    if await _cancelled(job_id, cancel_event):
+        raise JobCancelled
+    await set_job_status(
+        job_id,
+        JobStatus.PROCESSING,
+        event_message=f"adaptive upload fit; source_bytes={raw_size}; limit_bytes={upload_limit}",
+    )
+    await _edit_status(
+        job_id,
+        tr(language, "processing"),
+        reply_markup=_cancel_markup(job_id, language),
+    )
+
+    optimized = await fit_media_for_upload(
+        output,
+        upload_limit,
+        job_dir,
+        attempts=settings.media_compression_attempts,
+    )
+    if await _cancelled(job_id, cancel_event):
+        raise JobCancelled
+
+    optimized_size = optimized.stat().st_size
+    if optimized_size > upload_limit:
+        raise RuntimeError("File exceeds upload limit after adaptive compression")
+    await record_job_event(
+        job_id,
+        "MEDIA_OPTIMIZED",
+        f"before={raw_size}; after={optimized_size}; limit={upload_limit}",
+    )
+    return optimized, optimized_size
 
 
 async def process_download(ctx, job_id: int) -> None:
@@ -431,16 +485,13 @@ async def process_download(ctx, job_id: int) -> None:
         if await _cancelled(job_id, cancel_event):
             raise JobCancelled
 
-        file_size = output.stat().st_size
-        if file_size > settings.max_file_size_bytes:
-            raise RuntimeError(
-                f"Output is {file_size / 1024 / 1024:.1f} MB, above MAX_FILE_SIZE_MB"
-            )
-        if file_size > 49 * 1024 * 1024:
-            raise RuntimeError(
-                "File exceeds the conservative official Telegram Bot API upload limit. "
-                "Choose a smaller quality or clip."
-            )
+        output, file_size = await _prepare_output_for_upload(
+            job_id,
+            language,
+            output,
+            job_dir,
+            cancel_event,
+        )
 
         async with SessionLocal() as session:
             db_job = await session.get(DownloadJob, job_id)
