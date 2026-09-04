@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     progress_update_seconds: float = 2.0
     default_language: str = "ar"
 
+    # Job reliability. These are optional and have production-safe defaults.
+    job_max_retries: int = 2
+    job_retry_base_seconds: float = 5.0
+
     # Dashboard is optional. These defaults do not block the bot from starting.
     dashboard_username: str = "admin"
     dashboard_password: str = ""
@@ -79,6 +83,16 @@ class Settings(BaseSettings):
     @classmethod
     def validate_language(cls, value: str) -> str:
         return value if value in {"ar", "en"} else "ar"
+
+    @field_validator("job_max_retries")
+    @classmethod
+    def validate_job_max_retries(cls, value: int) -> int:
+        return max(0, min(int(value), 5))
+
+    @field_validator("job_retry_base_seconds")
+    @classmethod
+    def validate_retry_delay(cls, value: float) -> float:
+        return max(1.0, min(float(value), 60.0))
 
     @field_validator("database_url", mode="before")
     @classmethod
