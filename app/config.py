@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -71,6 +72,25 @@ class Settings(BaseSettings):
         if value not in {"polling", "webhook"}:
             raise ValueError("APP_MODE must be 'polling' or 'webhook'")
         return value
+
+    @field_validator("telegram_local_api_url", mode="before")
+    @classmethod
+    def validate_telegram_local_api_url(cls, value: str) -> str:
+        """Use a custom Bot API server only when it is an absolute HTTP(S) URL.
+
+        Railway projects often retain old optional variables. An accidental value such as
+        a service name must never replace Telegram's official API endpoint.
+        """
+        raw = str(value or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return ""
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return raw
 
     @field_validator("queue_backend")
     @classmethod
