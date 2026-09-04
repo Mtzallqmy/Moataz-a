@@ -15,7 +15,13 @@ from app.bot.client import create_bot
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, SessionLocal, User, WorkerNode, init_db
 from app.i18n import tr
-from app.jobs import RUNNING_STATUSES, classify_job_error, is_job_cancelled, record_job_event, set_job_status
+from app.jobs import (
+    RUNNING_STATUSES,
+    classify_job_error,
+    is_job_cancelled,
+    record_job_event,
+    set_job_status,
+)
 from app.queue import redis_settings
 from app.services.downloader import download_media
 from app.services.media import cut_media
@@ -197,6 +203,12 @@ async def _download_with_retries(
     for attempt in range(settings.job_max_retries + 1):
         if await _cancelled(job_id, cancel_event):
             raise JobCancelled
+        if attempt:
+            await set_job_status(
+                job_id,
+                JobStatus.DOWNLOADING,
+                event_message=f"retry {attempt} started",
+            )
         try:
             return await asyncio.to_thread(
                 download_media,
@@ -229,11 +241,6 @@ async def _download_with_retries(
                 reply_markup=_cancel_markup(job_id, language),
             )
             await asyncio.sleep(delay)
-            await set_job_status(
-                job_id,
-                JobStatus.DOWNLOADING,
-                event_message=f"retry {retry_number} started",
-            )
     raise RuntimeError("Download retry loop exhausted")
 
 
@@ -278,6 +285,12 @@ async def _upload_with_retries(
     for attempt in range(settings.job_max_retries + 1):
         if await _cancelled(job_id, cancel_event):
             raise JobCancelled
+        if attempt:
+            await set_job_status(
+                job_id,
+                JobStatus.UPLOADING,
+                event_message=f"upload retry {attempt} started",
+            )
         try:
             await _upload_once(job_id, output)
             return
@@ -305,7 +318,6 @@ async def _upload_with_retries(
                 reply_markup=_cancel_markup(job_id, language),
             )
             await asyncio.sleep(delay)
-            await set_job_status(job_id, JobStatus.UPLOADING, event_message="upload retry started")
     raise RuntimeError("Upload retry loop exhausted")
 
 
@@ -497,7 +509,11 @@ async def shutdown(ctx) -> None:
             except asyncio.CancelledError:
                 pass
     if ctx.get("worker_id"):
-        await _heartbeat_once(ctx["worker_id"], ctx.get("hostname", "unknown"), status="OFFLINE")
+        await _heartbeat_once(
+            ctx["worker_id"],
+            ctx.get("hostname", "unknown"),
+            status="OFFLINE",
+        )
 
 
 class WorkerSettings:
