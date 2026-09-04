@@ -8,6 +8,7 @@ from typing import Any
 import yt_dlp
 
 from app.config import get_settings
+from app.services.providers import available_qualities, format_selector, normalize_platform
 
 ProgressHook = Callable[[dict[str, Any]], None]
 settings = get_settings()
@@ -20,6 +21,9 @@ class MediaInfo:
     thumbnail: str | None
     platform: str
     qualities: list[int]
+    media_id: str | None = None
+    uploader: str | None = None
+    webpage_url: str | None = None
 
 
 def _base_options() -> dict[str, Any]:
@@ -27,9 +31,12 @@ def _base_options() -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
+        "socket_timeout": settings.ytdlp_socket_timeout_seconds,
+        "retries": settings.ytdlp_retries,
+        "fragment_retries": settings.ytdlp_fragment_retries,
+        "extractor_retries": settings.ytdlp_retries,
+        "concurrent_fragment_downloads": settings.ytdlp_concurrent_fragments,
+        "cachedir": False,
     }
     if settings.ytdlp_cookies_file:
         options["cookiefile"] = settings.ytdlp_cookies_file
@@ -51,35 +58,16 @@ def probe_media(url: str) -> MediaInfo:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = _single_info(ydl.extract_info(url, download=False))
 
-    qualities = sorted(
-        {
-            int(fmt["height"])
-            for fmt in info.get("formats") or []
-            if fmt.get("height") and fmt.get("vcodec") not in {None, "none"}
-        }
-    )
-    common = [q for q in (360, 480, 720, 1080, 1440, 2160) if q in qualities]
-    if not common and qualities:
-        common = qualities[-6:]
-
+    extractor_key = info.get("extractor_key") or info.get("extractor")
     return MediaInfo(
         title=(info.get("title") or "Untitled")[:500],
         duration=int(info["duration"]) if info.get("duration") else None,
         thumbnail=info.get("thumbnail"),
-        platform=(info.get("extractor_key") or info.get("extractor") or "unknown")[:32],
-        qualities=common,
-    )
-
-
-def _format_selector(quality: str) -> str:
-    if quality == "audio":
-        return "bestaudio/best"
-    if quality == "best":
-        return "bestvideo+bestaudio/best"
-    height = int(quality)
-    return (
-        f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]/bestvideo+bestaudio/best"
+        platform=normalize_platform(extractor_key, url),
+        qualities=available_qualities(info),
+        media_id=str(info.get("id"))[:128] if info.get("id") else None,
+        uploader=(info.get("uploader") or info.get("channel") or None),
+        webpage_url=info.get("webpage_url") or url,
     )
 
 
@@ -93,7 +81,7 @@ def download_media(
     opts = _base_options()
     opts.update(
         {
-            "format": _format_selector(quality),
+            "format": format_selector(quality),
             "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
             "merge_output_format": "mp4",
             "prefer_ffmpeg": True,
@@ -116,12 +104,13 @@ def download_media(
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
+    allowed_suffixes = {".mp3", ".m4a"} if quality == "audio" else {".mp4", ".mkv", ".webm"}
     candidates = [
         path
         for path in job_dir.iterdir()
         if path.is_file()
-        and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mp3", ".m4a"}
-        and not path.name.endswith(".part")
+        and path.suffix.lower() in allowed_suffixes
+        and not path.name.endswith((".part", ".ytdl"))
     ]
     if not candidates:
         raise RuntimeError("yt-dlp finished without a media output file")

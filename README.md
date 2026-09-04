@@ -1,252 +1,168 @@
-# Moataz Media Bot v0.2.0
+# Moataz Media Bot v0.3.0
 
-بوت Telegram عربي/إنجليزي لإدارة تنزيل ومعالجة الوسائط المسموح لك بتنزيلها من **YouTube** و**Facebook**. يعتمد على Python + aiogram + FastAPI + yt-dlp + FFmpeg، ويحتوي على نظام Jobs حقيقي، تقدم مباشر، إعادة محاولة ذكية، إلغاء المهام، سجل تنزيلات، وقاعدة بيانات PostgreSQL.
+بوت Telegram عربي/إنجليزي لتنزيل ومعالجة الوسائط التي تملك حق تنزيلها من **YouTube** و**Facebook**. يعتمد على Python 3.12 وaiogram وFastAPI وyt-dlp وFFmpeg، ويحتوي على Job System، Retry، إلغاء، قص، MP3، مراقبة Workers، Dashboard اختيارية، وتحسين تلقائي للملفات قبل إرسالها إلى Telegram.
 
-> استخدم المشروع فقط للمحتوى الذي تملكه أو لديك إذن بتنزيله أو تسمح المنصة/صاحب الحقوق بتنزيله. المشروع لا يهدف إلى تجاوز DRM أو الدفع أو الوصول غير المصرح به.
+> استخدم المشروع فقط للمحتوى الذي تملكه أو لديك إذن بتنزيله أو تسمح المنصة/صاحب الحقوق بتنزيله. المشروع لا يهدف إلى تجاوز DRM أو أنظمة الدفع أو الوصول غير المصرح به.
 
-## ما الجديد في v0.2.0 — المرحلة الأولى الموحّدة
+## v0.3.0 — المراحل 4 + 5 + 6
 
-تم دمج محاور **الاستقرار + Job System + تجربة Telegram** في إصدار واحد:
+تم تنفيذ المراحل الثلاث كحزمة واحدة بعد v0.2.0:
 
-- تشغيل Railway بسيط: المطلوب فقط `BOT_TOKEN` و`DATABASE_URL`.
-- Polling افتراضي؛ لا تحتاج Domain أو Webhook أو Redis.
-- Telegram API الرسمي مثبت صراحةً في جلسة aiogram.
-- أخطاء Telegram المؤقتة لا تسقط عملية الويب؛ Polling يعيد المحاولة في الخلفية.
-- دورة حياة Job واضحة:
-  `PENDING → ANALYZING → READY → QUEUED → DOWNLOADING → CUTTING → UPLOADING → COMPLETED`.
-- حالات إضافية: `RETRYING`, `FAILED`, `CANCELLED`، مع دعم الحالات القديمة في قاعدة البيانات.
-- جدول `job_events` جديد يسجل تاريخ انتقالات المهمة والأخطاء بدون تعديل مدمر للجداول الموجودة.
-- Retry انتقائي فقط للأخطاء المؤقتة مثل timeout / network / HTTP 429 و5xx.
-- الفيديو الخاص، الرابط غير الصالح، الصيغة غير المتاحة، FFmpeg، والملف الكبير لا تدخل Retry بلا فائدة.
-- Backoff تلقائي لإعادة المحاولة، افتراضيًا محاولتان إضافيتان.
-- زر إلغاء أثناء المهمة، مع إيقاف التنزيل في الـInline worker عند أول progress callback ممكن.
-- زر إعادة المحاولة يدويًا للمهام الفاشلة.
-- قائمة رئيسية عربية/إنجليزية.
-- `/jobs` و`📋 تحميلاتي` لعرض آخر المهام وحالتها.
-- حد المهام النشطة لكل مستخدم مطبق قبل بدء Job جديد.
-- Dashboard تحسب الحالات النشطة من نفس Job lifecycle الموحد.
-- GitHub Actions: تثبيت + Ruff + Pytest + compile check.
+### المرحلة 4 — Media Source Engine
 
-## المزايا
+- طبقة مصادر مستقلة لـYouTube وFacebook بدل الاعتماد على أسماء extractors الخام.
+- تطبيع اسم المنصة إلى `youtube` / `facebook`.
+- استخراج الجودات بصورة مستقرة وإخفاء تنسيقات الصوت من قائمة الفيديو.
+- اختيار Formats يفضّل MP4 + M4A المناسبة أكثر للإرسال والبث داخل Telegram، مع fallbacks لـyt-dlp.
+- إعدادات اختيارية لـsocket timeout، retries، fragment retries، وعدد التحميلات المتوازية للأجزاء.
+- لا تزال Cookies اختيارية ولا توجد أي أسرار إضافية مطلوبة للتشغيل العادي.
 
-- 🇸🇦 / 🇬🇧 عربية وإنجليزية.
+### المرحلة 5 — Adaptive Media Delivery
+
+- فصل حد الملف الداخلي عن حد الإرسال إلى Telegram.
+- الحد الداخلي الافتراضي: `MAX_FILE_SIZE_MB=512`.
+- ميزانية الإرسال الافتراضية المحافظة: `TELEGRAM_UPLOAD_LIMIT_MB=49`.
+- إذا تجاوز الفيديو/الصوت ميزانية الإرسال، يتم استخدام FFprobe لحساب المدة ثم FFmpeg لضبط bitrate والجودة تلقائيًا.
+- الفيديو يتحول إلى MP4/H.264 + AAC مع `faststart`.
+- الصوت الكبير يمكن ضغطه إلى MP3 بbitrate مناسب.
+- إذا احتاج الملف أكثر من محاولة للوصول للحجم المطلوب، يتم تعديل bitrate تلقائيًا ضمن عدد محاولات محدود.
+- يمكن تعطيل ذلك عبر `AUTO_COMPRESS_ENABLED=false`.
+
+### المرحلة 6 — Production Operations & Recovery
+
+- Endpoint جديد: `/readyz` يفحص PostgreSQL/SQLite + FFmpeg + FFprobe.
+- `/healthz` يبقى Liveness سريعًا ولا يعتمد على خدمات خارجية.
+- عند إعادة تشغيل خدمة تستخدم `QUEUE_BACKEND=inline`، لا تبقى المهام القديمة عالقة في حالة Running؛ يتم إنهاؤها كـ`FAILED / INTERRUPTED` لتكون قابلة لإعادة المحاولة بدل أن تبقى Stuck.
+- Workers التي يتوقف Heartbeat الخاص بها تُعلّم `OFFLINE` تلقائيًا.
+- Dashboard API تعرض إحصاءات completed/failed وWorker/file metadata إضافية.
+- API محمية للوحة التحكم لعرض آخر 100 حدث لمهمة محددة: `/api/jobs/{job_id}/events`.
+- سجل `job_events` يبقى Append-only ولا يتطلب Migration مدمرة لجدول المهام الحالي.
+
+## أهم المزايا
+
+- 🇸🇦 / 🇬🇧 واجهة Telegram بالعربية والإنجليزية.
 - 🔎 تحليل الرابط قبل التنزيل.
-- 📺 الجودات المتاحة: 360p / 480p / 720p / 1080p / 1440p / 2160p عند توفرها.
+- 📺 اختيار 360p / 480p / 720p / 1080p / 1440p / 2160p عند توفرها.
 - ⭐ أفضل جودة متاحة.
 - 🎵 استخراج MP3.
-- ✂️ قص الفيديو بواسطة FFmpeg.
-- 📊 نسبة التحميل والسرعة وETA.
+- ✂️ قص الفيديو عبر FFmpeg.
+- 📊 تقدم مباشر: النسبة، السرعة وETA.
 - ❌ إلغاء المهمة.
-- 🔄 Retry تلقائي للأخطاء المؤقتة + Retry يدوي.
-- 📋 سجل آخر التنزيلات.
-- 🗃 PostgreSQL للمستخدمين والمهام والأحداث.
-- ⚡ Queue داخلية افتراضيًا؛ Redis اختياري فقط للتوزيع المتقدم.
-- 🖥 Dashboard اختيارية.
-- 🔒 Allowlist اختيارية.
-- 🐳 Docker / Docker Compose.
-- 🚂 Railway-ready.
-- 🛡 URL validation وتقليل مخاطر SSRF.
+- 🔄 Retry تلقائي انتقائي + Retry يدوي.
+- 📋 `/jobs` وسجل آخر التنزيلات.
+- 🗃 PostgreSQL للمستخدمين والمهام والأحداث والWorkers.
+- ⚡ Queue داخلية افتراضيًا؛ Redis + ARQ اختياريان للتوزيع المتقدم.
+- 🖥 Dashboard اختيارية ومعطلة إذا لم تضبط كلمة مرور.
+- 🛡 URL allowlist لـYouTube/Facebook وتقليل مخاطر SSRF.
+- ✅ GitHub Actions: Ruff + Pytest + compile check.
 
 ---
 
 # أسرع نشر على Railway
 
-## المتغيرات المطلوبة فقط
+## المطلوب فقط
 
 ```env
 BOT_TOKEN=123456789:YOUR_TELEGRAM_BOT_TOKEN
 DATABASE_URL=postgresql://...
 ```
 
-كل ما عدا ذلك **اختياري**.
-
-### 1) أنشئ PostgreSQL
-
-داخل مشروع Railway:
+كل ما عدا ذلك اختياري. الوضع الافتراضي:
 
 ```text
-+ New → Database → PostgreSQL
+APP_MODE=polling
+QUEUE_BACKEND=inline
+AUTO_COMPRESS_ENABLED=true
 ```
 
-ثم في Variables لخدمة البوت:
+لذلك لا تحتاج Redis أو Webhook أو Public Domain أو Worker منفصل في النشر الأساسي.
+
+### Railway
+
+1. اربط المستودع بخدمة Railway.
+2. أضف PostgreSQL.
+3. أضف في Variables:
 
 ```env
 BOT_TOKEN=توكن_البوت
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 ```
 
-التطبيق يقبل رابط Railway العادي `postgresql://...` ويحوّله تلقائيًا إلى AsyncPG.
+4. Deploy.
 
-### 2) Deploy
-
-المستودع:
+عند تشغيل الإصدار الحالي يظهر في Logs:
 
 ```text
-https://github.com/Mtzallqmy/Moataz-a
+Starting Moataz Media Bot release 0.3.0-phase456
 ```
 
-المشروع يحتوي على `Dockerfile` و`railway.json`. الوضع الافتراضي:
-
-```text
-APP_MODE=polling
-QUEUE_BACKEND=inline
-```
-
-لذلك لا تحتاج Redis أو Webhook URL أو Public URL أو Worker منفصل.
-
-عند تشغيل الإصدار الصحيح سيظهر في logs:
-
-```text
-Starting Moataz Media Bot release 0.2.0-phase1
-```
-
-ثم افتح البوت وأرسل:
-
-```text
-/start
-```
+ثم افتح البوت وأرسل `/start`.
 
 ---
 
-# تجربة Telegram
-
-القائمة الرئيسية:
+# دورة حياة المهمة
 
 ```text
-🎬 إرسال رابط       📋 تحميلاتي
-🌐 اللغة            ℹ️ مساعدة
-```
-
-بعد إرسال الرابط:
-
-```text
-🔎 جاري تحليل الرابط...
-```
-
-ثم يعرض العنوان والمنصة والمدة ورقم المهمة والجودات المتاحة.
-
-أثناء التنزيل يتم تعديل نفس الرسالة تقريبًا بهذا الشكل:
-
-```text
-⬇️ التحميل 54.2%
-██████████░░░░░░░░
-⚡ 7.8 MB/s
-⏳ 00:09
-
-[ ❌ إلغاء المهمة ]
-```
-
-إذا حدث خطأ شبكة مؤقت:
-
-```text
-🔄 مشكلة مؤقتة في التنزيل. إعادة المحاولة 1/2...
-```
-
-وإذا انتهت المهمة بالفشل يظهر Error Code وزر:
-
-```text
-[ 🔄 إعادة المحاولة ]
-```
-
----
-
-# Job lifecycle
-
-الحالات الأساسية:
-
-```text
-PENDING
 ANALYZING
+  ↓
 READY
+  ↓
 QUEUED
-RETRYING
+  ↓
 DOWNLOADING
-MERGING
-CUTTING
+  ↓
+CUTTING / PROCESSING   (عند الحاجة)
+  ↓
 UPLOADING
+  ↓
 COMPLETED
-FAILED
-CANCELLED
 ```
 
-الحالتان القديمتان `PROBING` و`PROCESSING` بقيتا مدعومتين لقراءة بيانات الإصدارات السابقة.
-
-كل Job يسجل أحداثه في جدول مستقل:
+مع الحالات:
 
 ```text
-job_events
-├── job_id
-├── event_type
-├── message
-└── created_at
+RETRYING / FAILED / CANCELLED
 ```
 
-إضافة هذا الجدول لا تتطلب حذف قاعدة Railway الحالية أو إعادة إنشائها.
+`PROCESSING` في v0.3.0 يشمل أيضًا مرحلة تهيئة ملف كبير لميزانية إرسال Telegram.
 
 ---
 
-# Retry policy
-
-الإعدادات الافتراضية:
+# إعدادات Media Engine الاختيارية
 
 ```env
-JOB_MAX_RETRIES=2
-JOB_RETRY_BASE_SECONDS=5
+YTDLP_SOCKET_TIMEOUT_SECONDS=30
+YTDLP_RETRIES=2
+YTDLP_FRAGMENT_RETRIES=3
+YTDLP_CONCURRENT_FRAGMENTS=4
+YTDLP_COOKIES_FILE=
 ```
 
-وهما اختياريان بالكامل.
+لا تضف Cookies إلا للمحتوى الذي يحق لك الوصول إليه. لا ترفع Cookies أو Tokens أو `.env` إلى GitHub.
 
-Retry تلقائي متوقع مع:
-
-- Network / connection failures
-- timeout
-- HTTP 429
-- HTTP 500 / 502 / 503 / 504
-- أخطاء Telegram الشبكية المؤقتة
-
-ولا يتم التكرار تلقائيًا عادةً مع:
-
-- فيديو خاص أو يحتاج تسجيل دخول
-- رابط غير مدعوم
-- فيديو محذوف/غير متاح
-- جودة غير متاحة
-- FFmpeg processing error
-- ملف أكبر من حد الإرسال
-- خطأ مجهول غير مصنف كخطأ مؤقت
-
-التأخير يستخدم exponential backoff: 5 ثوانٍ ثم 10 ثوانٍ افتراضيًا.
-
----
-
-# قص الفيديو
-
-1. أرسل رابطًا.
-2. اختر `✂️ Cut / قص`.
-3. أرسل المدى:
-
-```text
-00:00:10-00:00:45
-```
-
-تدخل المهمة `QUEUED` ثم `DOWNLOADING` ثم `CUTTING` ثم `UPLOADING`.
-
----
-
-# حدود Telegram الحالية
-
-الإصدار البسيط يستخدم Telegram Bot API الرسمي، ولذلك الحد المحافظ الافتراضي للمخرجات هو:
+# إعدادات الملفات والإرسال الاختيارية
 
 ```env
-MAX_FILE_SIZE_MB=49
+MAX_FILE_SIZE_MB=512
+TELEGRAM_UPLOAD_LIMIT_MB=49
+AUTO_COMPRESS_ENABLED=true
+MEDIA_COMPRESSION_ATTEMPTS=2
 ```
 
-إذا كانت الجودة تنتج ملفًا أكبر، اختر جودة أقل أو قص مقطعًا أقصر.
+`MAX_FILE_SIZE_MB` هو حد العمل الداخلي قبل محاولة التحسين. `TELEGRAM_UPLOAD_LIMIT_MB` هو ميزانية الإرسال التي يحاول النظام تهيئة الملف لها.
 
 ---
 
-# الخصوصية — اختيارية
+# الخصوصية / Allowlist — اختياري
 
-بدون IDs يكون البوت مفتوحًا لمن يعرف رابطه. لجعله خاصًا:
+ترك القيم التالية فارغة يعني أن البوت متاح لمن يعرفه:
+
+```env
+ADMIN_TELEGRAM_IDS=
+ALLOWED_TELEGRAM_IDS=
+```
+
+لجعله خاصًا:
 
 ```env
 ADMIN_TELEGRAM_IDS=123456789
@@ -257,90 +173,80 @@ ALLOWED_TELEGRAM_IDS=123456789,987654321
 
 # Dashboard — اختيارية
 
-اللوحة معطلة ما لم تضع كلمة مرور:
+اللوحة معطلة افتراضيًا. لتفعيلها:
 
 ```env
-DASHBOARD_PASSWORD=strong-password
+DASHBOARD_PASSWORD=ضع_كلمة_مرور_قوية
 ```
 
-اسم المستخدم الافتراضي:
-
-```text
-admin
-```
-
-يمكن تغييره عبر:
+واختياريًا:
 
 ```env
-DASHBOARD_USERNAME=myadmin
+DASHBOARD_USERNAME=admin
+DASHBOARD_WS_TOKEN=secret-for-websocket
 ```
 
-ثم افتح:
+المسارات:
 
 ```text
-https://YOUR-DOMAIN/dashboard
+/dashboard
+/api/dashboard
+/api/jobs/{job_id}/events
 ```
+
+# Health / Readiness
+
+```text
+GET /healthz
+GET /readyz
+```
+
+`/healthz` يثبت أن عملية الويب تعمل. `/readyz` يتحقق من قاعدة البيانات ووجود FFmpeg وFFprobe داخل بيئة التشغيل.
 
 ---
 
-# Redis / Workers — اختياري ومتقدم
+# Redis وWorkers متعددة — اختياري
 
-الوضع الافتراضي لا يحتاج Redis:
+النشر العادي لا يحتاج Redis:
 
 ```env
 QUEUE_BACKEND=inline
 ```
 
-للتوزيع لاحقًا:
+للتوزيع المتقدم:
 
 ```env
 QUEUE_BACKEND=redis
 REDIS_URL=redis://...
 ```
 
-وتشغيل Worker منفصل:
+ثم شغّل Worker:
 
 ```bash
 arq app.worker.WorkerSettings
 ```
 
-الـWorker يحتاج نفس `BOT_TOKEN` و`DATABASE_URL` و`REDIS_URL`.
+يجب أن يشارك Worker نفس `BOT_TOKEN` و`DATABASE_URL` و`REDIS_URL`.
 
 ---
 
-# Cookies — اختيارية
+# Webhook — اختياري
 
-لبعض المحتوى المصرح لك بالوصول إليه قد تحتاج ملف Cookies:
+Polling هو الوضع الافتراضي. لتفعيل Webhook:
 
 ```env
-YTDLP_COOKIES_FILE=/run/secrets/cookies.txt
+APP_MODE=webhook
+WEBHOOK_BASE_URL=https://your-domain.example
+WEBHOOK_SECRET=long-random-secret
 ```
 
-لا ترفع Cookies أو Tokens أو `.env` إلى GitHub.
+المسار:
 
----
+```text
+/telegram/webhook
+```
 
-# أهم متغيرات البيئة
-
-| Variable | Default | Required |
-|---|---:|---:|
-| `BOT_TOKEN` | — | نعم |
-| `DATABASE_URL` | SQLite محليًا | نعم على Railway |
-| `APP_MODE` | `polling` | لا |
-| `QUEUE_BACKEND` | `inline` | لا |
-| `MAX_CONCURRENT_JOBS` | `2` | لا |
-| `MAX_JOBS_PER_USER` | `1` | لا |
-| `MAX_VIDEO_DURATION_SECONDS` | `14400` | لا |
-| `MAX_FILE_SIZE_MB` | `49` | لا |
-| `PROGRESS_UPDATE_SECONDS` | `2` | لا |
-| `JOB_MAX_RETRIES` | `2` | لا |
-| `JOB_RETRY_BASE_SECONDS` | `5` | لا |
-| `DEFAULT_LANGUAGE` | `ar` | لا |
-| `REDIS_URL` | فارغ | لا |
-| `DASHBOARD_PASSWORD` | فارغ | لا |
-| `YTDLP_COOKIES_FILE` | فارغ | لا |
-
-راجع `.env.example` لبقية القيم الاختيارية.
+إذا فشل إعداد Webhook عند الإقلاع، يعود التطبيق إلى Polling بدل إسقاط خدمة Railway.
 
 ---
 
@@ -350,50 +256,23 @@ YTDLP_COOKIES_FILE=/run/secrets/cookies.txt
 cp .env.example .env
 ```
 
-ثم ضع على الأقل:
+أقل إعداد:
 
 ```env
-BOT_TOKEN=YOUR_TOKEN
+BOT_TOKEN=123456:YOUR_TOKEN
 DATABASE_URL=sqlite+aiosqlite:///./moataz.db
 ```
 
-وشغّل:
+ثم:
 
 ```bash
 docker build -t moataz-media-bot .
 docker run --rm --env-file .env -p 8000:8000 moataz-media-bot
 ```
 
-أو للبنية المتقدمة:
-
-```bash
-docker compose up --build
-```
+أو استخدم `docker-compose.yml` للبنية التي تتضمن PostgreSQL وRedis وWorker منفصل.
 
 ---
-
-# هيكل المشروع
-
-```text
-app/
-├── bot/
-│   ├── access.py
-│   ├── client.py
-│   └── handlers.py
-├── services/
-│   ├── downloader.py
-│   └── media.py
-├── config.py
-├── dashboard.py
-├── db.py
-├── i18n.py
-├── jobs.py
-├── main.py
-├── queue.py
-├── security.py
-├── utils.py
-└── worker.py
-```
 
 # الاختبارات
 
@@ -404,8 +283,8 @@ pytest -q
 python -m compileall -q app
 ```
 
-GitHub Actions تنفذ هذه الفحوص تلقائيًا عند كل Push وPull Request.
+GitHub Actions تنفذها تلقائيًا عند كل Push وPull Request.
 
 ## License
 
-MIT
+MIT.
