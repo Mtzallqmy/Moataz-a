@@ -1,248 +1,304 @@
-# Moataz Media Bot — بوت تحميل ومعالجة وسائط خاص
+# Moataz Media Bot — بوت تحميل ومعالجة الوسائط
 
-بوت Telegram خاص ومفتوح المصدر مبني ببايثون لتحليل وتنزيل الوسائط المسموح لك بتنزيلها من **YouTube** و**Facebook**، مع اختيار الجودة، MP3، قص الفيديو عبر FFmpeg، نسبة تقدم مباشرة، Queue منفصلة، ولوحة تحكم Glassmorphism عربية/إنجليزية.
+بوت Telegram عربي/إنجليزي مبني ببايثون لتنزيل ومعالجة الوسائط المسموح لك بتنزيلها من **YouTube** و**Facebook**، مع اختيار الجودة، استخراج MP3، قص الفيديو عبر FFmpeg، وعرض تقدم التحميل.
 
-> **الاستخدام المسؤول:** استخدم المشروع فقط لتنزيل المحتوى الذي تملكه، أو لديك إذن بتنزيله، أو تسمح المنصة/صاحب الحقوق بتنزيله. لا يهدف المشروع لتجاوز DRM أو أنظمة الدفع أو الوصول إلى محتوى غير مصرح به.
+> **الاستخدام المسؤول:** استخدم المشروع فقط للمحتوى الذي تملكه، أو لديك إذن بتنزيله، أو تسمح المنصة/صاحب الحقوق بتنزيله. المشروع لا يهدف إلى تجاوز DRM أو أنظمة الدفع أو الوصول إلى محتوى غير مصرح به.
 
 ## المزايا
 
-- 🇸🇦 / 🇬🇧 واجهة Telegram عربية وإنجليزية.
-- 🔒 Allowlist خاصة لمجموعة صغيرة من المستخدمين.
-- 🎬 تحليل الرابط قبل التنزيل وعرض الجودات المتاحة.
-- 📺 اختيار 360p / 480p / 720p / 1080p / 1440p / 2160p عندما تكون متاحة.
+- 🇸🇦 / 🇬🇧 واجهة Telegram بالعربية والإنجليزية.
+- 🎬 تحليل الرابط وعرض الجودات المتاحة قبل التنزيل.
+- 📺 دعم 360p / 480p / 720p / 1080p / 1440p / 2160p عندما تكون متاحة.
 - 🎵 استخراج MP3.
-- ✂️ قص دقيق للفيديو بواسطة FFmpeg.
-- 📊 تقدم التحميل: النسبة، السرعة وETA.
-- 🧵 Redis + ARQ لفصل معالجة الفيديو عن Webhook/API.
-- 🗃 PostgreSQL لحفظ المستخدمين والمهام والحالة.
-- 🖥 Dashboard زجاجي متجاوب مع تحديث حي عبر WebSocket.
-- 🟢 Worker heartbeat مع عرض العقد المتصلة والمهام النشطة.
+- ✂️ قص الفيديو بواسطة FFmpeg.
+- 📊 نسبة التحميل والسرعة وETA.
+- ⚡ Queue داخلية افتراضيًا: **لا تحتاج Redis أو Worker منفصل**.
+- 🗃 PostgreSQL لحفظ المستخدمين والمهام.
+- 🖥 Dashboard اختيارية بتصميم Glassmorphism.
+- 🔒 Allowlist اختيارية للمستخدمين.
+- 🌐 Polling افتراضيًا: **لا تحتاج Domain أو Webhook**.
 - 🐳 Docker + Docker Compose.
-- 🌐 Polling للتجربة السريعة أو Webhook للإنتاج.
-- 🧰 دعم تشغيل أكثر من Worker على خوادم مختلفة باستخدام Redis/PostgreSQL مشتركين.
-- 🛡 Allowlist للدومينات وتقليل مخاطر SSRF.
+- 🚂 إعداد جاهز لـRailway.
+- 🧰 Redis + ARQ متاحان اختياريًا للتوزيع على Workers متعددة.
+- 🛡 فحص الروابط وتقليل مخاطر SSRF.
 - ✅ GitHub Actions للاختبارات وRuff وcompile check.
 
-## المعمارية
+---
 
-```text
-Telegram
-   │
-   ├── Polling (development)
-   │
-   └── HTTPS Webhook (production)
-            │
-            ▼
-      FastAPI + aiogram
-            │
-            ├──────────────► Dashboard / WebSocket
-            │
-            ▼
-          Redis
-            │
-            ▼
-       ARQ Worker(s)
-            │
-      ┌─────┴─────┐
-      ▼           ▼
-   yt-dlp       FFmpeg
-      │           │
-      └─────┬─────┘
-            ▼
-        Telegram
+# أسرع تشغيل على Railway
 
-FastAPI / Worker ────────── PostgreSQL
-```
+## المطلوب فقط
 
-## تشغيل سريع باستخدام Docker
-
-### 1) إنشاء البوت
-
-من Telegram افتح `@BotFather`، أنشئ بوتًا واحصل على `BOT_TOKEN`.
-
-للحصول على Telegram numeric user ID استخدم أي طريقة موثوقة لديك ثم ضعه في `ADMIN_TELEGRAM_IDS` و`ALLOWED_TELEGRAM_IDS`.
-
-### 2) إعداد البيئة
-
-```bash
-cp .env.example .env
-```
-
-عدّل أهم القيم:
+في النشر العادي تحتاج **متغيرين فقط**:
 
 ```env
-BOT_TOKEN=123456:YOUR_TOKEN
-APP_MODE=polling
-ADMIN_TELEGRAM_IDS=123456789
-ALLOWED_TELEGRAM_IDS=123456789,987654321
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=use-a-long-random-password
-DASHBOARD_WS_TOKEN=use-another-long-random-value
+BOT_TOKEN=123456789:YOUR_TELEGRAM_BOT_TOKEN
+DATABASE_URL=postgresql://...
 ```
 
-### 3) التشغيل
+جميع المتغيرات الأخرى اختيارية.
 
-```bash
-docker compose up -d --build
-```
+## 1. أنشئ البوت
 
-الحالة:
+من Telegram افتح `@BotFather` وأنشئ Bot ثم انسخ الـToken.
 
-```bash
-docker compose ps
-```
+## 2. اربط المستودع بـRailway
 
-السجلات:
-
-```bash
-docker compose logs -f api worker
-```
-
-لوحة التحكم:
+المستودع:
 
 ```text
-http://SERVER_IP:8000/dashboard
+https://github.com/Mtzallqmy/Moataz-a
 ```
 
-ستظهر نافذة HTTP Basic Auth؛ استخدم `DASHBOARD_USERNAME` و`DASHBOARD_PASSWORD`.
+المشروع يحتوي على `railway.json` و`Dockerfile`، وسيستخدم Railway صورة Python 3.12 مع FFmpeg تلقائيًا.
 
-## وضع Webhook للإنتاج
+## 3. أضف PostgreSQL في Railway
 
-تحتاج إلى Domain وHTTPS. يمكن استخدام Caddy أو Nginx أو Cloudflare Tunnel.
+من مشروع Railway:
+
+```text
++ New → Database → PostgreSQL
+```
+
+ثم في خدمة البوت افتح **Variables** وضع:
+
+```env
+BOT_TOKEN=توكن_البوت
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+```
+
+إذا كان اسم خدمة قاعدة البيانات مختلفًا عن `Postgres` استخدم اسمها الفعلي في Railway، أو انسخ `DATABASE_URL` مباشرة.
+
+> التطبيق يقبل رابط Railway العادي `postgresql://...` ويحوّله تلقائيًا إلى صيغة AsyncPG المطلوبة؛ لا تحتاج تعديل الرابط يدويًا.
+
+## 4. Redeploy
+
+هذا كل شيء. الوضع الافتراضي هو:
+
+```text
+APP_MODE=polling
+QUEUE_BACKEND=inline
+```
+
+لذلك لا تحتاج:
+
+- Redis
+- Webhook URL
+- Webhook Secret
+- Public URL
+- Worker Service
+- Admin Telegram ID
+- Dashboard Password
+
+Railway يرسل متغير `PORT` تلقائيًا والتطبيق يستخدمه مباشرة.
+
+بعد نجاح النشر افتح Bot في Telegram وأرسل `/start`.
+
+---
+
+# الخصوصية / Allowlist — اختياري
+
+إذا لم تضبط أي IDs فالبوت يعمل لكل من يعرف رابطه.
+
+لجعله خاصًا ضع مثلًا:
+
+```env
+ADMIN_TELEGRAM_IDS=123456789
+ALLOWED_TELEGRAM_IDS=123456789,987654321
+```
+
+يمكن وضع أكثر من ID مفصولًا بفاصلة.
+
+---
+
+# لوحة التحكم — اختيارية
+
+الـDashboard **معطلة افتراضيًا** حتى لا يكون هناك Password افتراضي مكشوف.
+
+لتفعيلها يكفي متغير واحد:
+
+```env
+DASHBOARD_PASSWORD=ضع_كلمة_مرور_قوية
+```
+
+اسم المستخدم الافتراضي:
+
+```text
+admin
+```
+
+ويمكن تغييره اختياريًا:
+
+```env
+DASHBOARD_USERNAME=myadmin
+```
+
+ثم افتح:
+
+```text
+https://YOUR-RAILWAY-DOMAIN/dashboard
+```
+
+`DASHBOARD_WS_TOKEN` اختياري بالكامل؛ إذا لم تضبطه يستخدم التطبيق كلمة مرور الداشبورد لحماية WebSocket.
+
+---
+
+# Webhook — اختياري
+
+Polling هو الوضع الافتراضي والأبسط على Railway.
+
+إذا أردت Webhook لاحقًا:
 
 ```env
 APP_MODE=webhook
-WEBHOOK_BASE_URL=https://bot.example.com
-WEBHOOK_SECRET=VERY_LONG_RANDOM_SECRET
-PUBLIC_BASE_URL=https://bot.example.com
+WEBHOOK_BASE_URL=https://your-domain.example
+WEBHOOK_SECRET=long-random-secret
 ```
 
-المسار الذي يسجله التطبيق تلقائيًا عند البدء:
+المسار:
 
 ```text
-https://bot.example.com/telegram/webhook
+/telegram/webhook
 ```
 
-ويتحقق التطبيق من هيدر Telegram السري قبل معالجة Update.
+`WEBHOOK_SECRET` مستحسن أمنيًا، لكنه ليس مطلوبًا في Polling.
 
-يوجد `Caddyfile` بسيط في المستودع كنقطة بداية.
+---
 
-## تشغيل بدون Docker للتطوير
+# Redis وWorkers متعددة — اختياري ومتقدم
 
-يلزم Python 3.12+ وFFmpeg وRedis وPostgreSQL، أو يمكن استخدام SQLite محليًا.
+لا تحتاج Redis في النشر العادي.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-cp .env.example .env
-```
-
-للتجربة المحلية السريعة غيّر:
+المشروع يشغل المهام داخل نفس خدمة التطبيق افتراضيًا:
 
 ```env
-DATABASE_URL=sqlite+aiosqlite:///./moataz.db
-REDIS_URL=redis://localhost:6379/0
-APP_MODE=polling
+QUEUE_BACKEND=inline
 ```
 
-ثم شغّل الطرفين:
+إذا أردت لاحقًا عدة Workers على أكثر من سيرفر، أضف Redis واضبط:
 
-```bash
-python -m app.main
+```env
+QUEUE_BACKEND=redis
+REDIS_URL=redis://...
 ```
 
-وفي Terminal آخر:
+ثم شغّل Worker منفصلًا:
 
 ```bash
 arq app.worker.WorkerSettings
 ```
 
-## قص الفيديو
+ويجب أن يستخدم الـWorker نفس:
 
-1. أرسل الرابط.
+```text
+BOT_TOKEN
+DATABASE_URL
+REDIS_URL
+```
+
+---
+
+# تشغيل Docker محليًا
+
+انسخ ملف البيئة:
+
+```bash
+cp .env.example .env
+```
+
+أقل إعداد ممكن:
+
+```env
+BOT_TOKEN=123456:YOUR_TOKEN
+DATABASE_URL=sqlite+aiosqlite:///./moataz.db
+```
+
+ثم:
+
+```bash
+docker build -t moataz-media-bot .
+docker run --rm --env-file .env -p 8000:8000 moataz-media-bot
+```
+
+أو استخدم `docker-compose.yml` للبنية المتقدمة التي تتضمن PostgreSQL وRedis وWorker منفصل.
+
+---
+
+# قص الفيديو
+
+1. أرسل رابط YouTube أو Facebook.
 2. اضغط `✂️ Cut / قص`.
-3. أرسل المدى:
+3. أرسل المدى مثل:
 
 ```text
 00:00:10-00:00:45
 ```
 
-يقوم Worker بتنزيل نسخة مناسبة ثم يعيد ترميز المقطع إلى MP4/H.264 + AAC لضمان دقة نقطة البداية والنهاية وتوافق جيد.
+سيتم تنزيل الفيديو ومعالجة المقطع عبر FFmpeg ثم إرساله إلى Telegram.
 
-## أكثر من Worker / أكثر من سيرفر
+---
 
-المشروع جاهز أفقيًا. أبقِ API/PostgreSQL/Redis في الخادم الرئيسي، وعلى أي VPS أو جهاز ثانٍ شغّل Worker مع **نفس** `DATABASE_URL` و`REDIS_URL` و`BOT_TOKEN`.
+# الملفات الكبيرة
 
-```bash
-arq app.worker.WorkerSettings
-```
+بدون `TELEGRAM_LOCAL_API_URL` يطبق التطبيق حدًا محافظًا على الملفات المرفوعة عبر Telegram Bot API.
 
-ARQ سيقوم بتوزيع Jobs المتاحة بين Workers. لا تجعل مجلد التنزيل Shared؛ كل Worker يستخدم مجلده المؤقت المحلي ثم يرفع الناتج إلى Telegram.
-
-> في Docker Compose الحالي `media_data` مشترك فقط بين `api` و`worker` على نفس الجهاز، مع أن API لا يعتمد عليه فعليًا.
-
-## الملفات الكبيرة وLocal Telegram Bot API
-
-يمكنك توجيه aiogram إلى Telegram Bot API Server محلي عبر:
+يمكن لاحقًا توجيه التطبيق إلى Local Telegram Bot API Server:
 
 ```env
 TELEGRAM_LOCAL_API_URL=http://telegram-bot-api:8081
 ```
 
-عند عدم ضبطه، يطبق Worker حدًا محافظًا للرفع عبر Bot API الرسمي ويطلب منك اختيار جودة أصغر إذا كان الملف كبيرًا. تشغيل Telegram Bot API Server نفسه يعتمد على بيئة استضافتك ويتطلب إعدادات Telegram المناسبة؛ لذلك لم يتم فرض Image معينة داخل `docker-compose.yml` حتى لا نربط المشروع بصورة Docker غير موثوقة أو إعداد واحد فقط.
+هذا الإعداد اختياري ولا يؤثر على تشغيل البوت الأساسي.
 
-## Cookies لـ yt-dlp
+---
 
-بعض المحتوى المصرح لك بالوصول إليه قد يحتاج جلسة متصفح. يمكن Mount ملف cookies إلى الحاوية ثم ضبط:
+# yt-dlp Cookies — اختياري
+
+بعض المحتوى المصرح لك بالوصول إليه قد يحتاج جلسة متصفح. يمكن Mount ملف cookies ثم ضبط:
 
 ```env
 YTDLP_COOKIES_FILE=/run/secrets/cookies.txt
 ```
 
-لا ترفع cookies أو Tokens أو `.env` إلى GitHub. `.gitignore` يمنع `.env`، لكن مسؤولية الأسرار تبقى عليك.
+لا ترفع Cookies أو Tokens أو `.env` إلى GitHub.
 
-## أهم متغيرات البيئة
+---
+
+# متغيرات البيئة
+
+## المطلوبة للإنتاج
 
 | Variable | الاستخدام |
 |---|---|
-| `BOT_TOKEN` | Telegram bot token |
-| `WORKER_NAME` | اسم اختياري ثابت للـWorker في الداشبورد |
-| `APP_MODE` | `polling` أو `webhook` |
-| `WEBHOOK_BASE_URL` | عنوان HTTPS العام في webhook mode |
-| `WEBHOOK_SECRET` | Secret للتحقق من Webhook |
-| `ADMIN_TELEGRAM_IDS` | IDs للمشرفين |
-| `ALLOWED_TELEGRAM_IDS` | Allowlist أولية |
-| `DATABASE_URL` | PostgreSQL/SQLite async URL |
-| `REDIS_URL` | Redis DSN |
-| `DOWNLOAD_DIR` | الملفات المؤقتة |
-| `MAX_CONCURRENT_JOBS` | عدد Jobs المتزامنة لكل Worker |
-| `MAX_JOBS_PER_USER` | الحد الأقصى للمهام النشطة لكل مستخدم |
-| `MAX_VIDEO_DURATION_SECONDS` | الحد الأقصى لمدة الفيديو |
-| `MAX_FILE_SIZE_MB` | حد الملف النهائي |
-| `PROGRESS_UPDATE_SECONDS` | معدل تعديل رسالة Telegram |
-| `TELEGRAM_LOCAL_API_URL` | Bot API Server محلي اختياري |
-| `YTDLP_COOKIES_FILE` | Cookies اختياري |
+| `BOT_TOKEN` | Telegram Bot Token |
+| `DATABASE_URL` | رابط PostgreSQL؛ Railway URLs مدعومة مباشرة |
 
-## الأمان
+## الاختيارية
 
-- الروابط مقيدة حاليًا إلى YouTube/Facebook/fb.watch بدل قبول أي URL عشوائي.
-- IP addresses و`file://` غير مقبولة.
-- Webhook يتحقق من `X-Telegram-Bot-Api-Secret-Token`.
-- Dashboard محمي بـHTTP Basic Auth.
-- لا يتم تمرير URL للمستخدم عبر `shell=True`.
-- FFmpeg يستقبل Arguments مباشرة عبر subprocess.
-- الأسرار محصورة في `.env`.
+| Variable | Default | الاستخدام |
+|---|---|---|
+| `APP_MODE` | `polling` | `polling` أو `webhook` |
+| `QUEUE_BACKEND` | `inline` | `inline` أو `redis` |
+| `REDIS_URL` | فارغ | فقط عند استخدام Redis Queue |
+| `ADMIN_TELEGRAM_IDS` | فارغ | IDs للمشرفين / تفعيل الوضع الخاص |
+| `ALLOWED_TELEGRAM_IDS` | فارغ | Allowlist |
+| `DASHBOARD_USERNAME` | `admin` | مستخدم لوحة التحكم |
+| `DASHBOARD_PASSWORD` | فارغ | تفعيل وحماية Dashboard |
+| `DASHBOARD_WS_TOKEN` | فارغ | Secret منفصل اختياري للـWebSocket |
+| `WEBHOOK_BASE_URL` | فارغ | HTTPS URL في webhook mode |
+| `WEBHOOK_SECRET` | فارغ | حماية Webhook |
+| `TELEGRAM_LOCAL_API_URL` | فارغ | Telegram Bot API محلي |
+| `MAX_CONCURRENT_JOBS` | `2` | عدد التنزيلات المتزامنة |
+| `MAX_JOBS_PER_USER` | `1` | عدد المهام النشطة لكل مستخدم |
+| `MAX_VIDEO_DURATION_SECONDS` | `14400` | أقصى مدة فيديو |
+| `MAX_FILE_SIZE_MB` | `1900` | الحد الأعلى الداخلي للملف |
+| `PROGRESS_UPDATE_SECONDS` | `2` | معدل تحديث رسالة التقدم |
+| `DEFAULT_LANGUAGE` | `ar` | `ar` أو `en` |
+| `YTDLP_COOKIES_FILE` | فارغ | مسار Cookies اختياري |
 
-يفضل في الإنتاج أيضًا:
+---
 
-- Firewall يسمح فقط بـ80/443 وSSH من عنوانك عند الإمكان.
-- HTTPS إجباري.
-- كلمات مرور عشوائية طويلة.
-- تحديث Docker images والحزم دوريًا.
-- Backup لقاعدة PostgreSQL.
-
-## هيكل المشروع
+# هيكل المشروع
 
 ```text
 app/
@@ -268,7 +324,7 @@ app/
 └── worker.py
 ```
 
-## الاختبارات
+# الاختبارات
 
 ```bash
 pip install -e '.[dev]'
@@ -277,17 +333,7 @@ pytest -q
 python -m compileall -q app
 ```
 
-GitHub Actions ينفذها تلقائيًا عند Push وPull Request.
-
-## English quick start
-
-```bash
-cp .env.example .env
-# set BOT_TOKEN, ADMIN_TELEGRAM_IDS, ALLOWED_TELEGRAM_IDS and dashboard passwords
-docker compose up -d --build
-```
-
-Use `APP_MODE=polling` first. For production, put the app behind HTTPS and switch to `APP_MODE=webhook` with `WEBHOOK_BASE_URL=https://your-domain`.
+GitHub Actions تنفذ الاختبارات تلقائيًا عند كل Push وPull Request.
 
 ## License
 
