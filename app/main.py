@@ -8,6 +8,7 @@ import uvicorn
 from aiogram import Bot
 from aiogram.types import Update
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.bot import create_dispatcher
@@ -15,13 +16,19 @@ from app.bot.client import create_bot
 from app.config import get_settings
 from app.dashboard import router as dashboard_router
 from app.db import init_db
+from app.operations import (
+    fail_interrupted_inline_jobs,
+    mark_stale_workers_offline,
+    readiness_snapshot,
+)
 
-RELEASE = "0.2.0-phase1"
+RELEASE = "0.3.0-phase456"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 dispatcher = create_dispatcher()
 bot: Bot | None = None
 polling_task: asyncio.Task | None = None
+maintenance_task: asyncio.Task | None = None
 active_mode = "polling"
 
 
@@ -45,13 +52,31 @@ async def _run_polling_forever(bot_instance: Bot) -> None:
             await asyncio.sleep(5)
 
 
+async def _maintenance_loop() -> None:
+    while True:
+        try:
+            await mark_stale_workers_offline()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Maintenance pass failed with %s", type(exc).__name__)
+        await asyncio.sleep(30)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    global bot, polling_task, active_mode
+    global bot, polling_task, maintenance_task, active_mode
     if not settings.bot_token.strip():
         raise RuntimeError("BOT_TOKEN is required")
 
     await init_db()
+    if settings.queue_backend == "inline":
+        interrupted = await fail_interrupted_inline_jobs()
+        if interrupted:
+            logger.warning("Closed %s interrupted inline jobs after restart", len(interrupted))
+    await mark_stale_workers_offline()
+    maintenance_task = asyncio.create_task(_maintenance_loop())
+
     bot = create_bot()
     logger.info("Starting Moataz Media Bot release %s", RELEASE)
 
@@ -81,10 +106,11 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     try:
         yield
     finally:
-        if polling_task:
-            polling_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await polling_task
+        for task in (polling_task, maintenance_task):
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         if bot:
             await bot.session.close()
 
@@ -103,12 +129,23 @@ async def root():
         "dashboard": "/dashboard",
         "mode": active_mode,
         "queue": settings.queue_backend,
+        "adaptive_upload": settings.auto_compress_enabled,
     }
 
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "release": RELEASE}
+
+
+@app.get("/readyz")
+async def readyz():
+    checks = await readiness_snapshot()
+    status_code = 200 if checks["ok"] else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "ready" if checks["ok"] else "not_ready", "release": RELEASE, **checks},
+    )
 
 
 @app.post("/telegram/webhook")
