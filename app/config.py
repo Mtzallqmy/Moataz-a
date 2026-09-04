@@ -1,6 +1,5 @@
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlparse
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -9,14 +8,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # The only value that is always required at runtime.
+    # Required for Telegram.
     bot_token: str = ""
 
     # Telegram / networking. Polling works without a public URL or webhook configuration.
     app_mode: str = "polling"
     webhook_base_url: str = ""
     webhook_secret: str = ""
-    telegram_local_api_url: str = ""
 
     # Empty lists mean open access. Set either list only when you want a private bot.
     admin_telegram_ids: str = ""
@@ -32,7 +30,7 @@ class Settings(BaseSettings):
     max_concurrent_jobs: int = 2
     max_jobs_per_user: int = 1
     max_video_duration_seconds: int = 14400
-    max_file_size_mb: int = 1900
+    max_file_size_mb: int = 49
     progress_update_seconds: float = 2.0
     default_language: str = "ar"
 
@@ -69,28 +67,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_mode(cls, value: str) -> str:
         value = value.lower().strip()
-        if value not in {"polling", "webhook"}:
-            raise ValueError("APP_MODE must be 'polling' or 'webhook'")
-        return value
-
-    @field_validator("telegram_local_api_url", mode="before")
-    @classmethod
-    def validate_telegram_local_api_url(cls, value: str) -> str:
-        """Use a custom Bot API server only when it is an absolute HTTP(S) URL.
-
-        Railway projects often retain old optional variables. An accidental value such as
-        a service name must never replace Telegram's official API endpoint.
-        """
-        raw = str(value or "").strip().rstrip("/")
-        if not raw:
-            return ""
-        try:
-            parsed = urlparse(raw)
-        except ValueError:
-            return ""
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return ""
-        return raw
+        return value if value in {"polling", "webhook"} else "polling"
 
     @field_validator("queue_backend")
     @classmethod
