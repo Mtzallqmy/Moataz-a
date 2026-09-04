@@ -11,7 +11,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.db import DownloadJob, SessionLocal, User, WorkerNode
+from app.db import DownloadJob, JobEvent, JobStatus, SessionLocal, User, WorkerNode
 from app.jobs import RUNNING_STATUSES
 
 settings = get_settings()
@@ -54,6 +54,16 @@ async def _snapshot() -> dict:
             .select_from(DownloadJob)
             .where(DownloadJob.status.in_(list(RUNNING_STATUSES)))
         ) or 0
+        completed_jobs = await session.scalar(
+            select(func.count())
+            .select_from(DownloadJob)
+            .where(DownloadJob.status == JobStatus.COMPLETED.value)
+        ) or 0
+        failed_jobs = await session.scalar(
+            select(func.count())
+            .select_from(DownloadJob)
+            .where(DownloadJob.status == JobStatus.FAILED.value)
+        ) or 0
         user_count = await session.scalar(select(func.count()).select_from(User)) or 0
         jobs = (
             await session.scalars(select(DownloadJob).order_by(DownloadJob.id.desc()).limit(30))
@@ -63,7 +73,13 @@ async def _snapshot() -> dict:
             await session.scalars(select(WorkerNode).order_by(WorkerNode.last_seen.desc()).limit(20))
         ).all()
         return {
-            "stats": {"total_jobs": total_jobs, "active_jobs": active_jobs, "users": user_count},
+            "stats": {
+                "total_jobs": total_jobs,
+                "active_jobs": active_jobs,
+                "completed_jobs": completed_jobs,
+                "failed_jobs": failed_jobs,
+                "users": user_count,
+            },
             "jobs": [
                 {
                     "id": job.id,
@@ -75,6 +91,8 @@ async def _snapshot() -> dict:
                     "speed": job.speed or "—",
                     "eta": job.eta or "—",
                     "error": job.error,
+                    "worker_id": job.worker_id,
+                    "file_size": job.file_size,
                 }
                 for job in jobs
             ],
@@ -113,6 +131,34 @@ async def dashboard(request: Request, _: str = Depends(require_admin)):
 @router.get("/api/dashboard")
 async def dashboard_data(_: str = Depends(require_admin)):
     return await _snapshot()
+
+
+@router.get("/api/jobs/{job_id}/events")
+async def dashboard_job_events(job_id: int, _: str = Depends(require_admin)):
+    async with SessionLocal() as session:
+        job = await session.get(DownloadJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        events = list(
+            await session.scalars(
+                select(JobEvent)
+                .where(JobEvent.job_id == job_id)
+                .order_by(JobEvent.id.desc())
+                .limit(100)
+            )
+        )
+    return {
+        "job_id": job_id,
+        "events": [
+            {
+                "id": event.id,
+                "type": event.event_type,
+                "message": event.message,
+                "created_at": event.created_at.isoformat() if event.created_at else None,
+            }
+            for event in events
+        ],
+    }
 
 
 @router.post("/dashboard/users")
