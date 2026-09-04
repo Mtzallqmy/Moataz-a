@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import shutil
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 
 from app.db import DownloadJob, JobEvent, JobStatus, SessionLocal, WorkerNode
-
 
 INTERRUPTED_INLINE_STATUSES = {
     JobStatus.PENDING.value,
