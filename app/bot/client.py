@@ -1,4 +1,6 @@
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import PRODUCTION
 
 from app.config import get_settings
 
@@ -6,9 +8,10 @@ settings = get_settings()
 
 
 def create_bot() -> Bot:
-    """Create the Telegram bot using the official Bot API endpoint.
+    """Create a bot session pinned to Telegram's official production API.
 
-    The simple deployment intentionally ignores TELEGRAM_LOCAL_API_URL so stale or
-    malformed optional Railway variables can never replace api.telegram.org.
+    The API server is supplied explicitly so stale Railway variables or previous
+    local Bot API configuration cannot replace https://api.telegram.org.
     """
-    return Bot(settings.bot_token)
+    session = AiohttpSession(api=PRODUCTION)
+    return Bot(token=settings.bot_token, session=session)
