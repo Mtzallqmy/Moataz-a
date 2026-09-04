@@ -7,13 +7,21 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.bot.access import ensure_user, is_allowed
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, SessionLocal, User
-from app.i18n import tr
-from app.queue import enqueue_download
+from app.i18n import status_label, tr
+from app.jobs import (
+    RUNNING_STATUSES,
+    TERMINAL_STATUSES,
+    classify_job_error,
+    count_user_running_jobs,
+    record_job_event,
+    set_job_status,
+)
+from app.queue import cancel_download, enqueue_download
 from app.security import validate_media_url
 from app.services.downloader import probe_media
 from app.utils import parse_time, seconds_to_hms
@@ -26,18 +34,51 @@ class CutState(StatesGroup):
     waiting_range = State()
 
 
-def language_keyboard() -> InlineKeyboardMarkup:
+def main_menu_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=tr(language, "send_link_button"),
+                    callback_data="menu:send",
+                ),
+                InlineKeyboardButton(
+                    text=tr(language, "jobs_button"),
+                    callback_data="menu:jobs",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=tr(language, "language_button"),
+                    callback_data="menu:lang",
+                ),
+                InlineKeyboardButton(
+                    text=tr(language, "help_button"),
+                    callback_data="menu:help",
+                ),
+            ],
+        ]
+    )
+
+
+def language_keyboard(language: str = "ar") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🇸🇦 العربية", callback_data="lang:ar"),
                 InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text=tr(language, "back_button"),
+                    callback_data="menu:home",
+                )
+            ],
         ]
     )
 
 
-def quality_keyboard(job_id: int, qualities: list[int]) -> InlineKeyboardMarkup:
+def quality_keyboard(job_id: int, qualities: list[int], language: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     buttons = [
         InlineKeyboardButton(text=f"{quality}p", callback_data=f"q:{job_id}:{quality}")
@@ -52,7 +93,28 @@ def quality_keyboard(job_id: int, qualities: list[int]) -> InlineKeyboardMarkup:
         ]
     )
     rows.append([InlineKeyboardButton(text="✂️ Cut / قص", callback_data=f"cut:{job_id}")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=tr(language, "cancel_button"),
+                callback_data=f"cancel:{job_id}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def cancel_keyboard(job_id: int, language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=tr(language, "cancel_button"),
+                    callback_data=f"cancel:{job_id}",
+                )
+            ]
+        ]
+    )
 
 
 async def _user_for_message(message: Message) -> User | None:
@@ -64,13 +126,45 @@ async def _user_for_message(message: Message) -> User | None:
     return await ensure_user(message.from_user.id, message.from_user.username)
 
 
+async def _user_for_callback(callback: CallbackQuery) -> User | None:
+    if not callback.from_user or not await is_allowed(callback.from_user.id):
+        await callback.answer("Private bot", show_alert=True)
+        return None
+    return await ensure_user(callback.from_user.id, callback.from_user.username)
+
+
+async def _recent_jobs_text(user: User, limit: int = 8) -> str:
+    async with SessionLocal() as session:
+        jobs = list(
+            await session.scalars(
+                select(DownloadJob)
+                .where(DownloadJob.user_id == user.id)
+                .order_by(DownloadJob.id.desc())
+                .limit(limit)
+            )
+        )
+    if not jobs:
+        return tr(user.language, "jobs_empty")
+    lines = []
+    for job in jobs:
+        title = (job.title or "Untitled").replace("\n", " ").strip()[:42]
+        quality = job.selected_quality or "—"
+        lines.append(
+            f"#{job.id} • {status_label(user.language, job.status)}\n"
+            f"{title}\n"
+            f"{job.platform} • {quality}"
+        )
+    return tr(user.language, "jobs_header", jobs="\n\n".join(lines))
+
+
 @router.message(CommandStart())
 async def start(message: Message) -> None:
     user = await _user_for_message(message)
     if not user:
         return
     await message.answer(
-        tr(user.language, "welcome", name=settings.app_name), reply_markup=language_keyboard()
+        tr(user.language, "welcome", name=settings.app_name),
+        reply_markup=main_menu_keyboard(user.language),
     )
 
 
@@ -79,11 +173,83 @@ async def help_command(message: Message) -> None:
     user = await _user_for_message(message)
     if not user:
         return
-    text = (
-        "أرسل رابط YouTube/Facebook ثم اختر الجودة. يمكنك أيضًا اختيار زر القص.\n"
-        "Send a YouTube/Facebook URL, choose a quality, or use the clip button."
+    await message.answer(tr(user.language, "help"), reply_markup=main_menu_keyboard(user.language))
+
+
+@router.message(Command("jobs"))
+async def jobs_command(message: Message) -> None:
+    user = await _user_for_message(message)
+    if not user:
+        return
+    await message.answer(
+        await _recent_jobs_text(user),
+        reply_markup=main_menu_keyboard(user.language),
     )
-    await message.answer(text)
+
+
+@router.callback_query(F.data == "menu:home")
+async def menu_home(callback: CallbackQuery) -> None:
+    user = await _user_for_callback(callback)
+    if not user:
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            tr(user.language, "welcome", name=settings.app_name),
+            reply_markup=main_menu_keyboard(user.language),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:send")
+async def menu_send(callback: CallbackQuery) -> None:
+    user = await _user_for_callback(callback)
+    if not user:
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            tr(user.language, "send_link_prompt"),
+            reply_markup=main_menu_keyboard(user.language),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:jobs")
+async def menu_jobs(callback: CallbackQuery) -> None:
+    user = await _user_for_callback(callback)
+    if not user:
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            await _recent_jobs_text(user),
+            reply_markup=main_menu_keyboard(user.language),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:help")
+async def menu_help(callback: CallbackQuery) -> None:
+    user = await _user_for_callback(callback)
+    if not user:
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            tr(user.language, "help"),
+            reply_markup=main_menu_keyboard(user.language),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:lang")
+async def menu_language(callback: CallbackQuery) -> None:
+    user = await _user_for_callback(callback)
+    if not user:
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            tr(user.language, "language_button"),
+            reply_markup=language_keyboard(user.language),
+        )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("lang:"))
@@ -102,7 +268,12 @@ async def set_language(callback: CallbackQuery) -> None:
         else:
             user.language = language
             await session.commit()
-    await callback.answer(tr(language, "language_changed"), show_alert=True)
+    if callback.message:
+        await callback.message.edit_text(
+            tr(language, "welcome", name=settings.app_name),
+            reply_markup=main_menu_keyboard(language),
+        )
+    await callback.answer(tr(language, "language_changed"))
 
 
 @router.message(F.text.regexp(r"^https?://"))
@@ -122,49 +293,57 @@ async def analyze_url(message: Message) -> None:
             chat_id=message.chat.id,
             progress_message_id=progress.message_id,
             source_url=url,
-            status=JobStatus.PROBING.value,
+            status=JobStatus.ANALYZING.value,
         )
         session.add(job)
         await session.commit()
         await session.refresh(job)
         job_id = job.id
+    await record_job_event(job_id, JobStatus.ANALYZING.value, "URL received")
 
     try:
         info = await asyncio.to_thread(probe_media, url)
         if info.duration and info.duration > settings.max_video_duration_seconds:
-            async with SessionLocal() as session:
-                db_job = await session.get(DownloadJob, job_id)
-                db_job.status = JobStatus.FAILED.value
-                db_job.error = "Duration limit exceeded"
-                await session.commit()
+            await set_job_status(
+                job_id,
+                JobStatus.FAILED,
+                error="MEDIA_TOO_LONG: Duration limit exceeded",
+                event_message="MEDIA_TOO_LONG",
+            )
             await progress.edit_text(tr(user.language, "too_long"))
             return
 
         async with SessionLocal() as session:
             db_job = await session.get(DownloadJob, job_id)
+            if not db_job or db_job.status == JobStatus.CANCELLED.value:
+                return
             db_job.title = info.title
             db_job.duration = info.duration
             db_job.thumbnail = info.thumbnail
             db_job.platform = info.platform
             db_job.status = JobStatus.READY.value
             await session.commit()
+        await record_job_event(job_id, JobStatus.READY.value, f"qualities={info.qualities}")
 
         await progress.edit_text(
             tr(
                 user.language,
                 "choose_quality",
                 title=info.title,
+                platform=info.platform,
                 duration=seconds_to_hms(info.duration),
+                job_id=job_id,
             ),
-            reply_markup=quality_keyboard(job_id, info.qualities),
+            reply_markup=quality_keyboard(job_id, info.qualities, user.language),
         )
     except Exception as exc:
-        async with SessionLocal() as session:
-            db_job = await session.get(DownloadJob, job_id)
-            if db_job:
-                db_job.status = JobStatus.FAILED.value
-                db_job.error = str(exc)[:1000]
-                await session.commit()
+        info = classify_job_error(exc)
+        await set_job_status(
+            job_id,
+            JobStatus.FAILED,
+            error=f"{info.code}: {str(exc)[:1800]}",
+            event_message=info.code,
+        )
         await progress.edit_text(tr(user.language, "unsupported"))
 
 
@@ -180,12 +359,20 @@ async def _owned_job(callback: CallbackQuery, job_id: int) -> tuple[DownloadJob,
         )
         row = result.first()
         if not row:
-            await callback.answer("Job not found", show_alert=True)
+            user = await ensure_user(callback.from_user.id, callback.from_user.username)
+            await callback.answer(tr(user.language, "job_not_found"), show_alert=True)
             return None
         job, user = row
         session.expunge(job)
         session.expunge(user)
         return job, user
+
+
+async def _check_active_limit(user_id: int, job_id: int, language: str) -> str | None:
+    active = await count_user_running_jobs(user_id, exclude_job_id=job_id)
+    if active >= settings.max_jobs_per_user:
+        return tr(language, "active_limit", limit=settings.max_jobs_per_user)
+    return None
 
 
 @router.callback_query(F.data.startswith("q:"))
@@ -195,35 +382,91 @@ async def choose_quality(callback: CallbackQuery) -> None:
     owned = await _owned_job(callback, job_id)
     if not owned:
         return
-    _, user = owned
+    job_snapshot, user = owned
+    limit_error = await _check_active_limit(job_snapshot.user_id, job_id, user.language)
+    if limit_error:
+        await callback.answer(limit_error, show_alert=True)
+        return
+
     async with SessionLocal() as session:
         job = await session.get(DownloadJob, job_id)
-        if job.status not in {JobStatus.READY.value, JobStatus.FAILED.value}:
-            await callback.answer("Already queued", show_alert=True)
-            return
-        active = await session.scalar(
-            select(func.count()).select_from(DownloadJob).where(
-                DownloadJob.user_id == job.user_id,
-                DownloadJob.id != job.id,
-                DownloadJob.status.in_([
-                    JobStatus.QUEUED.value, JobStatus.DOWNLOADING.value,
-                    JobStatus.PROCESSING.value, JobStatus.UPLOADING.value,
-                ]),
-            )
-        ) or 0
-        if active >= settings.max_jobs_per_user:
-            await callback.answer(
-                f"Active job limit: {settings.max_jobs_per_user}", show_alert=True
-            )
+        if not job or job.status not in {JobStatus.READY.value, JobStatus.FAILED.value}:
+            await callback.answer(tr(user.language, "already_queued"), show_alert=True)
             return
         job.selected_quality = quality
         job.status = JobStatus.QUEUED.value
+        job.error = None
+        job.progress = 0.0
         if callback.message:
             job.progress_message_id = callback.message.message_id
         await session.commit()
+    await record_job_event(job_id, JobStatus.QUEUED.value, f"quality={quality}")
     await enqueue_download(job_id)
     if callback.message:
-        await callback.message.edit_text(tr(user.language, "queued"))
+        await callback.message.edit_text(
+            tr(user.language, "queued", job_id=job_id),
+            reply_markup=cancel_keyboard(job_id, user.language),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cancel:"))
+async def cancel_job(callback: CallbackQuery) -> None:
+    job_id = int(callback.data.split(":", 1)[1])
+    owned = await _owned_job(callback, job_id)
+    if not owned:
+        return
+    job_snapshot, user = owned
+    if job_snapshot.status in TERMINAL_STATUSES:
+        await callback.answer(tr(user.language, "cannot_cancel"), show_alert=True)
+        return
+
+    await set_job_status(
+        job_id,
+        JobStatus.CANCELLED,
+        event_message="cancel requested from Telegram",
+    )
+    await cancel_download(job_id)
+    if callback.message:
+        await callback.message.edit_text(tr(user.language, "cancelled"))
+    await callback.answer(tr(user.language, "cancel_requested", job_id=job_id))
+
+
+@router.callback_query(F.data.startswith("retry:"))
+async def retry_job(callback: CallbackQuery) -> None:
+    job_id = int(callback.data.split(":", 1)[1])
+    owned = await _owned_job(callback, job_id)
+    if not owned:
+        return
+    job_snapshot, user = owned
+    if job_snapshot.status != JobStatus.FAILED.value or not job_snapshot.selected_quality:
+        await callback.answer(tr(user.language, "cannot_retry"), show_alert=True)
+        return
+    limit_error = await _check_active_limit(job_snapshot.user_id, job_id, user.language)
+    if limit_error:
+        await callback.answer(limit_error, show_alert=True)
+        return
+
+    async with SessionLocal() as session:
+        job = await session.get(DownloadJob, job_id)
+        if not job or job.status != JobStatus.FAILED.value:
+            await callback.answer(tr(user.language, "cannot_retry"), show_alert=True)
+            return
+        job.status = JobStatus.QUEUED.value
+        job.error = None
+        job.progress = 0.0
+        job.speed = None
+        job.eta = None
+        if callback.message:
+            job.progress_message_id = callback.message.message_id
+        await session.commit()
+    await record_job_event(job_id, "MANUAL_RETRY", "retry requested from Telegram")
+    await enqueue_download(job_id)
+    if callback.message:
+        await callback.message.edit_text(
+            tr(user.language, "retry_queued", job_id=job_id),
+            reply_markup=cancel_keyboard(job_id, user.language),
+        )
     await callback.answer()
 
 
@@ -233,7 +476,10 @@ async def choose_cut(callback: CallbackQuery, state: FSMContext) -> None:
     owned = await _owned_job(callback, job_id)
     if not owned:
         return
-    _, user = owned
+    job, user = owned
+    if job.status != JobStatus.READY.value:
+        await callback.answer(tr(user.language, "already_queued"), show_alert=True)
+        return
     await state.set_state(CutState.waiting_range)
     await state.update_data(job_id=job_id)
     if callback.message:
@@ -263,28 +509,27 @@ async def receive_cut_range(message: Message, state: FSMContext) -> None:
         if not job or job.user_id != user.id:
             await state.clear()
             return
+        if job.status != JobStatus.READY.value:
+            await state.clear()
+            await message.answer(tr(user.language, "already_queued"))
+            return
         if job.duration and end > job.duration:
             await message.answer(tr(user.language, "cut_invalid"))
             return
-        active = await session.scalar(
-            select(func.count()).select_from(DownloadJob).where(
-                DownloadJob.user_id == job.user_id,
-                DownloadJob.id != job.id,
-                DownloadJob.status.in_([
-                    JobStatus.QUEUED.value, JobStatus.DOWNLOADING.value,
-                    JobStatus.PROCESSING.value, JobStatus.UPLOADING.value,
-                ]),
-            )
-        ) or 0
-        if active >= settings.max_jobs_per_user:
-            await message.answer(f"Active job limit: {settings.max_jobs_per_user}")
+        limit_error = await _check_active_limit(job.user_id, job.id, user.language)
+        if limit_error:
+            await message.answer(limit_error)
             return
         job.cut_start = start
         job.cut_end = end
         job.selected_quality = "720"
         job.status = JobStatus.QUEUED.value
-        progress = await message.answer(tr(user.language, "cut_queued"))
+        progress = await message.answer(
+            tr(user.language, "cut_queued", job_id=job_id),
+            reply_markup=cancel_keyboard(job_id, user.language),
+        )
         job.progress_message_id = progress.message_id
         await session.commit()
+    await record_job_event(job_id, JobStatus.QUEUED.value, f"clip={start}-{end}")
     await state.clear()
     await enqueue_download(job_id)
