@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=78", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moataz-media-bot"
+version = "0.1.0"
+description = "Private bilingual Telegram media downloader with dashboard, queue, progress tracking and FFmpeg clipping."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "Moataz"}]
+dependencies = [
+  "aiogram==3.31.0",
+  "fastapi==0.141.1",
+  "uvicorn[standard]>=0.35,<1",
+  "SQLAlchemy[asyncio]==2.0.52",
+  "asyncpg>=0.30,<1",
+  "aiosqlite>=0.21,<1",
+  "redis>=6,<7",
+  "arq==0.28.0",
+  "yt-dlp>=2026.8.19",
+  "pydantic-settings>=2.10,<3",
+  "jinja2>=3.1,<4",
+  "python-multipart>=0.0.20,<1",
+  "aiohttp>=3.12,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+  "httpx>=0.28,<1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

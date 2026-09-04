@@ -1,0 +1,5 @@
+# Replace bot.example.com with your domain, then run Caddy on the host or as another container.
+bot.example.com {
+    reverse_proxy 127.0.0.1:8000
+    encode zstd gzip
+}
