@@ -16,7 +16,7 @@ from app.config import get_settings
 from app.dashboard import router as dashboard_router
 from app.db import init_db
 
-RELEASE = "2026.09.04-telegram-fix"
+RELEASE = "0.2.0-phase1"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 dispatcher = create_dispatcher()
