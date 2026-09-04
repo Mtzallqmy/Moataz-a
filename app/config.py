@@ -30,9 +30,21 @@ class Settings(BaseSettings):
     max_concurrent_jobs: int = 2
     max_jobs_per_user: int = 1
     max_video_duration_seconds: int = 14400
-    max_file_size_mb: int = 49
+
+    # Internal media budget can be larger than Telegram's delivery budget because Phase 5
+    # can adaptively transcode before upload.
+    max_file_size_mb: int = 512
+    telegram_upload_limit_mb: int = 49
+    auto_compress_enabled: bool = True
+    media_compression_attempts: int = 2
     progress_update_seconds: float = 2.0
     default_language: str = "ar"
+
+    # yt-dlp engine tuning. All values are optional and conservative by default.
+    ytdlp_socket_timeout_seconds: int = 30
+    ytdlp_retries: int = 2
+    ytdlp_fragment_retries: int = 3
+    ytdlp_concurrent_fragments: int = 4
 
     # Job reliability. These are optional and have production-safe defaults.
     job_max_retries: int = 2
@@ -84,15 +96,40 @@ class Settings(BaseSettings):
     def validate_language(cls, value: str) -> str:
         return value if value in {"ar", "en"} else "ar"
 
-    @field_validator("job_max_retries")
+    @field_validator("job_max_retries", "ytdlp_retries", "ytdlp_fragment_retries")
     @classmethod
-    def validate_job_max_retries(cls, value: int) -> int:
-        return max(0, min(int(value), 5))
+    def validate_retry_count(cls, value: int) -> int:
+        return max(0, min(int(value), 10))
 
     @field_validator("job_retry_base_seconds")
     @classmethod
     def validate_retry_delay(cls, value: float) -> float:
         return max(1.0, min(float(value), 60.0))
+
+    @field_validator("ytdlp_socket_timeout_seconds")
+    @classmethod
+    def validate_socket_timeout(cls, value: int) -> int:
+        return max(5, min(int(value), 120))
+
+    @field_validator("ytdlp_concurrent_fragments")
+    @classmethod
+    def validate_fragment_concurrency(cls, value: int) -> int:
+        return max(1, min(int(value), 16))
+
+    @field_validator("media_compression_attempts")
+    @classmethod
+    def validate_compression_attempts(cls, value: int) -> int:
+        return max(1, min(int(value), 4))
+
+    @field_validator("max_file_size_mb")
+    @classmethod
+    def validate_internal_file_limit(cls, value: int) -> int:
+        return max(16, min(int(value), 4096))
+
+    @field_validator("telegram_upload_limit_mb")
+    @classmethod
+    def validate_upload_limit(cls, value: int) -> int:
+        return max(1, min(int(value), 2048))
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -114,6 +151,10 @@ class Settings(BaseSettings):
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024
+
+    @property
+    def telegram_upload_limit_bytes(self) -> int:
+        return self.telegram_upload_limit_mb * 1024 * 1024
 
 
 @lru_cache
