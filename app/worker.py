@@ -198,10 +198,10 @@ async def process_download(ctx, job_id: int) -> None:
             raise RuntimeError(
                 f"Output is {file_size / 1024 / 1024:.1f} MB, above MAX_FILE_SIZE_MB"
             )
-        if not settings.telegram_local_api_url and file_size > 49 * 1024 * 1024:
+        if file_size > 49 * 1024 * 1024:
             raise RuntimeError(
-                "File exceeds the conservative official Bot API upload limit. "
-                "Configure TELEGRAM_LOCAL_API_URL or choose a smaller quality/clip."
+                "File exceeds the conservative official Telegram Bot API upload limit. "
+                "Choose a smaller quality or clip."
             )
 
         async with SessionLocal() as session:
