@@ -61,15 +61,17 @@ async def enqueue_download(job_id: int) -> None:
 
 
 async def cancel_download(job_id: int) -> bool:
-    """Request cancellation for a job.
+    """Request cancellation for an active embedded job.
 
-    The default inline worker uses a thread-safe cancellation flag so yt-dlp can
-    stop from its progress hook. Redis workers still honor the CANCELLED database
-    state between major processing stages.
+    Distributed workers observe the CANCELLED database state between major stages,
+    so no process-local flag is useful for them.
     """
+
+    task = _inline_tasks.get(job_id)
+    if not task or task.done():
+        return False
 
     from app.worker import request_cancel
 
     request_cancel(job_id)
-    task = _inline_tasks.get(job_id)
-    return bool(task and not task.done())
+    return True
