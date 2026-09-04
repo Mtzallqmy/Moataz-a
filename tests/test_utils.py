@@ -1,5 +1,6 @@
 import pytest
 
+from app.config import Settings
 from app.security import validate_media_url
 from app.utils import parse_time, progress_bar, seconds_to_hms
 
@@ -39,3 +40,13 @@ def test_media_url_rejects_ssrf_and_unknown_hosts():
     assert not validate_media_url("http://192.168.1.1/")
     assert not validate_media_url("file:///etc/passwd")
     assert not validate_media_url("https://evil.example/youtube.com")
+
+
+def test_invalid_telegram_local_api_url_is_ignored():
+    settings = Settings(_env_file=None, telegram_local_api_url="Moataz ai")
+    assert settings.telegram_local_api_url == ""
+
+
+def test_valid_telegram_local_api_url_is_kept():
+    settings = Settings(_env_file=None, telegram_local_api_url="http://telegram-bot-api:8081/")
+    assert settings.telegram_local_api_url == "http://telegram-bot-api:8081"
