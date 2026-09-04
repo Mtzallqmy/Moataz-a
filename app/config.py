@@ -118,6 +118,10 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    settings = Settings()
-    settings.download_dir.mkdir(parents=True, exist_ok=True)
-    return settings
+    """Load settings without touching the filesystem.
+
+    Runtime directories are created by the downloader when a job actually starts.
+    Keeping this function side-effect free makes imports safe in CI, tests, CLI tools,
+    and read-only environments.
+    """
+    return Settings()
