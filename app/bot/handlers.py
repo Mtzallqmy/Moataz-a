@@ -14,7 +14,6 @@ from app.config import get_settings
 from app.db import DownloadJob, JobStatus, SessionLocal, User
 from app.i18n import status_label, tr
 from app.jobs import (
-    RUNNING_STATUSES,
     TERMINAL_STATUSES,
     classify_job_error,
     count_user_running_jobs,
