@@ -26,6 +26,8 @@ def validate_media_url(url: str) -> bool:
             return False
         except ValueError:
             pass
-        return host in ALLOWED_HOSTS or any(host.endswith(f".{allowed}") for allowed in ALLOWED_HOSTS)
+        return host in ALLOWED_HOSTS or any(
+            host.endswith(f".{allowed}") for allowed in ALLOWED_HOSTS
+        )
     except Exception:
         return False
