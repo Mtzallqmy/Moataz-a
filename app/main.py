@@ -24,20 +24,22 @@ polling_task: asyncio.Task | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     global bot, polling_task
-    await init_db()
-    if not settings.bot_token:
+    if not settings.bot_token.strip():
         raise RuntimeError("BOT_TOKEN is required")
+
+    await init_db()
     bot = create_bot()
 
     if settings.app_mode == "webhook":
         if not settings.webhook_base_url:
-            raise RuntimeError("WEBHOOK_BASE_URL is required in webhook mode")
-        await bot.set_webhook(
-            settings.webhook_url,
-            secret_token=settings.webhook_secret,
-            allowed_updates=dispatcher.resolve_used_update_types(),
-            drop_pending_updates=False,
-        )
+            raise RuntimeError("WEBHOOK_BASE_URL is required only when APP_MODE=webhook")
+        webhook_kwargs = {
+            "allowed_updates": dispatcher.resolve_used_update_types(),
+            "drop_pending_updates": False,
+        }
+        if settings.webhook_secret:
+            webhook_kwargs["secret_token"] = settings.webhook_secret
+        await bot.set_webhook(settings.webhook_url, **webhook_kwargs)
     else:
         await bot.delete_webhook(drop_pending_updates=False)
         polling_task = asyncio.create_task(
@@ -67,6 +69,7 @@ async def root():
         "status": "ok",
         "dashboard": "/dashboard",
         "mode": settings.app_mode,
+        "queue": settings.queue_backend,
     }
 
 
@@ -82,7 +85,7 @@ async def telegram_webhook(
 ):
     if settings.app_mode != "webhook":
         raise HTTPException(status_code=404, detail="Webhook mode disabled")
-    if x_telegram_bot_api_secret_token != settings.webhook_secret:
+    if settings.webhook_secret and x_telegram_bot_api_secret_token != settings.webhook_secret:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
     if bot is None:
         raise HTTPException(status_code=503, detail="Bot is not ready")
@@ -93,4 +96,5 @@ async def telegram_webhook(
 
 
 if __name__ == "__main__":
+    # APP_PORT is supported locally; Railway injects PORT and config.py maps it automatically.
     uvicorn.run("app.main:app", host=settings.app_host, port=settings.app_port, reload=False)
