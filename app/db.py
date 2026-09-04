@@ -18,15 +18,24 @@ class Base(DeclarativeBase):
 
 
 class JobStatus(StrEnum):
-    PROBING = "PROBING"
+    # New lifecycle names. Legacy values are intentionally kept below so existing
+    # Railway rows remain readable without a destructive migration.
+    PENDING = "PENDING"
+    ANALYZING = "ANALYZING"
     READY = "READY"
     QUEUED = "QUEUED"
+    RETRYING = "RETRYING"
     DOWNLOADING = "DOWNLOADING"
-    PROCESSING = "PROCESSING"
+    MERGING = "MERGING"
+    CUTTING = "CUTTING"
     UPLOADING = "UPLOADING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+    # Legacy statuses from early releases.
+    PROBING = "PROBING"
+    PROCESSING = "PROCESSING"
 
 
 class User(Base):
@@ -61,7 +70,7 @@ class DownloadJob(Base):
     cut_end: Mapped[float | None] = mapped_column(Float, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
-    status: Mapped[str] = mapped_column(String(32), default=JobStatus.PROBING.value, index=True)
+    status: Mapped[str] = mapped_column(String(32), default=JobStatus.PENDING.value, index=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
     speed: Mapped[str | None] = mapped_column(String(64), nullable=True)
     eta: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -76,6 +85,27 @@ class DownloadJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="jobs")
+    events: Mapped[list["JobEvent"]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+
+
+class JobEvent(Base):
+    """Append-only lifecycle history for a download job.
+
+    A separate table lets us add durable observability to existing deployments
+    without altering the already-created download_jobs table.
+    """
+
+    __tablename__ = "job_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("download_jobs.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    job: Mapped[DownloadJob] = relationship(back_populates="events")
 
 
 class WorkerNode(Base):
