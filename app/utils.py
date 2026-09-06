@@ -1,31 +1,42 @@
+from __future__ import annotations
+
 from datetime import timedelta
 
+from app import progress as _progress
 
-def seconds_to_hms(seconds: int | float | None) -> str:
-    if not seconds:
-        return "00:00"
-    return str(timedelta(seconds=int(seconds)))
+
+def progress_bar(percent: float, width: int = 12) -> str:
+    return _progress.progress_bar(percent, width)
 
 
 def parse_time(value: str) -> float:
-    parts = value.strip().split(":")
-    if not 1 <= len(parts) <= 3:
-        raise ValueError("invalid time")
-    nums = [float(part) for part in parts]
-    if any(num < 0 for num in nums):
-        raise ValueError("invalid time")
-    if len(nums) == 3:
-        hours, minutes, seconds = nums
-    elif len(nums) == 2:
-        hours, minutes, seconds = 0, nums[0], nums[1]
-    else:
-        hours, minutes, seconds = 0, 0, nums[0]
-    if minutes >= 60 or seconds >= 60:
-        raise ValueError("invalid time")
-    return hours * 3600 + minutes * 60 + seconds
+    text = value.strip()
+    if not text or text.startswith("-"):
+        raise ValueError("Invalid time")
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ValueError("Invalid time")
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError("Invalid time") from exc
+    if any(number < 0 for number in numbers):
+        raise ValueError("Invalid time")
+    if len(numbers) >= 2 and numbers[-1] >= 60:
+        raise ValueError("Invalid seconds")
+    if len(numbers) == 3 and numbers[-2] >= 60:
+        raise ValueError("Invalid minutes")
+    if len(numbers) == 1:
+        return numbers[0]
+    if len(numbers) == 2:
+        return numbers[0] * 60 + numbers[1]
+    return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
 
 
-def progress_bar(progress: float, width: int = 12) -> str:
-    progress = max(0.0, min(100.0, progress))
-    filled = round(width * progress / 100)
-    return "█" * filled + "░" * (width - filled)
+def seconds_to_hms(value: int | float | None) -> str:
+    if value is None:
+        return "—"
+    return str(timedelta(seconds=int(value)))
+
+
+__all__ = ["parse_time", "progress_bar", "seconds_to_hms"]

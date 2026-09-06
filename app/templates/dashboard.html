@@ -10,70 +10,166 @@
   <div class="orb orb-a"></div><div class="orb orb-b"></div>
   <main class="shell">
     <header class="topbar glass">
-      <div>
-        <p class="eyebrow">PRIVATE MEDIA WORKSPACE</p>
-        <h1>{{ app_name }}</h1>
-      </div>
-      <div class="live"><span></span> LIVE</div>
+      <div><p class="eyebrow">MEDIA DOWNLOAD MANAGER</p><h1>{{ app_name }}</h1></div>
+      <div class="live"><span></span> INLINE QUEUE · POLLING</div>
     </header>
 
-    <section class="stats" id="stats"></section>
+    <nav class="tabs glass" id="tabs">
+      <button class="active" data-tab="overview">Overview</button>
+      <button data-tab="downloads">Downloads</button>
+      <button data-tab="jobs">Jobs</button>
+      <button data-tab="users">Users</button>
+      <button data-tab="workers">Workers</button>
+      <button data-tab="errors">Errors</button>
+      <button data-tab="system">System</button>
+    </nav>
 
-    <section class="grid">
-      <article class="glass panel jobs-panel">
-        <div class="panel-head"><h2>المهام / Jobs</h2><span id="updated">—</span></div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>#</th><th>العنوان</th><th>المصدر</th><th>الجودة</th><th>الحالة</th><th>التقدم</th></tr></thead>
-            <tbody id="jobs"></tbody>
-          </table>
+    <section class="tab active" id="tab-overview">
+      <section class="stats" id="stats"></section>
+      <article class="glass panel downloader-panel">
+        <div class="panel-head"><div><p class="eyebrow">RECLIP-STYLE FLOW · SHARED ENGINE</p><h2>تنزيل الوسائط / Download</h2></div><span>yt-dlp + FFmpeg</span></div>
+        <textarea id="urls" rows="3" placeholder="Paste one or more public HTTP/HTTPS URLs…"></textarea>
+        <div class="download-actions">
+          <button class="primary" id="analyzeBtn">Analyze</button>
+          <button id="downloadAllBtn" disabled>Download All</button>
+          <span id="analyzeStatus"></span>
         </div>
+        <div class="media-cards" id="mediaCards"></div>
       </article>
+    </section>
 
-      <article class="glass panel users-panel">
-        <div class="panel-head"><h2>العُقد / Workers</h2></div>
-        <div id="workers" class="users-list workers-list"></div>
-        <div class="panel-head secondary"><h2>المستخدمون / Users</h2></div>
-        <form action="/dashboard/users" method="post" class="user-form">
-          <input name="telegram_id" type="number" placeholder="Telegram ID" required>
-          <select name="language"><option value="ar">العربية</option><option value="en">English</option></select>
-          <label class="check"><input name="allowed" type="checkbox" value="true" checked> مسموح</label>
-          <button type="submit">حفظ</button>
-        </form>
-        <div id="users" class="users-list"></div>
-      </article>
+    <section class="tab" id="tab-downloads">
+      <article class="glass panel"><div class="panel-head"><h2>Downloads</h2><span id="updated">—</span></div><div id="downloads" class="job-cards"></div></article>
+    </section>
+
+    <section class="tab" id="tab-jobs">
+      <article class="glass panel"><div class="panel-head"><h2>Jobs</h2></div><div class="table-wrap"><table><thead><tr><th>#</th><th>Title</th><th>Platform</th><th>Quality</th><th>Status</th><th>Progress</th><th>Action</th></tr></thead><tbody id="jobs"></tbody></table></div></article>
+    </section>
+
+    <section class="tab" id="tab-users">
+      <article class="glass panel"><div class="panel-head"><h2>Users</h2></div><div id="users" class="list"></div></article>
+    </section>
+
+    <section class="tab" id="tab-workers">
+      <article class="glass panel"><div class="panel-head"><h2>Workers</h2></div><div id="workers" class="list"></div></article>
+    </section>
+
+    <section class="tab" id="tab-errors">
+      <article class="glass panel"><div class="panel-head"><h2>Errors</h2></div><div id="errors" class="list"></div></article>
+    </section>
+
+    <section class="tab" id="tab-system">
+      <article class="glass panel"><div class="panel-head"><h2>System</h2><span id="release"></span></div><div id="system" class="system-grid"></div></article>
     </section>
   </main>
 <script>
-const token = {{ ws_token|tojson }};
-const stats = document.querySelector('#stats');
-const jobs = document.querySelector('#jobs');
-const users = document.querySelector('#users');
-const workers = document.querySelector('#workers');
+const $ = s => document.querySelector(s);
+const esc = v => String(v ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+let analyzed = [];
 
-function esc(v){return String(v ?? '—').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
+async function api(url, options={}) {
+  const response = await fetch(url, {credentials:'same-origin', headers:{'Content-Type':'application/json', ...(options.headers||{})}, ...options});
+  let data = {};
+  try { data = await response.json(); } catch (_) {}
+  if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+  return data;
+}
+
+function switchTab(name){
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === `tab-${name}`));
+}
+$('#tabs').addEventListener('click', e => { if (e.target.dataset.tab) switchTab(e.target.dataset.tab); });
+
+function qualityOptions(item){
+  const qs = (item.qualities || []).map(q => `<option value="${q}">${q}p</option>`).join('');
+  return `<option value="best">Best Quality</option>${qs}<option value="audio">MP3 Audio</option>`;
+}
+
+function renderAnalyzed(){
+  $('#mediaCards').innerHTML = analyzed.map((item, index) => {
+    if (item.error) return `<div class="media-card error"><div><b>${esc(item.url)}</b><small>${esc(item.error)}</small></div></div>`;
+    const thumb = item.thumbnail ? `<img src="${esc(item.thumbnail)}" alt="">` : `<div class="thumb-placeholder">MEDIA</div>`;
+    const playlist = item.is_playlist ? `<span class="badge">Playlist · ${item.playlist_count}</span>` : `<span class="badge">${item.duration ? Math.round(item.duration)+'s' : '—'}</span>`;
+    const action = item.is_playlist
+      ? `<button onclick="expandPlaylist(${index})">Expand & Download</button>`
+      : `<button onclick="downloadOne(${index})">Download</button>`;
+    return `<div class="media-card" data-index="${index}">
+      <div class="thumb">${thumb}</div>
+      <div class="media-body"><h3>${esc(item.title)}</h3><p>${esc(item.platform)} · ${esc(item.uploader || '—')}</p>${playlist}
+      <div class="media-actions"><select id="quality-${index}">${qualityOptions(item)}</select>${action}</div></div>
+    </div>`;
+  }).join('');
+  $('#downloadAllBtn').disabled = !analyzed.some(i => i.job_id && !i.error && !i.is_playlist);
+}
+
+$('#analyzeBtn').addEventListener('click', async () => {
+  const urls = $('#urls').value.trim();
+  if (!urls) return;
+  $('#analyzeStatus').textContent = 'ANALYZING…';
+  $('#analyzeBtn').disabled = true;
+  try {
+    const data = await api('/api/media/analyze', {method:'POST', body:JSON.stringify({urls})});
+    analyzed = data.items || [];
+    renderAnalyzed();
+    $('#analyzeStatus').textContent = `Ready · duplicates ${data.duplicates || 0}`;
+  } catch (e) { $('#analyzeStatus').textContent = e.message; }
+  finally { $('#analyzeBtn').disabled = false; }
+});
+
+async function downloadOne(index){
+  const item = analyzed[index];
+  const quality = $(`#quality-${index}`).value;
+  await api('/api/media/download', {method:'POST', body:JSON.stringify({items:[{job_id:item.job_id, quality}]})});
+  switchTab('jobs');
+  await refresh();
+}
+
+async function expandPlaylist(index){
+  const item = analyzed[index];
+  const quality = $(`#quality-${index}`).value;
+  try {
+    await api(`/api/media/playlist/${item.job_id}/expand`, {method:'POST', body:JSON.stringify({quality})});
+    switchTab('jobs');
+    await refresh();
+  } catch (e) { alert(e.message); }
+}
+
+$('#downloadAllBtn').addEventListener('click', async () => {
+  const items = analyzed.flatMap((item, index) => item.job_id && !item.error && !item.is_playlist ? [{job_id:item.job_id, quality:$(`#quality-${index}`).value}] : []);
+  if (!items.length) return;
+  await api('/api/media/download', {method:'POST', body:JSON.stringify({items})});
+  switchTab('jobs');
+  await refresh();
+});
+
+async function cancelJob(id){ await api(`/api/jobs/${id}/cancel`, {method:'POST', body:'{}'}); await refresh(); }
+
 function render(data){
-  stats.innerHTML = `
+  $('#stats').innerHTML = `
     <div class="glass stat"><b>${data.stats.active_jobs}</b><span>Active Jobs</span></div>
     <div class="glass stat"><b>${data.stats.total_jobs}</b><span>Total Jobs</span></div>
-    <div class="glass stat"><b>${data.stats.users}</b><span>Users</span></div>`;
-  jobs.innerHTML = data.jobs.map(j=>`<tr>
-    <td>${j.id}</td><td title="${esc(j.error||'')}">${esc(j.title)}</td><td>${esc(j.platform)}</td>
-    <td>${esc(j.quality)}</td><td><span class="status ${j.status.toLowerCase()}">${esc(j.status)}</span></td>
+    <div class="glass stat"><b>${data.stats.completed_jobs}</b><span>Completed</span></div>
+    <div class="glass stat"><b>${data.stats.failed_jobs}</b><span>Failed</span></div>`;
+
+  $('#jobs').innerHTML = data.jobs.map(j => `<tr>
+    <td>${j.id}</td><td>${esc(j.title)}</td><td>${esc(j.platform)}</td><td>${esc(j.quality)}</td>
+    <td><span class="status ${j.status.toLowerCase()}">${esc(j.status)}</span></td>
     <td><div class="progress"><i style="width:${Number(j.progress)}%"></i></div><small>${j.progress}%</small></td>
+    <td>${['COMPLETED','FAILED','CANCELLED'].includes(j.status) ? '' : `<button class="mini" onclick="cancelJob(${j.id})">Cancel</button>`}</td>
   </tr>`).join('');
-  users.innerHTML = data.users.map(u=>`<div class="user-row"><div><b>${esc(u.username)}</b><small>${u.telegram_id}</small></div><span>${u.allowed?'✅':'⛔'} ${esc(u.language)}</span></div>`).join('');
-  workers.innerHTML = (data.workers||[]).map(w=>`<div class="user-row"><div><b>${esc(w.id)}</b><small>${esc(w.hostname)}</small></div><span>${w.status==='ONLINE'?'🟢':'⚪'} ${w.active_jobs} jobs</span></div>`).join('') || '<small>لا توجد Workers متصلة</small>';
-  document.querySelector('#updated').textContent = new Date().toLocaleTimeString();
+
+  $('#downloads').innerHTML = data.jobs.filter(j => j.status === 'COMPLETED').map(j => `<div class="job-card"><div><b>#${j.id} · ${esc(j.title)}</b><small>${esc(j.platform)} · ${esc(j.quality)} · ${esc(j.uploader || '—')}</small></div>${j.download_ready ? `<a class="mini" href="/api/jobs/${j.id}/file">Download file</a>` : ''}</div>`).join('') || '<p class="muted">No completed downloads.</p>';
+  $('#users').innerHTML = data.users.map(u => `<div class="list-row"><div><b>${esc(u.username)}</b><small>${u.telegram_id}</small></div><span>${u.allowed ? '✅' : '⛔'} ${esc(u.language)}</span></div>`).join('') || '<p class="muted">No users.</p>';
+  $('#workers').innerHTML = data.workers.map(w => `<div class="list-row"><div><b>${esc(w.id)}</b><small>${esc(w.hostname)}</small></div><span>${w.status === 'ONLINE' ? '🟢' : '⚪'} ${w.active_jobs} jobs</span></div>`).join('') || '<p class="muted">No workers.</p>';
+  $('#errors').innerHTML = data.errors.map(e => `<div class="list-row error-row"><div><b>#${e.id} · ${esc(e.title)}</b><small>${esc(e.error)}</small></div><span>${esc(e.platform)}</span></div>`).join('') || '<p class="muted">No recent errors.</p>';
+  $('#system').innerHTML = Object.entries(data.system).map(([k,v]) => `<div class="system-item"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+  $('#release').textContent = data.release;
+  $('#updated').textContent = new Date().toLocaleTimeString();
 }
 
-function connect(){
-  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${scheme}://${location.host}/ws/jobs?token=${encodeURIComponent(token)}`);
-  ws.onmessage = e => render(JSON.parse(e.data));
-  ws.onclose = () => setTimeout(connect, 2000);
-}
-connect();
+async function refresh(){ try { render(await api('/api/dashboard')); } catch (_) {} }
+refresh(); setInterval(refresh, 2500);
 </script>
 </body>
 </html>

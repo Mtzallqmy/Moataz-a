@@ -1,578 +1,363 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
 import socket
 import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.bot.client import create_bot
 from app.config import get_settings
-from app.db import DownloadJob, JobStatus, SessionLocal, User, WorkerNode, init_db
-from app.i18n import tr
-from app.jobs import (
-    RUNNING_STATUSES,
-    classify_job_error,
-    is_job_cancelled,
-    record_job_event,
-    set_job_status,
-)
-from app.queue import redis_settings
-from app.services.downloader import download_media
+from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User, WorkerNode
+from app.errors import CancelledError, ErrorCode, classify_error, retry_delay
+from app.jobs import is_job_cancelled, record_job_event, set_job_status
+from app.progress import ProgressSnapshot
+from app.security import redact_secrets
+from app.services.downloader import get_downloader_service
+from app.services.job_service import deserialize_qualities
 from app.services.media import cut_media, fit_media_for_upload
-from app.utils import progress_bar
 
 settings = get_settings()
+downloader = get_downloader_service()
 _cancel_events: dict[int, threading.Event] = {}
 
 
-class JobCancelled(Exception):
-    pass
-
-
 def request_cancel(job_id: int) -> None:
-    """Signal an embedded yt-dlp thread to stop at its next progress callback."""
-
     _cancel_events.setdefault(job_id, threading.Event()).set()
+    downloader.cancel(str(job_id))
 
 
-def _human_bytes_per_second(value: float | int | None) -> str:
-    if not value:
-        return "—"
-    size = float(value)
-    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
-        if size < 1024 or unit == "GB/s":
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return "—"
-
-
-def _human_eta(value: int | float | None) -> str:
-    if value is None:
-        return "—"
-    seconds = max(0, int(value))
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes:02d}:{seconds:02d}"
-
-
-def _cancel_markup(job_id: int, language: str) -> InlineKeyboardMarkup:
+def _cancel_markup(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=tr(language, "cancel_button"),
-                    callback_data=f"cancel:{job_id}",
-                )
-            ]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="✖️ Cancel / إلغاء", callback_data=f"cancel:{job_id}")]]
     )
 
 
-def _retry_markup(job_id: int, language: str) -> InlineKeyboardMarkup:
+def _retry_markup(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=tr(language, "retry_button"),
-                    callback_data=f"retry:{job_id}",
-                )
-            ]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="🔁 Retry / إعادة", callback_data=f"retry:{job_id}")]]
     )
 
 
-async def _edit_status(
-    job_id: int,
-    text: str,
-    *,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    clear_markup: bool = False,
-) -> None:
+async def _job_delivery(job_id: int) -> tuple[int, int | None]:
     async with SessionLocal() as session:
         job = await session.get(DownloadJob, job_id)
-        if not job or not job.progress_message_id:
-            return
-        chat_id = job.chat_id
-        message_id = job.progress_message_id
+        if job is None:
+            raise LookupError("Job not found")
+        return job.chat_id, job.progress_message_id
+
+
+async def _edit_status(job_id: int, text: str, *, markup: InlineKeyboardMarkup | None = None) -> None:
+    chat_id, message_id = await _job_delivery(job_id)
+    if chat_id == 0 or not message_id:
+        return
     bot = create_bot()
     try:
         try:
-            await bot.edit_message_text(
-                text,
-                chat_id=chat_id,
-                message_id=message_id,
-                reply_markup=reply_markup,
-            )
-        except Exception:
-            # A repeated progress text should not fail the job.
-            pass
-        if clear_markup:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            # Metadata messages can be photos; edit their caption instead.
             try:
-                await bot.edit_message_reply_markup(
+                await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
-                    reply_markup=None,
+                    caption=text[:1024],
+                    reply_markup=markup,
                 )
-            except Exception:
-                pass
+                return
+            except TelegramBadRequest:
+                return
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(min(float(exc.retry_after), 5.0))
     finally:
         await bot.session.close()
 
 
-async def _get_chat_id(job_id: int) -> int:
+async def _is_cancelled(job_id: int, event: threading.Event) -> bool:
+    return event.is_set() or await is_job_cancelled(job_id)
+
+
+async def _update_worker(active_delta: int) -> None:
+    worker_id = f"embedded:{socket.gethostname()}"
     async with SessionLocal() as session:
-        job = await session.get(DownloadJob, job_id)
-        if not job:
-            raise RuntimeError("Job not found")
-        return job.chat_id
-
-
-async def _cancelled(job_id: int, cancel_event: threading.Event) -> bool:
-    return cancel_event.is_set() or await is_job_cancelled(job_id)
-
-
-async def _heartbeat_once(worker_id: str, hostname: str, status: str = "ONLINE") -> None:
-    async with SessionLocal() as session:
-        active_jobs = await session.scalar(
-            select(func.count())
-            .select_from(DownloadJob)
-            .where(
-                DownloadJob.worker_id == worker_id,
-                DownloadJob.status.in_(list(RUNNING_STATUSES)),
-            )
-        ) or 0
         node = await session.get(WorkerNode, worker_id)
         if node is None:
-            node = WorkerNode(id=worker_id, hostname=hostname)
+            node = WorkerNode(id=worker_id, hostname=socket.gethostname(), active_jobs=0)
             session.add(node)
-        node.hostname = hostname
-        node.status = status
-        node.active_jobs = active_jobs if status == "ONLINE" else 0
+        node.status = "ONLINE"
+        node.active_jobs = max(0, int(node.active_jobs or 0) + active_delta)
         node.last_seen = datetime.now(UTC)
         await session.commit()
 
 
-async def _heartbeat_loop(worker_id: str, hostname: str) -> None:
-    while True:
-        await _heartbeat_once(worker_id, hostname)
-        await asyncio.sleep(15)
-
-
-async def _cleanup_loop() -> None:
-    """Delete non-running temporary job directories older than six hours."""
-    while True:
-        try:
-            async with SessionLocal() as session:
-                active_ids = set(
-                    await session.scalars(
-                        select(DownloadJob.id).where(
-                            DownloadJob.status.in_(list(RUNNING_STATUSES))
-                        )
-                    )
-                )
-            if settings.download_dir.exists():
-                cutoff = time.time() - 6 * 60 * 60
-                for path in settings.download_dir.iterdir():
-                    if not path.is_dir() or not path.name.isdigit():
-                        continue
-                    if int(path.name) in active_ids:
-                        continue
-                    if path.stat().st_mtime < cutoff:
-                        shutil.rmtree(path, ignore_errors=True)
-        except Exception:
-            pass
-        await asyncio.sleep(30 * 60)
+async def _persist_progress(job_id: int, snapshot: ProgressSnapshot, quality: str) -> None:
+    async with SessionLocal() as session:
+        job = await session.get(DownloadJob, job_id)
+        if job is None or job.status == JobStatus.CANCELLED.value:
+            return
+        job.progress = snapshot.percent
+        job.speed = f"{snapshot.speed:.0f} B/s" if snapshot.speed else None
+        job.eta = str(int(snapshot.eta)) if snapshot.eta is not None else None
+        await session.commit()
+    await _edit_status(
+        job_id,
+        snapshot.render(job_id=job_id, status=JobStatus.DOWNLOADING.value, quality=quality),
+        markup=_cancel_markup(job_id),
+    )
 
 
 async def _download_with_retries(
     job_id: int,
-    language: str,
-    source_url: str,
+    url: str,
     quality: str,
     job_dir: Path,
+    known_qualities: list[int],
     progress_hook,
     cancel_event: threading.Event,
 ) -> Path:
     for attempt in range(settings.job_max_retries + 1):
-        if await _cancelled(job_id, cancel_event):
-            raise JobCancelled
+        if await _is_cancelled(job_id, cancel_event):
+            raise CancelledError("Job cancelled")
         if attempt:
-            await set_job_status(
-                job_id,
-                JobStatus.DOWNLOADING,
-                event_message=f"retry {attempt} started",
-            )
+            await set_job_status(job_id, JobStatus.DOWNLOADING, event_message=f"retry attempt={attempt}")
         try:
             return await asyncio.to_thread(
-                download_media,
-                source_url,
+                downloader.download,
+                url,
                 quality,
                 job_dir,
-                progress_hook,
+                job_key=str(job_id),
+                progress_hook=progress_hook,
+                known_qualities=known_qualities,
             )
         except Exception as exc:
-            if await _cancelled(job_id, cancel_event):
-                raise JobCancelled from exc
-            info = classify_job_error(exc)
+            if await _is_cancelled(job_id, cancel_event):
+                raise CancelledError("Job cancelled") from exc
+            info = classify_error(exc)
             if not info.retryable or attempt >= settings.job_max_retries:
                 raise
-            retry_number = attempt + 1
-            delay = settings.job_retry_base_seconds * (2**attempt)
+            delay = retry_delay(
+                attempt,
+                base=settings.job_retry_base_seconds,
+                cap=settings.job_retry_cap_seconds,
+            )
             await set_job_status(
                 job_id,
                 JobStatus.RETRYING,
-                event_message=f"{info.code}; retry={retry_number}; delay={delay:.1f}s",
+                event_message=f"{info.code.value}; attempt={attempt + 1}; delay={delay:.2f}",
             )
             await _edit_status(
                 job_id,
-                tr(
-                    language,
-                    "retrying",
-                    attempt=retry_number,
-                    max_attempts=settings.job_max_retries,
-                ),
-                reply_markup=_cancel_markup(job_id, language),
+                f"Job #{job_id}\nStatus: RETRYING\nReason: {info.code.value}\nRetry in: {delay:.1f}s",
+                markup=_cancel_markup(job_id),
             )
             await asyncio.sleep(delay)
-    raise RuntimeError("Download retry loop exhausted")
+    raise RuntimeError("Retry loop exhausted")
 
 
 async def _upload_once(job_id: int, output: Path) -> None:
-    chat_id = await _get_chat_id(job_id)
+    chat_id, _ = await _job_delivery(job_id)
+    if chat_id == 0:
+        return
     bot = create_bot()
     try:
         media = FSInputFile(output)
         caption = f"✅ {output.stem[:900]}"
-        if output.suffix.lower() == ".mp4":
-            await bot.send_video(
-                chat_id=chat_id,
-                video=media,
-                caption=caption,
-                supports_streaming=True,
-                request_timeout=600,
-            )
-        elif output.suffix.lower() == ".mp3":
-            await bot.send_audio(
-                chat_id=chat_id,
-                audio=media,
-                caption=caption,
-                request_timeout=600,
-            )
+        suffix = output.suffix.lower()
+        if suffix == ".mp4":
+            await bot.send_video(chat_id=chat_id, video=media, caption=caption, supports_streaming=True, request_timeout=600)
+        elif suffix == ".mp3":
+            await bot.send_audio(chat_id=chat_id, audio=media, caption=caption, request_timeout=600)
         else:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=media,
-                caption=caption,
-                request_timeout=600,
-            )
+            await bot.send_document(chat_id=chat_id, document=media, caption=caption, request_timeout=600)
     finally:
         await bot.session.close()
 
 
-async def _upload_with_retries(
-    job_id: int,
-    language: str,
-    output: Path,
-    cancel_event: threading.Event,
-) -> None:
+async def _upload_with_retries(job_id: int, output: Path, cancel_event: threading.Event) -> None:
     for attempt in range(settings.job_max_retries + 1):
-        if await _cancelled(job_id, cancel_event):
-            raise JobCancelled
-        if attempt:
-            await set_job_status(
-                job_id,
-                JobStatus.UPLOADING,
-                event_message=f"upload retry {attempt} started",
-            )
+        if await _is_cancelled(job_id, cancel_event):
+            raise CancelledError("Job cancelled")
         try:
             await _upload_once(job_id, output)
             return
         except Exception as exc:
-            if await _cancelled(job_id, cancel_event):
-                raise JobCancelled from exc
-            info = classify_job_error(exc)
+            info = classify_error(exc)
             if not info.retryable or attempt >= settings.job_max_retries:
                 raise
-            retry_number = attempt + 1
-            delay = settings.job_retry_base_seconds * (2**attempt)
-            await set_job_status(
-                job_id,
-                JobStatus.RETRYING,
-                event_message=f"upload {info.code}; retry={retry_number}; delay={delay:.1f}s",
-            )
-            await _edit_status(
-                job_id,
-                tr(
-                    language,
-                    "retrying_upload",
-                    attempt=retry_number,
-                    max_attempts=settings.job_max_retries,
-                ),
-                reply_markup=_cancel_markup(job_id, language),
-            )
+            delay = retry_delay(attempt, base=settings.job_retry_base_seconds, cap=settings.job_retry_cap_seconds)
+            await set_job_status(job_id, JobStatus.RETRYING, event_message=f"upload {info.code.value}; delay={delay:.2f}")
             await asyncio.sleep(delay)
-    raise RuntimeError("Upload retry loop exhausted")
+            await set_job_status(job_id, JobStatus.UPLOADING, event_message="upload retry")
 
 
-async def _prepare_output_for_upload(
-    job_id: int,
-    language: str,
-    output: Path,
-    job_dir: Path,
-    cancel_event: threading.Event,
-) -> tuple[Path, int]:
-    raw_size = output.stat().st_size
-    if raw_size > settings.max_file_size_bytes:
-        raise RuntimeError(
-            f"Output is {raw_size / 1024 / 1024:.1f} MB, above MAX_FILE_SIZE_MB"
-        )
-
-    upload_limit = settings.telegram_upload_limit_bytes
-    if raw_size <= upload_limit:
-        return output, raw_size
-    if not settings.auto_compress_enabled:
-        raise RuntimeError("File exceeds the configured Telegram upload limit")
-
-    if await _cancelled(job_id, cancel_event):
-        raise JobCancelled
-    await set_job_status(
-        job_id,
-        JobStatus.PROCESSING,
-        event_message=f"adaptive upload fit; source_bytes={raw_size}; limit_bytes={upload_limit}",
-    )
-    await _edit_status(
-        job_id,
-        tr(language, "processing"),
-        reply_markup=_cancel_markup(job_id, language),
-    )
-
-    optimized = await fit_media_for_upload(
-        output,
-        upload_limit,
-        job_dir,
-        attempts=settings.media_compression_attempts,
-    )
-    if await _cancelled(job_id, cancel_event):
-        raise JobCancelled
-
-    optimized_size = optimized.stat().st_size
-    if optimized_size > upload_limit:
-        raise RuntimeError("File exceeds upload limit after adaptive compression")
-    await record_job_event(
-        job_id,
-        "MEDIA_OPTIMIZED",
-        f"before={raw_size}; after={optimized_size}; limit={upload_limit}",
-    )
-    return optimized, optimized_size
-
-
-async def process_download(ctx, job_id: int) -> None:
-    worker_id = ctx["worker_id"]
+async def process_download(job_id: int) -> None:
     cancel_event = _cancel_events.setdefault(job_id, threading.Event())
-
-    async with SessionLocal() as session:
-        result = await session.execute(
-            select(DownloadJob, User)
-            .join(User, DownloadJob.user_id == User.id)
-            .where(DownloadJob.id == job_id)
-        )
-        row = result.first()
-        if not row:
-            _cancel_events.pop(job_id, None)
-            return
-        job, user = row
-        if job.status == JobStatus.CANCELLED.value:
-            _cancel_events.pop(job_id, None)
-            return
-        language = user.language
-        job.status = JobStatus.DOWNLOADING.value
-        job.worker_id = worker_id
-        job.error = None
-        job.progress = 0.0
-        await session.commit()
-        source_url = job.source_url
-        quality = job.selected_quality or "best"
-        cut_start = job.cut_start
-        cut_end = job.cut_end
-
-    await record_job_event(job_id, JobStatus.DOWNLOADING.value, f"quality={quality}")
-    await _edit_status(
-        job_id,
-        tr(language, "download_start"),
-        reply_markup=_cancel_markup(job_id, language),
-    )
-
-    job_dir = settings.download_dir / str(job_id)
-    loop = asyncio.get_running_loop()
-    last_update = 0.0
-
-    async def save_progress(payload: dict) -> None:
-        nonlocal last_update
-        if await _cancelled(job_id, cancel_event):
-            return
-        now = time.monotonic()
-        if now - last_update < settings.progress_update_seconds:
-            return
-        last_update = now
-        downloaded = payload.get("downloaded_bytes") or 0
-        total = payload.get("total_bytes") or payload.get("total_bytes_estimate") or 0
-        percentage = (downloaded / total * 100) if total else 0.0
-        speed = _human_bytes_per_second(payload.get("speed"))
-        eta = _human_eta(payload.get("eta"))
-        async with SessionLocal() as session:
-            db_job = await session.get(DownloadJob, job_id)
-            if not db_job or db_job.status == JobStatus.CANCELLED.value:
-                return
-            db_job.progress = percentage
-            db_job.speed = speed
-            db_job.eta = eta
-            await session.commit()
-        await _edit_status(
-            job_id,
-            tr(
-                language,
-                "download",
-                progress=percentage,
-                bar=progress_bar(percentage),
-                speed=speed,
-                eta=eta,
-            ),
-            reply_markup=_cancel_markup(job_id, language),
-        )
-
-    def progress_hook(payload: dict) -> None:
-        if cancel_event.is_set():
-            raise RuntimeError("Job cancelled by user")
-        if payload.get("status") == "downloading":
-            asyncio.run_coroutine_threadsafe(save_progress(payload), loop)
-
+    await _update_worker(1)
     try:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(DownloadJob, User, MediaMetadata)
+                .join(User, DownloadJob.user_id == User.id)
+                .outerjoin(MediaMetadata, MediaMetadata.job_id == DownloadJob.id)
+                .where(DownloadJob.id == job_id)
+            )
+            row = result.first()
+            if row is None:
+                return
+            job, _user, metadata = row
+            if job.status == JobStatus.CANCELLED.value:
+                return
+            if job.status not in {JobStatus.QUEUED.value, JobStatus.RETRYING.value}:
+                return
+            job.status = JobStatus.DOWNLOADING.value
+            job.worker_id = f"embedded:{socket.gethostname()}"
+            job.error = None
+            job.progress = 0.0
+            await session.commit()
+            source_url = job.source_url
+            quality = job.selected_quality or "best"
+            cut_start = job.cut_start
+            cut_end = job.cut_end
+            source_duration = job.duration
+            chat_id = job.chat_id
+            known_qualities = deserialize_qualities(metadata.formats_json if metadata else "[]")
+            cut_mode = (metadata.cut_mode if metadata else "PRECISE") or "PRECISE"
+
+        await record_job_event(job_id, JobStatus.DOWNLOADING.value, f"quality={quality}")
+        job_dir = settings.download_dir / str(job_id)
+        loop = asyncio.get_running_loop()
+        last_update = 0.0
+
+        def consume_future(future) -> None:
+            try:
+                future.result()
+            except Exception:
+                pass
+
+        def progress_hook(payload: dict) -> None:
+            nonlocal last_update
+            if cancel_event.is_set():
+                raise CancelledError("Job cancelled")
+            status = payload.get("status")
+            if status == "finished":
+                future = asyncio.run_coroutine_threadsafe(
+                    set_job_status(job_id, JobStatus.MERGING, event_message="download streams finished"),
+                    loop,
+                )
+                future.add_done_callback(consume_future)
+                return
+            if status != "downloading":
+                return
+            now = time.monotonic()
+            if now - last_update < settings.progress_update_seconds:
+                return
+            last_update = now
+            snapshot = ProgressSnapshot.from_ytdlp(payload)
+            future = asyncio.run_coroutine_threadsafe(_persist_progress(job_id, snapshot, quality), loop)
+            future.add_done_callback(consume_future)
+
         output = await _download_with_retries(
             job_id,
-            language,
             source_url,
             quality,
             job_dir,
+            known_qualities,
             progress_hook,
             cancel_event,
         )
-
-        if await _cancelled(job_id, cancel_event):
-            raise JobCancelled
+        if await _is_cancelled(job_id, cancel_event):
+            raise CancelledError("Job cancelled")
 
         if cut_start is not None and cut_end is not None:
-            await set_job_status(
-                job_id,
-                JobStatus.CUTTING,
-                event_message=f"{cut_start:.2f}-{cut_end:.2f}",
-            )
+            await set_job_status(job_id, JobStatus.CUTTING, event_message=f"mode={cut_mode}; {cut_start}-{cut_end}")
             await _edit_status(
                 job_id,
-                tr(language, "cutting"),
-                reply_markup=_cancel_markup(job_id, language),
+                f"Job #{job_id}\nStatus: CUTTING\nMode: {cut_mode}\nRange: {cut_start:.2f}s → {cut_end:.2f}s",
+                markup=_cancel_markup(job_id),
             )
-            output = await cut_media(output, cut_start, cut_end)
+            output = await cut_media(
+                output,
+                cut_start,
+                cut_end,
+                mode=cut_mode,
+                source_duration=float(source_duration) if source_duration else None,
+                cancel_event=cancel_event,
+            )
 
-        if await _cancelled(job_id, cancel_event):
-            raise JobCancelled
+        if output.stat().st_size > settings.max_file_size_bytes:
+            raise RuntimeError("File too large: output exceeds MAX_FILE_SIZE_MB")
 
-        output, file_size = await _prepare_output_for_upload(
-            job_id,
-            language,
-            output,
-            job_dir,
-            cancel_event,
-        )
+        if chat_id != 0 and output.stat().st_size > settings.telegram_upload_limit_bytes:
+            await set_job_status(job_id, JobStatus.PROCESSING, event_message="adaptive Telegram size fit")
+            output = await fit_media_for_upload(
+                output,
+                settings.telegram_upload_limit_bytes,
+                job_dir,
+                attempts=2,
+                cancel_event=cancel_event,
+            )
 
+        if await _is_cancelled(job_id, cancel_event):
+            raise CancelledError("Job cancelled")
+
+        file_size = output.stat().st_size
         async with SessionLocal() as session:
             db_job = await session.get(DownloadJob, job_id)
-            if not db_job:
-                raise RuntimeError("Job not found")
+            if db_job is None:
+                raise LookupError("Job not found")
             if db_job.status == JobStatus.CANCELLED.value:
-                raise JobCancelled
-            db_job.status = JobStatus.UPLOADING.value
+                raise CancelledError("Job cancelled")
             db_job.output_path = str(output)
             db_job.file_size = file_size
             db_job.progress = 100.0
+            db_job.status = JobStatus.UPLOADING.value if chat_id != 0 else JobStatus.COMPLETED.value
+            if chat_id == 0:
+                db_job.completed_at = datetime.now(UTC)
             await session.commit()
-        await record_job_event(job_id, JobStatus.UPLOADING.value, f"bytes={file_size}")
-        await _edit_status(
-            job_id,
-            tr(language, "uploading"),
-            reply_markup=_cancel_markup(job_id, language),
-        )
 
-        await _upload_with_retries(job_id, language, output, cancel_event)
+        if chat_id != 0:
+            await record_job_event(job_id, JobStatus.UPLOADING.value, f"bytes={file_size}")
+            await _edit_status(
+                job_id,
+                f"Job #{job_id}\nStatus: UPLOADING\nQuality: {quality}\nProgress: 100%",
+                markup=_cancel_markup(job_id),
+            )
+            await _upload_with_retries(job_id, output, cancel_event)
+            await set_job_status(job_id, JobStatus.COMPLETED, progress=100.0)
+        else:
+            await record_job_event(job_id, JobStatus.COMPLETED.value, f"dashboard file ready; bytes={file_size}")
 
-        await set_job_status(job_id, JobStatus.COMPLETED, progress=100.0)
-        await _edit_status(job_id, tr(language, "done"), clear_markup=True)
-        shutil.rmtree(job_dir, ignore_errors=True)
-    except JobCancelled:
-        await set_job_status(job_id, JobStatus.CANCELLED, event_message="cancelled by user")
-        await _edit_status(job_id, tr(language, "cancelled"), clear_markup=True)
-        shutil.rmtree(job_dir, ignore_errors=True)
+        await _edit_status(job_id, f"Job #{job_id}\nStatus: COMPLETED ✅\nQuality: {quality}")
     except Exception as exc:
-        info = classify_job_error(exc)
-        error_text = f"{info.code}: {str(exc)[:1800]}"
-        await set_job_status(
-            job_id,
-            JobStatus.FAILED,
-            error=error_text,
-            event_message=info.code,
-        )
-        await _edit_status(
-            job_id,
-            tr(language, "failed_code", code=info.code),
-            reply_markup=_retry_markup(job_id, language),
-        )
-        raise
+        info = classify_error(exc)
+        if info.code == ErrorCode.CANCELLED or cancel_event.is_set():
+            await set_job_status(job_id, JobStatus.CANCELLED, error=ErrorCode.CANCELLED.value, event_message="cancelled")
+            await _edit_status(job_id, f"Job #{job_id}\nStatus: CANCELLED")
+        else:
+            safe_message = redact_secrets(
+                str(exc), bot_token=settings.bot_token, database_url=settings.database_url
+            )[:1500]
+            await set_job_status(
+                job_id,
+                JobStatus.FAILED,
+                error=f"{info.code.value}: {safe_message}",
+                event_message=info.code.value,
+            )
+            await _edit_status(
+                job_id,
+                f"Job #{job_id}\nStatus: FAILED ❌\nError: {info.code.value}",
+                markup=_retry_markup(job_id),
+            )
     finally:
         _cancel_events.pop(job_id, None)
-
-
-async def startup(ctx) -> None:
-    await init_db()
-    hostname = socket.gethostname()
-    worker_id = settings.worker_name.strip() or f"{hostname}-{os.getpid()}"
-    ctx["worker_id"] = worker_id
-    ctx["hostname"] = hostname
-    await _heartbeat_once(worker_id, hostname)
-    ctx["heartbeat_task"] = asyncio.create_task(_heartbeat_loop(worker_id, hostname))
-    ctx["cleanup_task"] = asyncio.create_task(_cleanup_loop())
-
-
-async def shutdown(ctx) -> None:
-    for key in ("heartbeat_task", "cleanup_task"):
-        task = ctx.get(key)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-    if ctx.get("worker_id"):
-        await _heartbeat_once(
-            ctx["worker_id"],
-            ctx.get("hostname", "unknown"),
-            status="OFFLINE",
-        )
-
-
-class WorkerSettings:
-    functions = [process_download]
-    on_startup = startup
-    on_shutdown = shutdown
-    redis_settings = redis_settings()
-    max_jobs = settings.max_concurrent_jobs
-    job_timeout = 60 * 60 * 4
-    keep_result = 3600
-    max_tries = 1
+        downloader.forget(str(job_id))
+        await _update_worker(-1)
