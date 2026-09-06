@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from collections.abc import AsyncIterator
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -18,24 +20,21 @@ class Base(DeclarativeBase):
 
 
 class JobStatus(StrEnum):
-    # New lifecycle names. Legacy values are intentionally kept below so existing
-    # Railway rows remain readable without a destructive migration.
     PENDING = "PENDING"
     ANALYZING = "ANALYZING"
     READY = "READY"
     QUEUED = "QUEUED"
-    RETRYING = "RETRYING"
     DOWNLOADING = "DOWNLOADING"
     MERGING = "MERGING"
+    PROCESSING = "PROCESSING"
     CUTTING = "CUTTING"
     UPLOADING = "UPLOADING"
+    RETRYING = "RETRYING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
-
-    # Legacy statuses from early releases.
+    # Legacy row compatibility.
     PROBING = "PROBING"
-    PROCESSING = "PROCESSING"
 
 
 class User(Base):
@@ -45,8 +44,8 @@ class User(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     language: Mapped[str] = mapped_column(String(5), default="ar")
-    is_allowed: Mapped[bool] = mapped_column(default=True)
-    is_admin: Mapped[bool] = mapped_column(default=False)
+    is_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     jobs: Mapped[list["DownloadJob"]] = relationship(back_populates="user")
@@ -59,7 +58,6 @@ class DownloadJob(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     chat_id: Mapped[int] = mapped_column(BigInteger)
     progress_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-
     source_url: Mapped[str] = mapped_column(Text)
     platform: Mapped[str] = mapped_column(String(32), default="unknown")
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -69,7 +67,6 @@ class DownloadJob(Base):
     cut_start: Mapped[float | None] = mapped_column(Float, nullable=True)
     cut_end: Mapped[float | None] = mapped_column(Float, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-
     status: Mapped[str] = mapped_column(String(32), default=JobStatus.PENDING.value, index=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
     speed: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -77,7 +74,6 @@ class DownloadJob(Base):
     output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -85,18 +81,26 @@ class DownloadJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="jobs")
-    events: Mapped[list["JobEvent"]] = relationship(
-        back_populates="job", cascade="all, delete-orphan"
-    )
+    events: Mapped[list["JobEvent"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+
+
+class MediaMetadata(Base):
+    """Extension table so existing deployments need no destructive column migration."""
+
+    __tablename__ = "media_metadata"
+
+    job_id: Mapped[int] = mapped_column(ForeignKey("download_jobs.id"), primary_key=True)
+    uploader: Mapped[str | None] = mapped_column(Text, nullable=True)
+    formats_json: Mapped[str] = mapped_column(Text, default="[]")
+    normalized_url: Mapped[str] = mapped_column(Text, index=True)
+    is_playlist: Mapped[bool] = mapped_column(Boolean, default=False)
+    playlist_count: Mapped[int] = mapped_column(Integer, default=0)
+    cut_mode: Mapped[str] = mapped_column(String(16), default="PRECISE")
+    source: Mapped[str] = mapped_column(String(16), default="telegram")
+    priority: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class JobEvent(Base):
-    """Append-only lifecycle history for a download job.
-
-    A separate table lets us add durable observability to existing deployments
-    without altering the already-created download_jobs table.
-    """
-
     __tablename__ = "job_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
