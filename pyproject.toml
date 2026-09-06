@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moataz-media-bot"
-version = "0.3.0"
-description = "Bilingual Telegram media pipeline with resilient jobs, adaptive delivery, dashboard observability and FFmpeg processing."
+version = "0.4.0"
+description = "Production-hardened Telegram and Web media download manager using yt-dlp and FFmpeg."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = {text = "MIT"}
@@ -17,8 +17,6 @@ dependencies = [
   "SQLAlchemy[asyncio]==2.0.52",
   "asyncpg>=0.30,<1",
   "aiosqlite>=0.21,<1",
-  "redis>=5,<6",
-  "arq==0.28.0",
   "yt-dlp>=2026.8.19",
   "pydantic-settings>=2.10,<3",
   "jinja2>=3.1,<4",
@@ -44,7 +42,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-ignore = ["B008"]
+ignore = ["B008", "E501"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

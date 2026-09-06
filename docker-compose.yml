@@ -1,65 +1,25 @@
 services:
-  api:
+  app:
     build: .
-    env_file: .env
-    restart: unless-stopped
-    command: python -m app.main
-    ports:
-      - "${APP_PORT:-8000}:${APP_PORT:-8000}"
-    volumes:
-      - media_data:/data/downloads
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:${APP_PORT:-8000}/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-  worker:
-    build: .
-    env_file: .env
-    restart: unless-stopped
-    command: arq app.worker.WorkerSettings
-    volumes:
-      - media_data:/data/downloads
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-  postgres:
-    image: postgres:17-alpine
-    restart: unless-stopped
     environment:
-      POSTGRES_DB: moataz
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATABASE_URL: postgresql://postgres@db:5432/moataz
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - downloads:/data/downloads
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: moataz
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d moataz"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
+      interval: 5s
+      timeout: 3s
+      retries: 10
 volumes:
-  pg_data:
-  redis_data:
-  media_data:
+  downloads:
