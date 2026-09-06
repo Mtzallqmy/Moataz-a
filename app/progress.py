@@ -42,7 +42,7 @@ class ProgressSnapshot:
     eta: float | None
 
     @classmethod
-    def from_ytdlp(cls, payload: dict) -> "ProgressSnapshot":
+    def from_ytdlp(cls, payload: dict) -> ProgressSnapshot:
         downloaded = int(payload.get("downloaded_bytes") or 0)
         total = int(payload.get("total_bytes") or payload.get("total_bytes_estimate") or 0)
         percent = (downloaded / total * 100.0) if total > 0 else 0.0

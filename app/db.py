@@ -33,7 +33,6 @@ class JobStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
-    # Legacy row compatibility.
     PROBING = "PROBING"
 
 
@@ -48,7 +47,7 @@ class User(Base):
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    jobs: Mapped[list["DownloadJob"]] = relationship(back_populates="user")
+    jobs: Mapped[list[DownloadJob]] = relationship(back_populates="user")
 
 
 class DownloadJob(Base):
@@ -81,12 +80,10 @@ class DownloadJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="jobs")
-    events: Mapped[list["JobEvent"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+    events: Mapped[list[JobEvent]] = relationship(back_populates="job", cascade="all, delete-orphan")
 
 
 class MediaMetadata(Base):
-    """Extension table so existing deployments need no destructive column migration."""
-
     __tablename__ = "media_metadata"
 
     job_id: Mapped[int] = mapped_column(ForeignKey("download_jobs.id"), primary_key=True)
