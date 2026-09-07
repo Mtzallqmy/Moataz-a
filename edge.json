@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "runtime": "python-3.12-managed",
+  "mode": "telegram-service",
+  "entrypoint": "edge_entry.py",
+  "handler": "process_update",
+  "packages": [
+    "aiogram",
+    "aiohttp",
+    "SQLAlchemy",
+    "aiosqlite",
+    "pydantic-settings",
+    "yt-dlp",
+    "jinja2",
+    "python-multipart"
+  ],
+  "capabilities": [
+    "telegram",
+    "network",
+    "storage",
+    "background-jobs"
+  ]
+}
