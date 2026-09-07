@@ -22,10 +22,11 @@ jobs:
           pip install --no-deps -e .
           pip install \
             "aiohttp==3.10.10" \
-            "aiogram==3.17.0" \
+            "pydantic==2.11.7" \
+            "pydantic-settings==2.10.1" \
+            "aiogram==3.20.0.post0" \
             "SQLAlchemy==2.0.52" \
             "aiosqlite>=0.21,<1" \
-            "pydantic-settings>=2.10,<3" \
             "yt-dlp>=2026.8.19" \
             "jinja2>=3.1,<4" \
             "python-multipart>=0.0.20,<1"
@@ -39,10 +40,14 @@ jobs:
         run: |
           source /tmp/moataz-edge-runtime/bin/activate
           EDGE_HOST=1 python - <<'PY'
+          import aiogram
+          import pydantic
           import edge_entry
           from app.bot import create_dispatcher
           from app.services.providers import format_selector
 
+          assert aiogram.__version__ == "3.20.0.post0"
+          assert pydantic.VERSION == "2.11.7"
           dispatcher = create_dispatcher()
           assert dispatcher is not None
           assert "acodec!=none" in format_selector("720p")
