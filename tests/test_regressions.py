@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +37,37 @@ def test_telegram_client_is_pinned_to_official_production_api():
 
     bot = create_bot()
     assert "api.telegram.org" in bot.session.api.base
+
+
+@pytest.mark.asyncio
+async def test_url_breaks_stale_cut_state_and_uses_normal_analyzer(monkeypatch):
+    pytest.importorskip("aiogram")
+    from app.bot import state_recovery
+
+    message = SimpleNamespace(text="https://www.facebook.com/share/v/example/")
+    calls = []
+
+    class FakeState:
+        cleared = False
+
+        async def clear(self):
+            self.cleared = True
+
+    state = FakeState()
+
+    async def fake_analyze(received_message):
+        calls.append(received_message)
+
+    monkeypatch.setattr(state_recovery, "analyze_text", fake_analyze)
+
+    url_filter = state_recovery.ContainsMediaURL()
+    assert await url_filter(message) is True
+    assert await url_filter(SimpleNamespace(text="00:10 - 00:20")) is False
+
+    await state_recovery.recover_url_from_stale_cut_state(message, state)
+
+    assert state.cleared is True
+    assert calls == [message]
 
 
 @pytest.mark.asyncio
