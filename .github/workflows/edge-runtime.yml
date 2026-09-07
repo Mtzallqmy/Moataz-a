@@ -1,0 +1,54 @@
+name: Edge Runtime Compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  android-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Android-host dependency profile
+        shell: bash
+        run: |
+          python -m venv /tmp/moataz-edge-runtime
+          source /tmp/moataz-edge-runtime/bin/activate
+          python -m pip install --upgrade pip
+          pip install --no-deps -e .
+          pip install \
+            "aiohttp==3.10.10" \
+            "aiogram==3.17.0" \
+            "SQLAlchemy==2.0.52" \
+            "aiosqlite>=0.21,<1" \
+            "pydantic-settings>=2.10,<3" \
+            "yt-dlp>=2026.8.19" \
+            "jinja2>=3.1,<4" \
+            "python-multipart>=0.0.20,<1"
+      - name: Compile Android hosted adapter
+        shell: bash
+        run: |
+          source /tmp/moataz-edge-runtime/bin/activate
+          python -m compileall -q app edge_entry.py
+      - name: Import hosted service with Android package versions
+        shell: bash
+        run: |
+          source /tmp/moataz-edge-runtime/bin/activate
+          EDGE_HOST=1 python - <<'PY'
+          import edge_entry
+          from app.bot import create_dispatcher
+          from app.services.providers import format_selector
+
+          dispatcher = create_dispatcher()
+          assert dispatcher is not None
+          assert "acodec!=none" in format_selector("720p")
+          assert callable(edge_entry.process_update)
+          assert callable(edge_entry.startup)
+          assert callable(edge_entry.health)
+          assert callable(edge_entry.shutdown)
+          print("Moataz Edge Android runtime profile: OK")
+          PY
