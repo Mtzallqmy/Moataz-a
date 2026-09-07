@@ -7,7 +7,6 @@ It deliberately does not start FastAPI, Uvicorn or another Telegram polling loop
 
 from __future__ import annotations
 
-import json
 import os
 from contextlib import suppress
 from typing import Any
