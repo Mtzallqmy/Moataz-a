@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from app.config import get_settings
-from app.services.openai_compatible import AIProviderError, OpenAICompatibleProvider
+from app.services.openai_compatible import AIProviderError, ChatReply, OpenAICompatibleProvider
 
 _PROVIDER_ENV_RE = re.compile(
     r"^AI_PROVIDER_([A-Z0-9][A-Z0-9_]*)_(NAME|BASE_URL|API_TOKEN|API_KEY|PRIORITY)$"
@@ -190,9 +190,13 @@ def load_provider_specs(env: Mapping[str, str] | None = None) -> list[ProviderSp
             )
         )
 
-    settings = get_settings()
-    legacy_base = _normalize_base_url(settings.openai_base_url)
-    legacy_token = settings.openai_api_token.strip()
+    if env is None:
+        settings = get_settings()
+        legacy_base = _normalize_base_url(settings.openai_base_url)
+        legacy_token = settings.openai_api_token.strip()
+    else:
+        legacy_base = _normalize_base_url(source.get("OPENAI_BASE_URL"))
+        legacy_token = str(source.get("OPENAI_API_TOKEN") or "").strip()
     if legacy_base and legacy_token:
         specs.append(
             ProviderSpec(
@@ -284,7 +288,7 @@ class AIProviderRegistry:
         )
         return ordered, errors
 
-    async def chat(self, provider_id: str, model: str, messages: list[dict[str, str]]):
+    async def chat(self, provider_id: str, model: str, messages: list[dict[str, str]]) -> ChatReply:
         spec = self.provider(provider_id)
         client = OpenAICompatibleProvider(spec.base_url, spec.api_token)
         return await client.chat(model, messages)
