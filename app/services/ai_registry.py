@@ -373,6 +373,8 @@ class AIProviderRegistry:
     ) -> ChatReply:
         spec = self.provider(provider_id)
         client = self._client(spec)
+        if max_reply_chars is None:
+            return await client.chat(model, messages)
         return await client.chat(model, messages, max_reply_chars=max_reply_chars)
 
 
