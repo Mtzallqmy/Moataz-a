@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 
 from aiogram import F, Router
@@ -13,16 +14,18 @@ from app.bot.access import ensure_user, is_allowed
 from app.config import get_settings
 from app.db import SessionLocal, User
 from app.i18n import tr
-from app.security import redact_secrets
-from app.services.openai_compatible import AIProviderError, get_openai_compatible_provider
+from app.services.ai_registry import get_ai_provider_registry
+from app.services.openai_compatible import AIProviderError
 
 settings = get_settings()
 router = Router(name="ai-chat")
-provider = get_openai_compatible_provider()
+registry = get_ai_provider_registry()
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_MODEL_PAGE_SIZE = 12
 
 
 class AIState(StatesGroup):
+    provider_name = State()
     model_name = State()
     chatting = State()
 
@@ -86,14 +89,57 @@ def _chat_controls(language: str = "ar") -> InlineKeyboardMarkup:
     )
 
 
-def _models_keyboard(models: list[str], language: str = "ar") -> InlineKeyboardMarkup:
+def _model_label(model: dict[str, object]) -> str:
+    provider = str(model.get("provider_name") or "AI")
+    model_id = str(model.get("model_id") or "unknown")
+    prefix = "🆓 " if model.get("is_free") is True else ""
+    label = f"{prefix}{provider} • {model_id}"
+    return label if len(label) <= 58 else label[:55] + "…"
+
+
+def _models_keyboard(
+    models: list[dict[str, object]],
+    language: str = "ar",
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    total_pages = max(1, math.ceil(len(models) / _MODEL_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * _MODEL_PAGE_SIZE
+    stop = min(len(models), start + _MODEL_PAGE_SIZE)
     rows: list[list[InlineKeyboardButton]] = []
-    for index, model in enumerate(models[:20]):
-        label = model if len(model) <= 48 else model[:45] + "…"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"aimodel:{index}")])
+    for index in range(start, stop):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=_model_label(models[index]),
+                    callback_data=f"aimodel:{index}",
+                )
+            ]
+        )
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"ai:page:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ai:noop"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"ai:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
     manual = "⌨️ Enter model ID" if language == "en" else "⌨️ إدخال Model ID يدويًا"
     home = "🏠 Home" if language == "en" else "🏠 الرئيسية"
     rows.append([InlineKeyboardButton(text=manual, callback_data="ai:manual-model")])
+    rows.append([InlineKeyboardButton(text=home, callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _providers_keyboard(providers: list[dict[str, object]], language: str = "ar") -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, provider in enumerate(providers[:40]):
+        name = str(provider.get("name") or provider.get("provider_id") or "AI")
+        rows.append([InlineKeyboardButton(text=f"🔌 {name}"[:58], callback_data=f"aiprovider:{index}")])
+    home = "🏠 Home" if language == "en" else "🏠 الرئيسية"
     rows.append([InlineKeyboardButton(text=home, callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -110,50 +156,102 @@ async def _callback_user(callback: CallbackQuery) -> User | None:
 
 
 async def _show_models(target: Message, state: FSMContext, language: str = "ar") -> None:
-    if not settings.ai_enabled:
+    providers = [provider.public_dict() for provider in registry.providers]
+    if not registry.enabled:
         text = (
-            "🤖 AI is disabled. Configure OPENAI_BASE_URL and OPENAI_API_TOKEN in Railway Variables, then redeploy."
+            "🤖 AI is disabled. Configure at least one OpenAI-compatible provider in Railway Variables."
             if language == "en"
-            else "🤖 خدمة AI غير مفعلة. أضف OPENAI_BASE_URL وOPENAI_API_TOKEN في Railway Variables ثم أعد النشر."
+            else "🤖 خدمة AI غير مفعلة. أضف مزود OpenAI-compatible واحدًا على الأقل في Railway Variables."
         )
         await target.answer(text, reply_markup=enhanced_menu_keyboard(language))
         return
+
     status = await target.answer(
-        "🤖 Reading models from the configured provider…"
+        "🤖 Reading models from all configured providers…"
         if language == "en"
-        else "🤖 جارٍ الاتصال بالمزود وقراءة النماذج المتاحة…"
+        else "🤖 جارٍ قراءة النماذج من جميع المزودين المضافين…"
     )
-    try:
-        models = await provider.list_models()
-    except AIProviderError as exc:
-        await state.set_state(AIState.model_name)
-        await state.update_data(ai_models=[])
-        safe = redact_secrets(str(exc), api_token=settings.openai_api_token)[:240]
+    models, errors = await registry.list_models()
+    serialized = [model.state_dict() for model in models]
+    await state.update_data(
+        ai_models=serialized,
+        ai_providers=providers,
+        ai_provider_errors=list(errors),
+    )
+
+    if not serialized:
+        await state.set_state(AIState.provider_name)
         text = (
-            f"The provider did not return a usable /models list ({safe}). Send the model ID exactly as your provider names it."
+            "No provider returned a usable /models list. Choose a provider and enter a model ID manually."
             if language == "en"
-            else f"لم يُرجع المزود قائمة /models قابلة للاستخدام ({safe}). أرسل Model ID كما يسميه المزود بالضبط."
+            else "لم يُرجع أي مزود قائمة /models قابلة للاستخدام. اختر المزود ثم أدخل Model ID يدويًا."
         )
-        await status.edit_text(text, reply_markup=_chat_controls(language))
+        await status.edit_text(text, reply_markup=_providers_keyboard(providers, language))
         return
-    await state.update_data(ai_models=models)
-    await status.edit_text(
-        "Choose a model:" if language == "en" else "اختر النموذج الذي تريد استخدامه:",
-        reply_markup=_models_keyboard(models, language),
-    )
+
+    free_count = sum(model.get("is_free") is True for model in serialized)
+    provider_count = len({str(model.get("provider_id") or "") for model in serialized})
+    unavailable = len(errors)
+    if language == "en":
+        text = f"🤖 Models: {len(serialized)} • 🆓 Free: {free_count} • Providers: {provider_count}"
+        if unavailable:
+            text += f" • Unavailable: {unavailable}"
+        text += "\nFree models are shown first."
+    else:
+        text = f"🤖 النماذج: {len(serialized)} • 🆓 المجانية: {free_count} • المزودون: {provider_count}"
+        if unavailable:
+            text += f" • متعذر مؤقتًا: {unavailable}"
+        text += "\nتظهر النماذج المجانية أولًا."
+    await status.edit_text(text, reply_markup=_models_keyboard(serialized, language, 0))
 
 
-async def _start_chat(target: Message, state: FSMContext, model: str, language: str) -> None:
+async def _start_chat(
+    target: Message,
+    state: FSMContext,
+    provider_id: str,
+    provider_name: str,
+    model: str,
+    language: str,
+) -> None:
     data = await state.get_data()
     models = list(data.get("ai_models") or [])
+    providers = list(data.get("ai_providers") or [])
     await state.set_state(AIState.chatting)
-    await state.update_data(ai_model=model, ai_models=models, ai_history=[])
+    await state.update_data(
+        ai_provider_id=provider_id,
+        ai_provider_name=provider_name,
+        ai_model=model,
+        ai_models=models,
+        ai_providers=providers,
+        ai_history=[],
+    )
     text = (
-        f"🤖 Model: {model}\nSend your message. Conversation context is kept for this bot session."
+        f"🤖 Provider: {provider_name}\nModel: {model}\nSend your message. Conversation context is kept for this bot session."
         if language == "en"
-        else f"🤖 النموذج: {model}\nأرسل رسالتك الآن. سأحافظ على سياق المحادثة أثناء جلسة البوت الحالية."
+        else f"🤖 المزود: {provider_name}\nالنموذج: {model}\nأرسل رسالتك الآن. سأحافظ على سياق المحادثة أثناء جلسة البوت الحالية."
     )
     await target.answer(text, reply_markup=_chat_controls(language))
+
+
+async def _ask_manual_provider(target: Message, state: FSMContext, language: str) -> None:
+    providers = [provider.public_dict() for provider in registry.providers]
+    await state.update_data(ai_providers=providers)
+    if len(providers) == 1:
+        provider = providers[0]
+        await state.set_state(AIState.model_name)
+        await state.update_data(
+            ai_manual_provider_id=str(provider["provider_id"]),
+            ai_manual_provider_name=str(provider["name"]),
+        )
+        await target.answer(
+            "Send the exact model ID." if language == "en" else "أرسل Model ID بالاسم المطابق لدى المزود."
+        )
+        return
+    await state.set_state(AIState.provider_name)
+    await target.answer(
+        "Choose the provider for the manual model ID:" if language == "en" else "اختر المزود الذي تريد إدخال Model ID له:",
+        reply_markup=_providers_keyboard(providers, language),
+    )
 
 
 @router.message(CommandStart())
@@ -193,9 +291,9 @@ async def enhanced_help(callback: CallbackQuery) -> None:
         return
     text = tr(user.language, "help")
     ai_note = (
-        "\n\n🤖 AI Chat uses the OpenAI-compatible provider configured by the service owner."
+        "\n\n🤖 AI Chat aggregates models from all OpenAI-compatible providers configured by the service owner."
         if user.language == "en"
-        else "\n\n🤖 دردشة AI تستخدم مزود OpenAI-compatible الذي يضبطه مالك الخدمة."
+        else "\n\n🤖 دردشة AI تجمع النماذج من جميع مزودي OpenAI-compatible الذين يضبطهم مالك الخدمة."
     )
     if callback.message:
         await callback.message.edit_text(text + ai_note, reply_markup=enhanced_menu_keyboard(user.language))
@@ -254,15 +352,71 @@ async def ai_models(callback: CallbackQuery, state: FSMContext) -> None:
         await _show_models(callback.message, state, user.language)
 
 
+@router.callback_query(F.data.startswith("ai:page:"))
+async def ai_models_page(callback: CallbackQuery, state: FSMContext) -> None:
+    user = await _callback_user(callback)
+    if user is None:
+        return
+    data = await state.get_data()
+    models = list(data.get("ai_models") or [])
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer()
+        return
+    free_count = sum(isinstance(model, dict) and model.get("is_free") is True for model in models)
+    if callback.message:
+        text = (
+            f"🤖 Models: {len(models)} • 🆓 Free: {free_count}\nFree models are shown first."
+            if user.language == "en"
+            else f"🤖 النماذج: {len(models)} • 🆓 المجانية: {free_count}\nتظهر النماذج المجانية أولًا."
+        )
+        await callback.message.edit_text(text, reply_markup=_models_keyboard(models, user.language, page))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ai:noop")
+async def ai_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
 @router.callback_query(F.data == "ai:manual-model")
 async def ai_manual_model(callback: CallbackQuery, state: FSMContext) -> None:
     user = await _callback_user(callback)
     if user is None:
         return
+    if callback.message:
+        await _ask_manual_provider(callback.message, state, user.language)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aiprovider:"))
+async def ai_choose_manual_provider(callback: CallbackQuery, state: FSMContext) -> None:
+    user = await _callback_user(callback)
+    if user is None:
+        return
+    data = await state.get_data()
+    providers = list(data.get("ai_providers") or [])
+    try:
+        index = int(callback.data.split(":", 1)[1])
+        provider = providers[index]
+        if not isinstance(provider, dict):
+            raise IndexError
+        provider_id = str(provider["provider_id"])
+        provider_name = str(provider["name"])
+    except (ValueError, IndexError, KeyError):
+        await callback.answer("Reopen the provider list", show_alert=True)
+        return
     await state.set_state(AIState.model_name)
+    await state.update_data(
+        ai_manual_provider_id=provider_id,
+        ai_manual_provider_name=provider_name,
+    )
     if callback.message:
         await callback.message.answer(
-            "Send the exact model ID." if user.language == "en" else "أرسل Model ID بالاسم المطابق لدى المزود."
+            f"Provider: {provider_name}\nSend the exact model ID."
+            if user.language == "en"
+            else f"المزود: {provider_name}\nأرسل Model ID بالاسم المطابق لدى المزود."
         )
     await callback.answer()
 
@@ -280,7 +434,13 @@ async def ai_model_name(message: Message, state: FSMContext) -> None:
             else "Model ID غير صالح. استخدم أحرفًا وأرقامًا و . - _ : / فقط."
         )
         return
-    await _start_chat(message, state, model, user.language)
+    data = await state.get_data()
+    provider_id = str(data.get("ai_manual_provider_id") or "")
+    provider_name = str(data.get("ai_manual_provider_name") or "")
+    if not provider_id:
+        await _ask_manual_provider(message, state, user.language)
+        return
+    await _start_chat(message, state, provider_id, provider_name or provider_id, model, user.language)
 
 
 @router.callback_query(F.data == "ai:new")
@@ -289,13 +449,27 @@ async def ai_new_chat(callback: CallbackQuery, state: FSMContext) -> None:
     if user is None:
         return
     data = await state.get_data()
+    provider_id = str(data.get("ai_provider_id") or "")
+    provider_name = str(data.get("ai_provider_name") or provider_id)
     model = str(data.get("ai_model") or "")
     models = list(data.get("ai_models") or [])
+    providers = list(data.get("ai_providers") or [])
     await state.clear()
-    if model and callback.message:
+    if provider_id and model and callback.message:
         await state.set_state(AIState.chatting)
-        await state.update_data(ai_model=model, ai_models=models, ai_history=[])
-        text = f"🧹 New chat with {model}." if user.language == "en" else f"🧹 بدأت محادثة جديدة مع {model}."
+        await state.update_data(
+            ai_provider_id=provider_id,
+            ai_provider_name=provider_name,
+            ai_model=model,
+            ai_models=models,
+            ai_providers=providers,
+            ai_history=[],
+        )
+        text = (
+            f"🧹 New chat with {provider_name} • {model}."
+            if user.language == "en"
+            else f"🧹 بدأت محادثة جديدة مع {provider_name} • {model}."
+        )
         await callback.message.answer(text, reply_markup=_chat_controls(user.language))
     elif callback.message:
         await _show_models(callback.message, state, user.language)
@@ -311,12 +485,17 @@ async def ai_choose_model(callback: CallbackQuery, state: FSMContext) -> None:
     models = list(data.get("ai_models") or [])
     try:
         index = int(callback.data.split(":", 1)[1])
-        model = str(models[index])
-    except (ValueError, IndexError):
+        selected = models[index]
+        if not isinstance(selected, dict):
+            raise IndexError
+        provider_id = str(selected["provider_id"])
+        provider_name = str(selected["provider_name"])
+        model = str(selected["model_id"])
+    except (ValueError, IndexError, KeyError):
         await callback.answer("Reopen the model list", show_alert=True)
         return
     if callback.message:
-        await _start_chat(callback.message, state, model, user.language)
+        await _start_chat(callback.message, state, provider_id, provider_name, model, user.language)
     await callback.answer()
 
 
@@ -326,9 +505,11 @@ async def ai_chat_message(message: Message, state: FSMContext) -> None:
         return
     user = await ensure_user(message.from_user.id, message.from_user.username)
     data = await state.get_data()
+    provider_id = str(data.get("ai_provider_id") or "")
+    provider_name = str(data.get("ai_provider_name") or provider_id)
     model = str(data.get("ai_model") or "")
     history = list(data.get("ai_history") or [])
-    if not model:
+    if not provider_id or not model:
         await state.clear()
         await _show_models(message, state, user.language)
         return
@@ -336,16 +517,21 @@ async def ai_chat_message(message: Message, state: FSMContext) -> None:
     history.append({"role": "user", "content": message.text[:8000]})
     thinking = await message.answer("🤖 Thinking…" if user.language == "en" else "🤖 يفكر…")
     try:
-        reply = await provider.chat(model, history)
+        reply = await registry.chat(provider_id, model, history)
     except AIProviderError as exc:
-        safe = redact_secrets(str(exc), api_token=settings.openai_api_token)[:300]
+        safe = str(exc)[:300]
         text = f"AI request failed: {safe}" if user.language == "en" else f"تعذر إكمال طلب AI: {safe}"
         await thinking.edit_text(text, reply_markup=_chat_controls(user.language))
         return
 
     history.append({"role": "assistant", "content": reply.text})
     history = history[-settings.ai_max_history_messages :]
-    await state.update_data(ai_history=history, ai_model=reply.model or model)
+    await state.update_data(
+        ai_history=history,
+        ai_provider_id=provider_id,
+        ai_provider_name=provider_name,
+        ai_model=reply.model or model,
+    )
     try:
         await thinking.delete()
     except Exception:
