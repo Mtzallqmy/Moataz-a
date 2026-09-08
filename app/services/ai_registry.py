@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from app.config import get_settings
 from app.services.openai_compatible import AIProviderError, ChatReply, OpenAICompatibleProvider
+from app.services.runware_provider import RunwareOpenAIProvider
 
 _PROVIDER_ENV_RE = re.compile(
     r"^AI_PROVIDER_([A-Z0-9][A-Z0-9_]*)_(NAME|BASE_URL|API_TOKEN|API_KEY|PRIORITY)$"
@@ -24,12 +25,28 @@ _PRESETS = (
         20,
     ),
     (
+        "runware",
+        "Runware",
+        ("RUNWARE_API_TOKEN", "RUNWARE_API_KEY"),
+        "RUNWARE_BASE_URL",
+        "https://api.runware.ai/v1",
+        25,
+    ),
+    (
         "nvidia",
         "NVIDIA",
         ("NVIDIA_API_TOKEN", "NVIDIA_API_KEY"),
         "NVIDIA_BASE_URL",
         "https://integrate.api.nvidia.com/v1",
         30,
+    ),
+    (
+        "agentrouter",
+        "AgentRouter",
+        ("AGENTROUTER_API_TOKEN", "AGENTROUTER_API_KEY"),
+        "AGENTROUTER_BASE_URL",
+        "https://co.agentrouter.org/v1",
+        35,
     ),
     (
         "xai",
@@ -74,15 +91,24 @@ class CatalogModel:
     model_id: str
     is_free: bool | None = None
     priority: int = 100
+    capabilities: tuple[str, ...] = ()
+    input_modalities: tuple[str, ...] = ()
+    output_modalities: tuple[str, ...] = ()
 
-    def state_dict(self) -> dict[str, str | bool | int | None]:
+    def state_dict(self) -> dict[str, object]:
         return {
             "provider_id": self.provider_id,
             "provider_name": self.provider_name,
             "model_id": self.model_id,
             "is_free": self.is_free,
             "priority": self.priority,
+            "capabilities": list(self.capabilities),
+            "input_modalities": list(self.input_modalities),
+            "output_modalities": list(self.output_modalities),
         }
+
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
 
 
 def _normalize_base_url(value: object) -> str:
@@ -113,6 +139,10 @@ def _infer_name(base_url: str) -> str:
         return "Nara Router"
     if "openrouter.ai" in host:
         return "OpenRouter"
+    if "runware.ai" in host:
+        return "Runware"
+    if "agentrouter.org" in host:
+        return "AgentRouter"
     if "nvidia.com" in host:
         return "NVIDIA"
     if host.endswith("x.ai"):
@@ -135,6 +165,11 @@ def _priority(value: object, default: int) -> int:
         return max(0, min(int(str(value)), 1000))
     except (TypeError, ValueError):
         return default
+
+
+def _is_runware_url(base_url: str) -> bool:
+    host = (urlsplit(base_url).hostname or "").lower()
+    return host == "runware.ai" or host.endswith(".runware.ai")
 
 
 def load_provider_specs(env: Mapping[str, str] | None = None) -> list[ProviderSpec]:
@@ -248,9 +283,15 @@ class AIProviderRegistry:
         except KeyError as exc:
             raise AIProviderError("AI provider is no longer configured") from exc
 
+    @staticmethod
+    def _client(spec: ProviderSpec) -> OpenAICompatibleProvider:
+        if _is_runware_url(spec.base_url):
+            return RunwareOpenAIProvider(spec.base_url, spec.api_token)
+        return OpenAICompatibleProvider(spec.base_url, spec.api_token)
+
     async def list_models(self) -> tuple[list[CatalogModel], dict[str, str]]:
         async def fetch(spec: ProviderSpec) -> tuple[ProviderSpec, object]:
-            client = OpenAICompatibleProvider(spec.base_url, spec.api_token)
+            client = self._client(spec)
             try:
                 return spec, await client.list_model_infos()
             except AIProviderError as exc:
@@ -271,6 +312,9 @@ class AIProviderRegistry:
                         model_id=model.model_id,
                         is_free=model.is_free,
                         priority=spec.priority,
+                        capabilities=model.capabilities,
+                        input_modalities=model.input_modalities,
+                        output_modalities=model.output_modalities,
                     )
                 )
 
@@ -288,10 +332,50 @@ class AIProviderRegistry:
         )
         return ordered, errors
 
-    async def chat(self, provider_id: str, model: str, messages: list[dict[str, str]]) -> ChatReply:
+    async def models_for(self, capability: str) -> tuple[list[CatalogModel], dict[str, str]]:
+        models, errors = await self.list_models()
+        if capability == "free":
+            return [model for model in models if model.is_free is True], errors
+        return [model for model in models if model.supports(capability)], errors
+
+    async def probe(self) -> list[dict[str, object]]:
+        async def check(spec: ProviderSpec) -> dict[str, object]:
+            client = self._client(spec)
+            try:
+                if isinstance(client, RunwareOpenAIProvider):
+                    await client.probe_credentials()
+                models = await client.list_model_infos()
+                capabilities = sorted({capability for model in models for capability in model.capabilities})
+                return {
+                    "provider_id": spec.provider_id,
+                    "provider_name": spec.name,
+                    "ok": True,
+                    "model_count": len(models),
+                    "capabilities": capabilities,
+                }
+            except AIProviderError as exc:
+                return {
+                    "provider_id": spec.provider_id,
+                    "provider_name": spec.name,
+                    "ok": False,
+                    "error": str(exc)[:180],
+                }
+
+        return list(await asyncio.gather(*(check(spec) for spec in self.providers)))
+
+    async def chat(
+        self,
+        provider_id: str,
+        model: str,
+        messages: list[dict[str, object]],
+        *,
+        max_reply_chars: int | None = None,
+    ) -> ChatReply:
         spec = self.provider(provider_id)
-        client = OpenAICompatibleProvider(spec.base_url, spec.api_token)
-        return await client.chat(model, messages)
+        client = self._client(spec)
+        if max_reply_chars is None:
+            return await client.chat(model, messages)
+        return await client.chat(model, messages, max_reply_chars=max_reply_chars)
 
 
 _registry: AIProviderRegistry | None = None

@@ -22,6 +22,7 @@ from app.db import DownloadJob, SessionLocal, init_db
 from app.operations import mark_stale_workers_offline, readiness_snapshot, reconcile_stale_jobs
 from app.queue import enqueue_download, shutdown_queue, start_queue
 from app.security import redact_secrets
+from app.services.ai_registry import get_ai_provider_registry
 from app.version import RELEASE
 
 settings = get_settings()
@@ -30,6 +31,7 @@ dispatcher = create_dispatcher()
 bot: Bot | None = None
 polling_task: asyncio.Task | None = None
 maintenance_task: asyncio.Task | None = None
+ai_probe_task: asyncio.Task | None = None
 
 
 def _redact(value: object) -> str:
@@ -114,9 +116,36 @@ async def _maintenance_loop() -> None:
         await asyncio.sleep(60)
 
 
+async def _probe_ai_providers() -> None:
+    await asyncio.sleep(2)
+    registry = get_ai_provider_registry()
+    if not registry.enabled:
+        logger.info("AI provider registry is disabled")
+        return
+    try:
+        checks = await registry.probe()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("AI provider probe failed with %s", type(exc).__name__)
+        return
+    for check in checks:
+        name = str(check.get("provider_name") or check.get("provider_id") or "AI")
+        if check.get("ok") is True:
+            capabilities = ",".join(str(item) for item in check.get("capabilities") or []) or "text"
+            logger.info(
+                "AI provider %s ready: %s models; capabilities=%s",
+                name,
+                int(check.get("model_count") or 0),
+                capabilities,
+            )
+        else:
+            logger.warning("AI provider %s unavailable: %s", name, str(check.get("error") or "unknown error")[:180])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    global bot, polling_task, maintenance_task
+    global bot, polling_task, maintenance_task, ai_probe_task
     configure_logging()
     if not settings.bot_token.strip():
         raise RuntimeError("BOT_TOKEN is required")
@@ -130,6 +159,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     bot = create_bot()
     polling_task = asyncio.create_task(_run_polling_forever(bot), name="telegram-polling")
     maintenance_task = asyncio.create_task(_maintenance_loop(), name="maintenance")
+    ai_probe_task = asyncio.create_task(_probe_ai_providers(), name="ai-provider-probe")
     logger.info("Starting %s release %s", settings.app_name, RELEASE)
     try:
         yield
@@ -142,6 +172,10 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             maintenance_task.cancel()
             with suppress(asyncio.CancelledError):
                 await maintenance_task
+        if ai_probe_task:
+            ai_probe_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await ai_probe_task
         await shutdown_queue()
         if bot:
             await bot.session.close()
@@ -162,7 +196,7 @@ async def root():
         "mode": "polling",
         "queue": "inline",
         "dashboard": "/dashboard" if settings.dashboard_password else "disabled",
-        "ai_provider": "configured" if settings.ai_enabled else "disabled",
+        "ai_provider": "configured" if get_ai_provider_registry().enabled else "disabled",
     }
 
 

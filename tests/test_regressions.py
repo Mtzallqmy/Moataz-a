@@ -26,8 +26,12 @@ def test_env_example_documents_core_and_multi_provider_ai_variables():
     assert {
         "OPENROUTER_BASE_URL",
         "OPENROUTER_API_TOKEN",
+        "RUNWARE_BASE_URL",
+        "RUNWARE_API_TOKEN",
         "NVIDIA_BASE_URL",
         "NVIDIA_API_TOKEN",
+        "AGENTROUTER_BASE_URL",
+        "AGENTROUTER_API_TOKEN",
         "XAI_BASE_URL",
         "XAI_API_TOKEN",
         "GROQ_BASE_URL",

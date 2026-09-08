@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     ai_request_timeout_seconds: int = 120
     ai_max_history_messages: int = 20
-    ai_max_reply_chars: int = 12_000
+    ai_max_reply_chars: int = 60_000
 
     dashboard_username: str = "admin"
     dashboard_password: str = ""
