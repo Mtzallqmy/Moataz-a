@@ -21,11 +21,17 @@ class ChatReply:
     model: str
 
 
+@dataclass(frozen=True, slots=True)
+class ModelInfo:
+    model_id: str
+    is_free: bool | None = None
+
+
 class OpenAICompatibleProvider:
     """Minimal OpenAI-compatible client without an SDK dependency.
 
-    OPENAI_BASE_URL is treated as the API root, normally ending in `/v1`.
-    Only `/models` and `/chat/completions` are used.
+    The configured base URL is treated as the API root, normally ending in
+    `/v1`. Only `/models` and `/chat/completions` are required.
     """
 
     def __init__(self, base_url: str | None = None, api_token: str | None = None) -> None:
@@ -74,15 +80,60 @@ class OpenAICompatibleProvider:
         except aiohttp.ClientError as exc:
             raise AIProviderError(f"AI provider network error: {type(exc).__name__}") from exc
 
-    async def list_models(self) -> list[str]:
+    @staticmethod
+    def _number(value: object) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _is_free_model(cls, item: dict[str, Any]) -> bool | None:
+        model_id = str(item.get("id") or "").lower()
+        if model_id.endswith(":free"):
+            return True
+
+        for key in ("is_free", "free"):
+            flag = item.get(key)
+            if isinstance(flag, bool):
+                return flag
+
+        pricing = item.get("pricing")
+        if not isinstance(pricing, dict):
+            return None
+        values = [
+            cls._number(pricing.get(key))
+            for key in ("prompt", "completion", "input", "output", "request")
+            if key in pricing
+        ]
+        known = [value for value in values if value is not None]
+        if not known:
+            return None
+        if all(value == 0 for value in known):
+            return True
+        if any(value > 0 for value in known):
+            return False
+        return None
+
+    async def list_model_infos(self) -> list[ModelInfo]:
         payload = await self._request_json("GET", "models")
         items = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(items, list):
             raise AIProviderError("AI provider returned an invalid /models response")
-        models = sorted({str(item.get("id")) for item in items if isinstance(item, dict) and item.get("id")})
+        models: dict[str, ModelInfo] = {}
+        for item in items:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            model_id = str(item["id"])
+            models[model_id] = ModelInfo(model_id=model_id, is_free=self._is_free_model(item))
         if not models:
             raise AIProviderError("AI provider returned no models")
-        return models
+        return sorted(models.values(), key=lambda model: (model.is_free is not True, model.model_id.lower()))
+
+    async def list_models(self) -> list[str]:
+        return [model.model_id for model in await self.list_model_infos()]
 
     async def chat(self, model: str, messages: list[dict[str, str]]) -> ChatReply:
         model = model.strip()
