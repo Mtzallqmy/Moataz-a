@@ -16,10 +16,11 @@ def test_load_provider_specs_supports_multiple_keys_for_same_vendor():
     }
 
     specs = load_provider_specs(env)
+    by_id = {spec.provider_id: spec for spec in specs}
 
-    assert [spec.provider_id for spec in specs] == ["router_a", "router_b"]
-    assert specs[0].base_url == specs[1].base_url
-    assert specs[0].api_token != specs[1].api_token
+    assert set(by_id) == {"router_a", "router_b"}
+    assert by_id["router_a"].base_url == by_id["router_b"].base_url
+    assert by_id["router_a"].api_token != by_id["router_b"].api_token
 
 
 def test_named_presets_use_official_openai_compatible_roots():
