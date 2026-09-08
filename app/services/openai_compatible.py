@@ -8,6 +8,7 @@ import aiohttp
 
 from app.config import get_settings
 from app.security import redact_secrets
+from app.services.model_capabilities import extract_capabilities, extract_modalities
 
 settings = get_settings()
 _FREE_MODEL_TOKEN = re.compile(r"(?:^|[/:._-])free(?:$|[/:._-])", re.IGNORECASE)
@@ -27,13 +28,16 @@ class ChatReply:
 class ModelInfo:
     model_id: str
     is_free: bool | None = None
+    capabilities: tuple[str, ...] = ()
+    input_modalities: tuple[str, ...] = ()
+    output_modalities: tuple[str, ...] = ()
 
 
 class OpenAICompatibleProvider:
     """Minimal OpenAI-compatible client without an SDK dependency.
 
     The configured base URL is treated as the API root, normally ending in
-    `/v1`. Only `/models` and `/chat/completions` are required.
+    `/v1`. `/models` is used for discovery and `/chat/completions` for chat.
     """
 
     def __init__(self, base_url: str | None = None, api_token: str | None = None) -> None:
@@ -61,7 +65,7 @@ class OpenAICompatibleProvider:
         method: str,
         path: str,
         *,
-        json_body: dict[str, Any] | None = None,
+        json_body: object | None = None,
     ) -> object:
         if not self.enabled:
             raise AIProviderError("OpenAI-compatible provider is not configured")
@@ -129,23 +133,42 @@ class OpenAICompatibleProvider:
             if not isinstance(item, dict) or not item.get("id"):
                 continue
             model_id = str(item["id"])
-            models[model_id] = ModelInfo(model_id=model_id, is_free=self._is_free_model(item))
+            input_modalities, output_modalities = extract_modalities(item)
+            models[model_id] = ModelInfo(
+                model_id=model_id,
+                is_free=self._is_free_model(item),
+                capabilities=extract_capabilities(item),
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+            )
         if not models:
             raise AIProviderError("AI provider returned no models")
-        return sorted(models.values(), key=lambda model: (model.is_free is not True, model.model_id.lower()))
+        return sorted(
+            models.values(),
+            key=lambda model: (model.is_free is not True, model.model_id.lower()),
+        )
 
     async def list_models(self) -> list[str]:
         return [model.model_id for model in await self.list_model_infos()]
 
-    async def chat(self, model: str, messages: list[dict[str, str]]) -> ChatReply:
+    async def chat(self, model: str, messages: list[dict[str, Any]]) -> ChatReply:
         model = model.strip()
         if not model:
             raise AIProviderError("A model must be selected")
-        cleaned = [
-            {"role": str(item.get("role") or "user"), "content": str(item.get("content") or "")}
-            for item in messages[-settings.ai_max_history_messages :]
-            if item.get("content")
-        ]
+
+        cleaned: list[dict[str, Any]] = []
+        for item in messages[-settings.ai_max_history_messages :]:
+            content = item.get("content")
+            if content in (None, "", []):
+                continue
+            if not isinstance(content, (str, list, dict)):
+                content = str(content)
+            cleaned.append(
+                {
+                    "role": str(item.get("role") or "user"),
+                    "content": content,
+                }
+            )
         if not cleaned:
             raise AIProviderError("Chat message is empty")
 
