@@ -17,9 +17,14 @@ def test_railway_uses_single_service_startup():
     assert "redis" not in text.lower()
 
 
-def test_env_example_only_contains_basic_required_variables():
+def test_env_example_contains_core_and_optional_ai_variables_only():
     lines = [line.strip() for line in Path(".env.example").read_text().splitlines() if line.strip()]
-    assert lines == ["BOT_TOKEN=", "DATABASE_URL="]
+    assert lines == [
+        "BOT_TOKEN=",
+        "DATABASE_URL=",
+        "OPENAI_BASE_URL=",
+        "OPENAI_API_TOKEN=",
+    ]
 
 
 def test_router_can_be_requested_repeatedly_without_already_attached_error():
