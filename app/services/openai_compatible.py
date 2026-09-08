@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 
 from app.config import get_settings
+from app.security import redact_secrets
 
 settings = get_settings()
 
@@ -20,9 +22,15 @@ class ChatReply:
 
 
 class OpenAICompatibleProvider:
+    """Minimal OpenAI-compatible client without an SDK dependency.
+
+    OPENAI_BASE_URL is treated as the API root, normally ending in `/v1`.
+    Only `/models` and `/chat/completions` are used.
+    """
+
     def __init__(self, base_url: str | None = None, api_token: str | None = None) -> None:
         self.base_url = (base_url if base_url is not None else settings.openai_base_url).rstrip("/")
-        self.api_token = api_token if api_token is not None else settings.openai_api_token
+        self.api_token = (api_token if api_token is not None else settings.openai_api_token).strip()
 
     @property
     def enabled(self) -> bool:
@@ -37,19 +45,37 @@ class OpenAICompatibleProvider:
             "Accept": "application/json",
         }
 
-    async def list_models(self) -> list[str]:
+    def _safe(self, value: object) -> str:
+        return redact_secrets(value, api_token=self.api_token)
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> object:
+        if not self.enabled:
+            raise AIProviderError("OpenAI-compatible provider is not configured")
         timeout = aiohttp.ClientTimeout(total=settings.ai_request_timeout_seconds)
+        url = f"{self.base_url}/{path.lstrip('/')}"
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=self._headers()) as session:
-                async with session.get(f"{self.base_url}/models") as response:
-                    payload = await response.json(content_type=None)
+                async with session.request(method, url, json=json_body) as response:
+                    try:
+                        payload = await response.json(content_type=None)
+                    except (ValueError, TypeError) as exc:
+                        raise AIProviderError(f"AI provider HTTP {response.status}: invalid JSON response") from exc
                     if response.status >= 400:
                         raise AIProviderError(self._error_message(response.status, payload))
+                    return payload
         except TimeoutError as exc:
-            raise AIProviderError("AI provider timed out while listing models") from exc
+            raise AIProviderError("AI provider request timed out") from exc
         except aiohttp.ClientError as exc:
             raise AIProviderError(f"AI provider network error: {type(exc).__name__}") from exc
 
+    async def list_models(self) -> list[str]:
+        payload = await self._request_json("GET", "models")
         items = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(items, list):
             raise AIProviderError("AI provider returned an invalid /models response")
@@ -70,19 +96,11 @@ class OpenAICompatibleProvider:
         if not cleaned:
             raise AIProviderError("Chat message is empty")
 
-        timeout = aiohttp.ClientTimeout(total=settings.ai_request_timeout_seconds)
-        body = {"model": model, "messages": cleaned, "stream": False}
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=self._headers()) as session:
-                async with session.post(f"{self.base_url}/chat/completions", json=body) as response:
-                    payload = await response.json(content_type=None)
-                    if response.status >= 400:
-                        raise AIProviderError(self._error_message(response.status, payload))
-        except TimeoutError as exc:
-            raise AIProviderError("AI provider request timed out") from exc
-        except aiohttp.ClientError as exc:
-            raise AIProviderError(f"AI provider network error: {type(exc).__name__}") from exc
-
+        payload = await self._request_json(
+            "POST",
+            "chat/completions",
+            json_body={"model": model, "messages": cleaned, "stream": False},
+        )
         try:
             choice = payload["choices"][0]
             message = choice["message"]
@@ -100,8 +118,7 @@ class OpenAICompatibleProvider:
         response_model = str(payload.get("model") or model) if isinstance(payload, dict) else model
         return ChatReply(text=text[: settings.ai_max_reply_chars], model=response_model)
 
-    @staticmethod
-    def _error_message(status: int, payload: object) -> str:
+    def _error_message(self, status: int, payload: object) -> str:
         detail = ""
         if isinstance(payload, dict):
             error = payload.get("error")
@@ -109,7 +126,7 @@ class OpenAICompatibleProvider:
                 detail = str(error.get("message") or error.get("type") or "")
             elif error:
                 detail = str(error)
-        detail = detail[:300].strip()
+        detail = self._safe(detail)[:300].strip()
         return f"AI provider HTTP {status}" + (f": {detail}" if detail else "")
 
 
