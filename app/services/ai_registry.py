@@ -24,12 +24,28 @@ _PRESETS = (
         20,
     ),
     (
+        "runware",
+        "Runware",
+        ("RUNWARE_API_TOKEN", "RUNWARE_API_KEY"),
+        "RUNWARE_BASE_URL",
+        "https://api.runware.ai/v1",
+        25,
+    ),
+    (
         "nvidia",
         "NVIDIA",
         ("NVIDIA_API_TOKEN", "NVIDIA_API_KEY"),
         "NVIDIA_BASE_URL",
         "https://integrate.api.nvidia.com/v1",
         30,
+    ),
+    (
+        "agentrouter",
+        "AgentRouter",
+        ("AGENTROUTER_API_TOKEN", "AGENTROUTER_API_KEY"),
+        "AGENTROUTER_BASE_URL",
+        "https://co.agentrouter.org/v1",
+        35,
     ),
     (
         "xai",
@@ -74,15 +90,24 @@ class CatalogModel:
     model_id: str
     is_free: bool | None = None
     priority: int = 100
+    capabilities: tuple[str, ...] = ()
+    input_modalities: tuple[str, ...] = ()
+    output_modalities: tuple[str, ...] = ()
 
-    def state_dict(self) -> dict[str, str | bool | int | None]:
+    def state_dict(self) -> dict[str, object]:
         return {
             "provider_id": self.provider_id,
             "provider_name": self.provider_name,
             "model_id": self.model_id,
             "is_free": self.is_free,
             "priority": self.priority,
+            "capabilities": list(self.capabilities),
+            "input_modalities": list(self.input_modalities),
+            "output_modalities": list(self.output_modalities),
         }
+
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
 
 
 def _normalize_base_url(value: object) -> str:
@@ -113,6 +138,10 @@ def _infer_name(base_url: str) -> str:
         return "Nara Router"
     if "openrouter.ai" in host:
         return "OpenRouter"
+    if "runware.ai" in host:
+        return "Runware"
+    if "agentrouter.org" in host:
+        return "AgentRouter"
     if "nvidia.com" in host:
         return "NVIDIA"
     if host.endswith("x.ai"):
@@ -271,6 +300,9 @@ class AIProviderRegistry:
                         model_id=model.model_id,
                         is_free=model.is_free,
                         priority=spec.priority,
+                        capabilities=model.capabilities,
+                        input_modalities=model.input_modalities,
+                        output_modalities=model.output_modalities,
                     )
                 )
 
@@ -288,7 +320,36 @@ class AIProviderRegistry:
         )
         return ordered, errors
 
-    async def chat(self, provider_id: str, model: str, messages: list[dict[str, str]]) -> ChatReply:
+    async def models_for(self, capability: str) -> tuple[list[CatalogModel], dict[str, str]]:
+        models, errors = await self.list_models()
+        if capability == "free":
+            return [model for model in models if model.is_free is True], errors
+        return [model for model in models if model.supports(capability)], errors
+
+    async def probe(self) -> list[dict[str, object]]:
+        async def check(spec: ProviderSpec) -> dict[str, object]:
+            client = OpenAICompatibleProvider(spec.base_url, spec.api_token)
+            try:
+                models = await client.list_model_infos()
+                capabilities = sorted({capability for model in models for capability in model.capabilities})
+                return {
+                    "provider_id": spec.provider_id,
+                    "provider_name": spec.name,
+                    "ok": True,
+                    "model_count": len(models),
+                    "capabilities": capabilities,
+                }
+            except AIProviderError as exc:
+                return {
+                    "provider_id": spec.provider_id,
+                    "provider_name": spec.name,
+                    "ok": False,
+                    "error": str(exc)[:180],
+                }
+
+        return list(await asyncio.gather(*(check(spec) for spec in self.providers)))
+
+    async def chat(self, provider_id: str, model: str, messages: list[dict[str, object]]) -> ChatReply:
         spec = self.provider(provider_id)
         client = OpenAICompatibleProvider(spec.base_url, spec.api_token)
         return await client.chat(model, messages)
