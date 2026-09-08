@@ -12,6 +12,7 @@ from app.services.model_capabilities import extract_capabilities, extract_modali
 
 settings = get_settings()
 _FREE_MODEL_TOKEN = re.compile(r"(?:^|[/:._-])free(?:$|[/:._-])", re.IGNORECASE)
+_MAX_ARTIFACT_REPLY_CHARS = 250_000
 
 
 class AIProviderError(RuntimeError):
@@ -151,7 +152,13 @@ class OpenAICompatibleProvider:
     async def list_models(self) -> list[str]:
         return [model.model_id for model in await self.list_model_infos()]
 
-    async def chat(self, model: str, messages: list[dict[str, Any]]) -> ChatReply:
+    async def chat(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        max_reply_chars: int | None = None,
+    ) -> ChatReply:
         model = model.strip()
         if not model:
             raise AIProviderError("A model must be selected")
@@ -192,7 +199,9 @@ class OpenAICompatibleProvider:
         if not text:
             raise AIProviderError("AI provider returned an empty response")
         response_model = str(payload.get("model") or model) if isinstance(payload, dict) else model
-        return ChatReply(text=text[: settings.ai_max_reply_chars], model=response_model)
+        requested_limit = settings.ai_max_reply_chars if max_reply_chars is None else int(max_reply_chars)
+        reply_limit = max(1000, min(requested_limit, _MAX_ARTIFACT_REPLY_CHARS))
+        return ChatReply(text=text[:reply_limit], model=response_model)
 
     def _error_message(self, status: int, payload: object) -> str:
         detail = ""
