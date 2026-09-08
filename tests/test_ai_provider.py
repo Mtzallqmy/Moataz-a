@@ -32,12 +32,8 @@ class FakeSession:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    def get(self, url):
-        self.calls.append(("GET", url, None))
-        return self.responses.pop(0)
-
-    def post(self, url, json):
-        self.calls.append(("POST", url, json))
+    def request(self, method, url, json=None):
+        self.calls.append((method, url, json))
         return self.responses.pop(0)
 
 
