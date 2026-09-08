@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from collections.abc import Callable
 from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
@@ -100,14 +101,18 @@ def assert_public_dns(url: str, *, resolver: Resolver = socket.getaddrinfo) -> s
     return normalized
 
 
-def redact_secrets(value: object, *, bot_token: str = "", database_url: str = "") -> str:
+def redact_secrets(
+    value: object,
+    *,
+    bot_token: str = "",
+    database_url: str = "",
+    api_token: str = "",
+) -> str:
     text = str(value)
-    for secret in (bot_token, database_url):
+    for secret in (bot_token, database_url, api_token):
         if secret and len(secret) >= 6:
             text = text.replace(secret, "[REDACTED]")
-    # Telegram tokens have a stable numeric-prefix:secret shape; redact even if not configured here.
-    import re
-
     text = re.sub(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b", "[REDACTED_TELEGRAM_TOKEN]", text)
     text = re.sub(r"(?i)(postgres(?:ql)?(?:\+asyncpg)?://)[^\s@]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
     return text
