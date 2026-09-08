@@ -10,14 +10,14 @@ from sqlalchemy import select
 
 from app.bot.access import ensure_user, is_allowed
 from app.config import get_settings
-from app.db import DownloadJob, JobStatus, SessionLocal, User
+from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
 from app.errors import classify_error
 from app.i18n import tr
 from app.jobs import set_job_status
 from app.rate_limit import telegram_analyze_limiter
 from app.services.cutting import configure_and_queue_cut
 from app.services.downloader import MediaInfo
-from app.services.job_service import analyze_and_create_job, queue_existing_job
+from app.services.job_service import analyze_and_create_job, deserialize_qualities, queue_existing_job
 from app.services.urls import parse_bulk_urls
 from app.utils import parse_time, seconds_to_hms
 
@@ -78,9 +78,18 @@ def cut_menu_keyboard(job_id: int, mode: str = "PRECISE") -> InlineKeyboardMarku
     )
 
 
-def _info_text(job_id: int, info: MediaInfo) -> str:
+def _info_text(job_id: int, info: MediaInfo, language: str = "ar") -> str:
     qualities = ", ".join(f"{quality}p" for quality in info.qualities) or "Best / MP3"
     uploader = info.uploader or "—"
+    if language == "en":
+        return (
+            f"Job #{job_id}\n"
+            f"Title: {info.title}\n"
+            f"Platform: {info.platform}\n"
+            f"Uploader: {uploader}\n"
+            f"Duration: {seconds_to_hms(info.duration)}\n"
+            f"Available: {qualities}"
+        )
     return (
         f"Job #{job_id}\n"
         f"العنوان: {info.title}\n"
@@ -92,14 +101,15 @@ def _info_text(job_id: int, info: MediaInfo) -> str:
 
 
 def _playlist_keyboard(job_id: int, preferred: str = "best") -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="📥 تنزيل القائمة Best", callback_data=f"playlist:{job_id}:best")],
-        [InlineKeyboardButton(text="🎵 تنزيل القائمة MP3", callback_data=f"playlist:{job_id}:audio")],
-        [InlineKeyboardButton(text="✖️ إلغاء", callback_data=f"cancel:{job_id}")],
-    ]
-    if preferred == "audio":
-        rows[1][0].text = "🎵 تنزيل القائمة MP3 ✓"
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    audio_text = "🎵 تنزيل القائمة MP3 ✓" if preferred == "audio" else "🎵 تنزيل القائمة MP3"
+    best_text = "📥 تنزيل القائمة Best ✓" if preferred == "best" else "📥 تنزيل القائمة Best"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=best_text, callback_data=f"playlist:{job_id}:best")],
+            [InlineKeyboardButton(text=audio_text, callback_data=f"playlist:{job_id}:audio")],
+            [InlineKeyboardButton(text="✖️ إلغاء", callback_data=f"cancel:{job_id}")],
+        ]
+    )
 
 
 async def _get_message_user(message: Message) -> User | None:
@@ -109,6 +119,13 @@ async def _get_message_user(message: Message) -> User | None:
         await message.answer(tr(settings.default_language, "private"))
         return None
     return await ensure_user(message.from_user.id, message.from_user.username)
+
+
+async def _get_callback_user(callback: CallbackQuery) -> User | None:
+    if not callback.from_user or not await is_allowed(callback.from_user.id):
+        await callback.answer("Private bot", show_alert=True)
+        return None
+    return await ensure_user(callback.from_user.id, callback.from_user.username)
 
 
 async def _get_callback_job(callback: CallbackQuery, job_id: int) -> tuple[DownloadJob, User] | None:
@@ -152,32 +169,99 @@ async def _update_progress_message(job_id: int, message_id: int) -> None:
             await session.commit()
 
 
-async def _show_analysis(message: Message, progress: Message, job: DownloadJob, info: MediaInfo, intent: str) -> None:
+async def _deliver_card(
+    message: Message,
+    progress: Message,
+    job: DownloadJob,
+    info: MediaInfo,
+    text: str,
+    markup: InlineKeyboardMarkup,
+) -> None:
+    if info.thumbnail and info.thumbnail.startswith("https://") and not info.is_playlist:
+        try:
+            card = await message.answer_photo(
+                photo=info.thumbnail,
+                caption=text[:1024],
+                reply_markup=markup,
+            )
+            await _update_progress_message(job.id, card.message_id)
+            try:
+                await progress.delete()
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+    await progress.edit_text(text, reply_markup=markup)
+
+
+async def _show_analysis(
+    message: Message,
+    progress: Message,
+    job: DownloadJob,
+    info: MediaInfo,
+    intent: str,
+    language: str,
+) -> None:
     if info.is_playlist:
-        text = (
-            f"Job #{job.id}\n{info.title}\n"
-            f"Playlist: {info.playlist_count} عنصر\n"
-            f"الحد الآمن: {settings.max_playlist_items}\n"
-            "يجب تأكيد التوسعة؛ كل عنصر سيصبح Job مستقلاً."
+        if language == "en":
+            text = (
+                f"Job #{job.id}\n{info.title}\n"
+                f"Playlist: {info.playlist_count} items\n"
+                f"Safe limit: {settings.max_playlist_items}\n"
+                "Confirm expansion; every item becomes an independent Job."
+            )
+        else:
+            text = (
+                f"Job #{job.id}\n{info.title}\n"
+                f"Playlist: {info.playlist_count} عنصر\n"
+                f"الحد الآمن: {settings.max_playlist_items}\n"
+                "يجب تأكيد التوسعة؛ كل عنصر سيصبح Job مستقلاً."
+            )
+        await progress.edit_text(
+            text,
+            reply_markup=_playlist_keyboard(job.id, preferred="audio" if intent == "audio" else "best"),
         )
-        await progress.edit_text(text, reply_markup=_playlist_keyboard(job.id, preferred="audio" if intent == "audio" else "best"))
         return
 
+    text = _info_text(job.id, info, language)
     if intent == "audio":
         await queue_existing_job(job.id, "audio")
-        await progress.edit_text(tr("ar", "queued", job_id=job.id), reply_markup=_cancel_keyboard(job.id))
-        return
-
-    text = _info_text(job.id, info)
-    if intent == "cut":
-        await progress.edit_text(
-            f"{text}\n\nاختر نوع القص. PRECISE أدق، وFAST أسرع بدون إعادة ترميز.",
-            reply_markup=cut_menu_keyboard(job.id, "PRECISE"),
+        queued = tr(language, "queued", job_id=job.id)
+        await _deliver_card(
+            message,
+            progress,
+            job,
+            info,
+            f"{text}\n\n{queued}",
+            _cancel_keyboard(job.id),
         )
         return
 
-    markup = media_keyboard(job.id, info.qualities, include_audio=intent != "video")
-    await progress.edit_text(text, reply_markup=markup)
+    if intent == "cut":
+        hint = (
+            "Choose a cut type. PRECISE is frame-accurate; FAST is faster without re-encoding."
+            if language == "en"
+            else "اختر نوع القص. PRECISE أدق، وFAST أسرع بدون إعادة ترميز."
+        )
+        await _deliver_card(
+            message,
+            progress,
+            job,
+            info,
+            f"{text}\n\n{hint}",
+            cut_menu_keyboard(job.id, "PRECISE"),
+        )
+        return
+
+    await _deliver_card(
+        message,
+        progress,
+        job,
+        info,
+        text,
+        media_keyboard(job.id, info.qualities, include_audio=intent != "video"),
+    )
 
 
 async def _analyze_one(message: Message, user: User, url: str, intent: str = "general") -> None:
@@ -191,7 +275,12 @@ async def _analyze_one(message: Message, user: User, url: str, intent: str = "ge
             source="telegram",
         )
         if job.progress_message_id != progress.message_id:
-            await progress.edit_text(f"الرابط موجود بالفعل في Job #{job.id} النشط.")
+            duplicate = (
+                f"Duplicate URL: existing Job #{job.id} is already active."
+                if user.language == "en"
+                else f"الرابط موجود بالفعل في Job #{job.id} النشط."
+            )
+            await progress.edit_text(duplicate)
             return
         if info.is_playlist and info.playlist_count > settings.max_playlist_items:
             await set_job_status(
@@ -200,9 +289,14 @@ async def _analyze_one(message: Message, user: User, url: str, intent: str = "ge
                 error=f"PLAYLIST_LIMIT: max {settings.max_playlist_items}",
                 event_message="PLAYLIST_LIMIT",
             )
-            await progress.edit_text(f"القائمة أكبر من الحد الآمن ({settings.max_playlist_items}).")
+            limit_text = (
+                f"Playlist is larger than the safe limit ({settings.max_playlist_items})."
+                if user.language == "en"
+                else f"القائمة أكبر من الحد الآمن ({settings.max_playlist_items})."
+            )
+            await progress.edit_text(limit_text)
             return
-        await _show_analysis(message, progress, job, info, intent)
+        await _show_analysis(message, progress, job, info, intent, user.language)
     except Exception as exc:
         error = classify_error(exc)
         await progress.edit_text(tr(user.language, "failed", code=error.code.value))
@@ -213,14 +307,20 @@ async def _process_urls(message: Message, *, intent: str = "general") -> None:
     if user is None or not message.text:
         return
     if not await telegram_analyze_limiter.allow(f"tg:{user.telegram_id}"):
-        await message.answer("تم تجاوز معدل الطلبات. حاول بعد قليل.")
+        text = "Rate limit exceeded. Try again shortly." if user.language == "en" else "تم تجاوز معدل الطلبات. حاول بعد قليل."
+        await message.answer(text)
         return
     parsed = parse_bulk_urls(message.text, limit=settings.max_bulk_urls)
     if not parsed.urls:
         await message.answer(tr(user.language, "invalid_url"))
         return
     if parsed.duplicates:
-        await message.answer(f"تم تجاهل {parsed.duplicates} رابط مكرر.")
+        text = (
+            f"Deduplication: skipped {parsed.duplicates} duplicate URL(s)."
+            if user.language == "en"
+            else f"تم تجاهل {parsed.duplicates} رابط مكرر."
+        )
+        await message.answer(text)
     effective_intent = intent if len(parsed.urls) == 1 else ("audio" if intent == "audio" else "general")
     for url in parsed.urls:
         await _analyze_one(message, user, url, effective_intent)
@@ -244,19 +344,27 @@ async def reset_home(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.in_({"menu:video", "menu:audio", "menu:cut", "menu:bulk"}))
 async def choose_next_action(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not await is_allowed(callback.from_user.id):
-        await callback.answer("Private bot", show_alert=True)
+    user = await _get_callback_user(callback)
+    if user is None:
         return
     intent = callback.data.split(":", 1)[1]
     await state.set_state(FeatureState.waiting_url)
     await state.update_data(intent=intent)
     if callback.message:
-        prompts = {
-            "video": "🎬 أرسل رابط الفيديو. بعد التحليل سأعرض الجودات المتاحة فعليًا.",
-            "audio": "🎵 أرسل الرابط وسأحلله ثم أضيف تنزيل MP3 مباشرة.",
-            "cut": "✂️ أرسل رابط الفيديو ثم اختر: قص حر، 30 ثانية للقصص، أو 60 ثانية.",
-            "bulk": "📥 أرسل عدة روابط، كل رابط في سطر أو مفصول بمسافة.",
-        }
+        if user.language == "en":
+            prompts = {
+                "video": "🎬 Send the media URL. I will analyze it and show only resolutions that actually exist.",
+                "audio": "🎵 Send the URL. I will analyze it and queue MP3 automatically.",
+                "cut": "✂️ Send the video URL, then choose Free Cut, 30-second Story, or 60-second Cut.",
+                "bulk": "📥 Send multiple URLs separated by spaces or new lines.",
+            }
+        else:
+            prompts = {
+                "video": "🎬 أرسل رابط الفيديو. بعد التحليل سأعرض الجودات المتاحة فعليًا.",
+                "audio": "🎵 أرسل الرابط وسأحلله ثم أضيف تنزيل MP3 مباشرة.",
+                "cut": "✂️ أرسل رابط الفيديو ثم اختر: قص حر، 30 ثانية للقصص، أو 60 ثانية.",
+                "bulk": "📥 أرسل عدة روابط، كل رابط في سطر أو مفصول بمسافة.",
+            }
         await _edit_callback(callback, prompts[intent])
     await callback.answer()
 
@@ -306,15 +414,17 @@ async def receive_cut_input(message: Message, state: FSMContext) -> None:
             quality="best",
         )
     except (KeyError, TypeError, ValueError, LookupError):
-        await message.answer(
-            "تعذر ضبط القص. للقص الحر استخدم 00:10 - 00:45، ولـ30/60 ثانية أرسل وقت البداية فقط. "
-            "تأكد أيضًا أن المدة المتبقية تكفي للمقطع المطلوب."
+        text = (
+            "Could not configure the cut. For Free Cut use 00:10 - 00:45; for 30/60 seconds send only the start time. Make sure enough media remains."
+            if user.language == "en"
+            else "تعذر ضبط القص. للقص الحر استخدم 00:10 - 00:45، ولـ30/60 ثانية أرسل وقت البداية فقط. تأكد أيضًا أن المدة المتبقية تكفي للمقطع المطلوب."
         )
+        await message.answer(text)
         return
     await state.clear()
     progress = await message.answer(
-        f"✂️ Job #{job_id} أضيف للطابور\n"
-        f"القص: {seconds_to_hms(plan.start)} → {seconds_to_hms(plan.end)} ({plan.duration:.0f}s)\n"
+        f"✂️ Job #{job_id} • QUEUED\n"
+        f"Cut: {seconds_to_hms(plan.start)} → {seconds_to_hms(plan.end)} ({plan.duration:.0f}s)\n"
         f"Mode: {plan.mode}",
         reply_markup=_cancel_keyboard(job_id),
     )
@@ -328,15 +438,16 @@ async def upgrade_legacy_cut_button(callback: CallbackQuery) -> None:
     owned = await _get_callback_job(callback, job_id)
     if owned is None:
         return
-    job, _ = owned
+    job, user = owned
     if job.status != JobStatus.READY.value:
-        await callback.answer("Job ليس READY", show_alert=True)
+        await callback.answer("Job is not READY", show_alert=True)
         return
-    await _edit_callback(
-        callback,
-        f"✂️ خيارات القص لـ Job #{job_id}\nاختر المدة أو القص الحر، ثم حدد وقت البداية/النهاية.",
-        cut_menu_keyboard(job_id, mode),
+    text = (
+        f"✂️ Cut options for Job #{job_id}\nChoose Free, 30s, or 60s, then provide the start/range."
+        if user.language == "en"
+        else f"✂️ خيارات القص لـ Job #{job_id}\nاختر المدة أو القص الحر، ثم حدد وقت البداية/النهاية."
     )
+    await _edit_callback(callback, text, cut_menu_keyboard(job_id, mode))
     await callback.answer()
 
 
@@ -347,15 +458,15 @@ async def show_cut_menu(callback: CallbackQuery) -> None:
     owned = await _get_callback_job(callback, job_id)
     if owned is None:
         return
-    job, _ = owned
+    job, user = owned
     if job.status != JobStatus.READY.value:
-        await callback.answer("Job ليس READY", show_alert=True)
+        await callback.answer("Job is not READY", show_alert=True)
         return
-    await _edit_callback(
-        callback,
-        f"✂️ Job #{job_id}\nالمدة: {seconds_to_hms(job.duration)}\nاختر نوع القص. الوضع الحالي: {mode.upper()}",
-        cut_menu_keyboard(job_id, mode),
-    )
+    if user.language == "en":
+        text = f"✂️ Job #{job_id}\nDuration: {seconds_to_hms(job.duration)}\nChoose a cut type. Current mode: {mode.upper()}"
+    else:
+        text = f"✂️ Job #{job_id}\nالمدة: {seconds_to_hms(job.duration)}\nاختر نوع القص. الوضع الحالي: {mode.upper()}"
+    await _edit_callback(callback, text, cut_menu_keyboard(job_id, mode))
     await callback.answer()
 
 
@@ -366,16 +477,24 @@ async def choose_cut_preset(callback: CallbackQuery, state: FSMContext) -> None:
     owned = await _get_callback_job(callback, job_id)
     if owned is None:
         return
-    job, _ = owned
+    job, user = owned
     if job.status != JobStatus.READY.value:
-        await callback.answer("Job ليس READY", show_alert=True)
+        await callback.answer("Job is not READY", show_alert=True)
         return
     await state.set_state(FeatureState.waiting_cut_input)
     await state.update_data(job_id=job_id, preset=preset, mode=mode.upper())
-    if preset == "free":
-        prompt = "✂️ قص حر: أرسل البداية والنهاية مثل 00:10 - 00:45"
+    if user.language == "en":
+        prompt = (
+            "✂️ Free Cut: send start and end like 00:10 - 00:45"
+            if preset == "free"
+            else f"✂️ {preset}-second cut: send only the start time, e.g. 00:10"
+        )
     else:
-        prompt = f"✂️ قص {preset} ثانية: أرسل وقت البداية فقط مثل 00:10"
+        prompt = (
+            "✂️ قص حر: أرسل البداية والنهاية مثل 00:10 - 00:45"
+            if preset == "free"
+            else f"✂️ قص {preset} ثانية: أرسل وقت البداية فقط مثل 00:10"
+        )
     await _edit_callback(callback, f"{prompt}\nMode: {mode.upper()}")
     await callback.answer()
 
@@ -388,17 +507,14 @@ async def back_to_download_options(callback: CallbackQuery) -> None:
         return
     job, _ = owned
     if job.status != JobStatus.READY.value:
-        await callback.answer("Job ليس READY", show_alert=True)
+        await callback.answer("Job is not READY", show_alert=True)
         return
     async with SessionLocal() as session:
-        from app.db import MediaMetadata
-        from app.services.job_service import deserialize_qualities
-
         metadata = await session.get(MediaMetadata, job_id)
         qualities = deserialize_qualities(metadata.formats_json if metadata else "[]")
     await _edit_callback(
         callback,
-        f"Job #{job_id}\n{job.title or 'Media'}\nالمدة: {seconds_to_hms(job.duration)}",
+        f"Job #{job_id}\n{job.title or 'Media'}\nDuration: {seconds_to_hms(job.duration)}",
         media_keyboard(job_id, qualities, include_audio=True),
     )
     await callback.answer()
