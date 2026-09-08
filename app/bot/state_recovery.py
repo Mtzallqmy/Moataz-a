@@ -10,6 +10,7 @@ from app.bot.handlers import CutState, start
 from app.services.urls import parse_bulk_urls
 
 router = Router(name="state-recovery")
+analyze_text = handle_media_text
 
 
 class ContainsMediaURL(BaseFilter):
@@ -28,4 +29,4 @@ async def reset_stale_cut_state_on_start(message: Message, state: FSMContext) ->
 async def recover_url_from_stale_cut_state(message: Message, state: FSMContext) -> None:
     """Clear an abandoned legacy cut state and use the current media flow."""
     await state.clear()
-    await handle_media_text(message)
+    await analyze_text(message)
