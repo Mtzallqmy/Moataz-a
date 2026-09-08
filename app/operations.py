@@ -7,7 +7,10 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 
+from app.config import get_settings
 from app.db import DownloadJob, JobEvent, JobStatus, SessionLocal, WorkerNode
+
+settings = get_settings()
 
 UNSAFE_INTERRUPTED = {
     JobStatus.ANALYZING.value,
@@ -97,6 +100,7 @@ async def readiness_snapshot() -> dict[str, object]:
         "database_error": database_error,
         "ffmpeg": ffmpeg_ok,
         "ffprobe": ffprobe_ok,
+        "ai_provider": "configured" if settings.ai_enabled else "disabled",
         "railway_commit": railway_sha[:12] if railway_sha else "local",
         "railway_branch": os.getenv("RAILWAY_GIT_BRANCH", "local"),
         "railway_deployment": os.getenv("RAILWAY_DEPLOYMENT_ID", "local"),
