@@ -32,19 +32,22 @@ polling_task: asyncio.Task | None = None
 maintenance_task: asyncio.Task | None = None
 
 
+def _redact(value: object) -> str:
+    return redact_secrets(
+        value,
+        bot_token=settings.bot_token,
+        database_url=settings.database_url,
+        api_token=settings.openai_api_token,
+    )
+
+
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact_secrets(record.msg, bot_token=settings.bot_token, database_url=settings.database_url)
+        record.msg = _redact(record.msg)
         if isinstance(record.args, tuple):
-            record.args = tuple(
-                redact_secrets(arg, bot_token=settings.bot_token, database_url=settings.database_url)
-                for arg in record.args
-            )
+            record.args = tuple(_redact(arg) for arg in record.args)
         elif isinstance(record.args, dict):
-            record.args = {
-                key: redact_secrets(value, bot_token=settings.bot_token, database_url=settings.database_url)
-                for key, value in record.args.items()
-            }
+            record.args = {key: _redact(value) for key, value in record.args.items()}
         return True
 
 
@@ -159,6 +162,7 @@ async def root():
         "mode": "polling",
         "queue": "inline",
         "dashboard": "/dashboard" if settings.dashboard_password else "disabled",
+        "ai_provider": "configured" if settings.ai_enabled else "disabled",
     }
 
 

@@ -27,7 +27,7 @@
     <section class="tab active" id="tab-overview">
       <section class="stats" id="stats"></section>
       <article class="glass panel downloader-panel">
-        <div class="panel-head"><div><p class="eyebrow">RECLIP-STYLE FLOW · SHARED ENGINE</p><h2>تنزيل الوسائط / Download</h2></div><span>yt-dlp + FFmpeg</span></div>
+        <div class="panel-head"><div><p class="eyebrow">RECLIP-STYLE FLOW · SHARED ENGINE</p><h2>تنزيل وقص الوسائط / Download & Cut</h2></div><span>yt-dlp + FFmpeg</span></div>
         <textarea id="urls" rows="3" placeholder="Paste one or more public HTTP/HTTPS URLs…"></textarea>
         <div class="download-actions">
           <button class="primary" id="analyzeBtn">Analyze</button>
@@ -94,10 +94,18 @@ function renderAnalyzed(){
     const action = item.is_playlist
       ? `<button onclick="expandPlaylist(${index})">Expand & Download</button>`
       : `<button onclick="downloadOne(${index})">Download</button>`;
+    const cuts = item.is_playlist ? '' : `<div class="cut-controls">
+      <select id="cutmode-${index}" title="Cut mode"><option value="PRECISE">🎯 PRECISE</option><option value="FAST">⚡ FAST</option></select>
+      <input id="cutstart-${index}" value="00:00" placeholder="Start 00:10" title="Cut start">
+      <input id="cutend-${index}" placeholder="End 00:45 (free cut)" title="Free cut end">
+      <button onclick="cutOne(${index},'free')">✂️ قص حر</button>
+      <button onclick="cutOne(${index},'30')">📱 30ث قصة</button>
+      <button onclick="cutOne(${index},'60')">🎞️ 60ث</button>
+    </div>`;
     return `<div class="media-card" data-index="${index}">
       <div class="thumb">${thumb}</div>
       <div class="media-body"><h3>${esc(item.title)}</h3><p>${esc(item.platform)} · ${esc(item.uploader || '—')}</p>${playlist}
-      <div class="media-actions"><select id="quality-${index}">${qualityOptions(item)}</select>${action}</div></div>
+      <div class="media-actions"><select id="quality-${index}">${qualityOptions(item)}</select>${action}</div>${cuts}</div>
     </div>`;
   }).join('');
   $('#downloadAllBtn').disabled = !analyzed.some(i => i.job_id && !i.error && !i.is_playlist);
@@ -123,6 +131,27 @@ async function downloadOne(index){
   await api('/api/media/download', {method:'POST', body:JSON.stringify({items:[{job_id:item.job_id, quality}]})});
   switchTab('jobs');
   await refresh();
+}
+
+async function cutOne(index, preset){
+  const item = analyzed[index];
+  const start = $(`#cutstart-${index}`).value.trim() || '00:00';
+  const end = $(`#cutend-${index}`).value.trim() || null;
+  const mode = $(`#cutmode-${index}`).value;
+  const selected = $(`#quality-${index}`).value;
+  const quality = selected === 'audio' ? 'best' : selected;
+  if (preset === 'free' && !end) {
+    alert('أدخل وقت النهاية للقص الحر، مثال 00:45');
+    return;
+  }
+  try {
+    await api(`/api/media/cut/${item.job_id}`, {
+      method:'POST',
+      body:JSON.stringify({preset, start, end, mode, quality})
+    });
+    switchTab('jobs');
+    await refresh();
+  } catch (e) { alert(e.message); }
 }
 
 async function expandPlaylist(index){
@@ -159,7 +188,10 @@ function render(data){
     <td>${['COMPLETED','FAILED','CANCELLED'].includes(j.status) ? '' : `<button class="mini" onclick="cancelJob(${j.id})">Cancel</button>`}</td>
   </tr>`).join('');
 
-  $('#downloads').innerHTML = data.jobs.filter(j => j.status === 'COMPLETED').map(j => `<div class="job-card"><div><b>#${j.id} · ${esc(j.title)}</b><small>${esc(j.platform)} · ${esc(j.quality)} · ${esc(j.uploader || '—')}</small></div>${j.download_ready ? `<a class="mini" href="/api/jobs/${j.id}/file">Download file</a>` : ''}</div>`).join('') || '<p class="muted">No completed downloads.</p>';
+  $('#downloads').innerHTML = data.jobs.filter(j => j.status === 'COMPLETED').map(j => {
+    const cut = j.cut_start != null && j.cut_end != null ? ` · ✂️ ${j.cut_start}s→${j.cut_end}s ${esc(j.cut_mode || '')}` : '';
+    return `<div class="job-card"><div><b>#${j.id} · ${esc(j.title)}</b><small>${esc(j.platform)} · ${esc(j.quality)} · ${esc(j.uploader || '—')}${cut}</small></div>${j.download_ready ? `<a class="mini" href="/api/jobs/${j.id}/file">Download file</a>` : ''}</div>`;
+  }).join('') || '<p class="muted">No completed downloads.</p>';
   $('#users').innerHTML = data.users.map(u => `<div class="list-row"><div><b>${esc(u.username)}</b><small>${u.telegram_id}</small></div><span>${u.allowed ? '✅' : '⛔'} ${esc(u.language)}</span></div>`).join('') || '<p class="muted">No users.</p>';
   $('#workers').innerHTML = data.workers.map(w => `<div class="list-row"><div><b>${esc(w.id)}</b><small>${esc(w.hostname)}</small></div><span>${w.status === 'ONLINE' ? '🟢' : '⚪'} ${w.active_jobs} jobs</span></div>`).join('') || '<p class="muted">No workers.</p>';
   $('#errors').innerHTML = data.errors.map(e => `<div class="list-row error-row"><div><b>#${e.id} · ${esc(e.title)}</b><small>${esc(e.error)}</small></div><span>${esc(e.platform)}</span></div>`).join('') || '<p class="muted">No recent errors.</p>';

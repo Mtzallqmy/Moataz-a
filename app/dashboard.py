@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse, HTMLResponse
@@ -18,6 +19,7 @@ from app.jobs import RUNNING_STATUSES, set_job_status
 from app.operations import readiness_snapshot
 from app.queue import cancel_download
 from app.rate_limit import dashboard_write_limiter
+from app.services.cutting import configure_and_queue_cut
 from app.services.downloader import get_downloader_service
 from app.services.job_service import (
     analyze_and_create_job,
@@ -25,6 +27,7 @@ from app.services.job_service import (
     queue_existing_job,
 )
 from app.services.urls import parse_bulk_urls
+from app.utils import parse_time
 from app.version import RELEASE
 
 settings = get_settings()
@@ -49,6 +52,14 @@ class DownloadRequest(BaseModel):
 
 class PlaylistRequest(BaseModel):
     quality: str = "best"
+
+
+class CutRequest(BaseModel):
+    preset: Literal["free", "30", "60"] = "free"
+    start: str = Field(default="0", min_length=1, max_length=32)
+    end: str | None = Field(default=None, max_length=32)
+    mode: Literal["FAST", "PRECISE"] = "PRECISE"
+    quality: str = Field(default="best", min_length=1, max_length=32)
 
 
 def require_admin(credentials: HTTPBasicCredentials | None = Depends(security)) -> str:
@@ -96,6 +107,9 @@ def _serialize_job(job: DownloadJob, metadata: MediaMetadata | None) -> dict:
         "playlist": bool(metadata.is_playlist) if metadata else False,
         "playlist_count": metadata.playlist_count if metadata else 0,
         "source": metadata.source if metadata else "telegram",
+        "cut_start": job.cut_start,
+        "cut_end": job.cut_end,
+        "cut_mode": metadata.cut_mode if metadata else None,
         "download_ready": job.status == JobStatus.COMPLETED.value and bool(job.output_path),
     }
 
@@ -225,6 +239,33 @@ async def download_media(payload: DownloadRequest, request: Request, _: str = De
         except Exception as exc:
             errors.append({"job_id": item.job_id, "error": str(exc)[:200]})
     return {"queued": queued, "errors": errors}
+
+
+@router.post("/api/media/cut/{job_id}")
+async def dashboard_cut(job_id: int, payload: CutRequest, request: Request, _: str = Depends(require_admin)):
+    await enforce_write_rate(request)
+    try:
+        start = parse_time(payload.start)
+        end = parse_time(payload.end) if payload.end else None
+        plan = await configure_and_queue_cut(
+            job_id,
+            start=start,
+            end=end,
+            preset=payload.preset,
+            mode=payload.mode,
+            quality=payload.quality,
+        )
+    except (LookupError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)[:300]) from exc
+    return {
+        "job_id": job_id,
+        "status": JobStatus.QUEUED.value,
+        "preset": plan.preset,
+        "start": plan.start,
+        "end": plan.end,
+        "duration": plan.duration,
+        "mode": plan.mode,
+    }
 
 
 @router.post("/api/media/playlist/{job_id}/expand")

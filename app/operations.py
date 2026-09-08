@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 
+from app.config import get_settings
 from app.db import DownloadJob, JobEvent, JobStatus, SessionLocal, WorkerNode
+
+settings = get_settings()
 
 UNSAFE_INTERRUPTED = {
     JobStatus.ANALYZING.value,
@@ -31,7 +35,13 @@ async def reconcile_stale_jobs() -> ReconciliationResult:
     requeue: list[int] = []
     failed: list[int] = []
     async with SessionLocal() as session:
-        jobs = list(await session.scalars(select(DownloadJob).where(DownloadJob.status.in_(UNSAFE_INTERRUPTED | {JobStatus.QUEUED.value}))))
+        jobs = list(
+            await session.scalars(
+                select(DownloadJob).where(
+                    DownloadJob.status.in_(UNSAFE_INTERRUPTED | {JobStatus.QUEUED.value})
+                )
+            )
+        )
         for job in jobs:
             if job.status == JobStatus.QUEUED.value:
                 requeue.append(job.id)
@@ -42,7 +52,13 @@ async def reconcile_stale_jobs() -> ReconciliationResult:
             job.error = "INTERRUPTED: service restarted while this stage was process-bound"
             job.worker_id = None
             failed.append(job.id)
-            session.add(JobEvent(job_id=job.id, event_type="INTERRUPTED", message=f"recovered from stale status={previous}"))
+            session.add(
+                JobEvent(
+                    job_id=job.id,
+                    event_type="INTERRUPTED",
+                    message=f"recovered from stale status={previous}",
+                )
+            )
         if jobs:
             await session.commit()
     return ReconciliationResult(tuple(requeue), tuple(failed))
@@ -77,10 +93,15 @@ async def readiness_snapshot() -> dict[str, object]:
         database_error = type(exc).__name__
     ffmpeg_ok = shutil.which("ffmpeg") is not None
     ffprobe_ok = shutil.which("ffprobe") is not None
+    railway_sha = os.getenv("RAILWAY_GIT_COMMIT_SHA")
     return {
         "ok": database_ok and ffmpeg_ok and ffprobe_ok,
         "database": database_ok,
         "database_error": database_error,
         "ffmpeg": ffmpeg_ok,
         "ffprobe": ffprobe_ok,
+        "ai_provider": "configured" if settings.ai_enabled else "disabled",
+        "railway_commit": railway_sha[:12] if railway_sha else "local",
+        "railway_branch": os.getenv("RAILWAY_GIT_BRANCH", "local"),
+        "railway_deployment": os.getenv("RAILWAY_DEPLOYMENT_ID", "local"),
     }
