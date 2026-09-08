@@ -17,14 +17,29 @@ def test_railway_uses_single_service_startup():
     assert "redis" not in text.lower()
 
 
-def test_env_example_contains_core_and_optional_ai_variables_only():
-    lines = [line.strip() for line in Path(".env.example").read_text().splitlines() if line.strip()]
-    assert lines == [
-        "BOT_TOKEN=",
-        "DATABASE_URL=",
-        "OPENAI_BASE_URL=",
-        "OPENAI_API_TOKEN=",
-    ]
+def test_env_example_documents_core_and_multi_provider_ai_variables():
+    raw_lines = [line.strip() for line in Path(".env.example").read_text().splitlines()]
+    variables = [line for line in raw_lines if line and not line.startswith("#")]
+    names = {line.split("=", 1)[0] for line in variables}
+
+    assert {"BOT_TOKEN", "DATABASE_URL", "OPENAI_BASE_URL", "OPENAI_API_TOKEN"} <= names
+    assert {
+        "OPENROUTER_BASE_URL",
+        "OPENROUTER_API_TOKEN",
+        "NVIDIA_BASE_URL",
+        "NVIDIA_API_TOKEN",
+        "XAI_BASE_URL",
+        "XAI_API_TOKEN",
+        "GROQ_BASE_URL",
+        "GROQ_API_TOKEN",
+        "AI_PROVIDER_EXAMPLE_1_NAME",
+        "AI_PROVIDER_EXAMPLE_1_BASE_URL",
+        "AI_PROVIDER_EXAMPLE_1_API_TOKEN",
+        "AI_PROVIDER_EXAMPLE_1_PRIORITY",
+    } <= names
+
+    token_lines = [line for line in variables if line.split("=", 1)[0].endswith(("TOKEN", "API_KEY"))]
+    assert all(line.endswith("=") for line in token_lines)
 
 
 def test_router_can_be_requested_repeatedly_without_already_attached_error():

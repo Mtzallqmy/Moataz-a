@@ -56,6 +56,32 @@ async def test_lists_models_from_openai_compatible_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_model_infos_put_known_free_aliases_and_zero_pricing_first(monkeypatch):
+    monkeypatch.setattr(openai_compatible.aiohttp, "ClientSession", FakeSession)
+    FakeSession.responses = [
+        FakeResponse(
+            200,
+            {
+                "data": [
+                    {"id": "paid-model", "pricing": {"prompt": "0.1", "completion": "0.2"}},
+                    {"id": "vendor/model:free"},
+                    {"id": "glm-5.3-free"},
+                    {"id": "zero-cost", "pricing": {"prompt": "0", "completion": 0}},
+                ]
+            },
+        )
+    ]
+    provider = OpenAICompatibleProvider("https://provider.example/v1", "placeholder-token")
+
+    models = await provider.list_model_infos()
+
+    assert [model.model_id for model in models[:3]] == ["glm-5.3-free", "vendor/model:free", "zero-cost"]
+    assert all(model.is_free is True for model in models[:3])
+    assert models[-1].model_id == "paid-model"
+    assert models[-1].is_free is False
+
+
+@pytest.mark.asyncio
 async def test_chat_uses_selected_model_and_message_history(monkeypatch):
     monkeypatch.setattr(openai_compatible.aiohttp, "ClientSession", FakeSession)
     FakeSession.responses = [
