@@ -1,4 +1,8 @@
-from app.services.model_capabilities import extract_capabilities, extract_modalities
+from app.services.model_capabilities import (
+    extract_capabilities,
+    extract_modalities,
+    extract_runware_capabilities,
+)
 
 
 def test_openrouter_style_architecture_detects_vision_and_text():
@@ -45,3 +49,33 @@ def test_output_modalities_distinguish_vision_from_image_generation():
     assert "vision" in vision
     assert "image" not in vision
     assert "image" in generator
+
+
+def test_runware_io_taxonomy_maps_input_and_output_modalities():
+    capabilities, inputs, outputs = extract_runware_capabilities(
+        {
+            "air": "vendor:model@1",
+            "name": "Multimodal Model",
+            "capabilities": ["io:text-to-text", "io:image-to-text", "op:tool-calling"],
+        }
+    )
+
+    assert inputs == ("text", "image")
+    assert outputs == ("text",)
+    assert {"text", "vision", "tools"} <= set(capabilities)
+
+
+def test_runware_output_categories_map_media_generation():
+    image_caps, _, image_outputs = extract_runware_capabilities(
+        {"air": "vendor:image@1", "capabilities": ["io:text-to-image"]}
+    )
+    video_caps, _, video_outputs = extract_runware_capabilities(
+        {"air": "vendor:video@1", "capabilities": ["io:image-to-video"]}
+    )
+    audio_caps, _, audio_outputs = extract_runware_capabilities(
+        {"air": "vendor:audio@1", "capabilities": ["io:text-to-audio"]}
+    )
+
+    assert "image" in image_caps and image_outputs == ("image",)
+    assert "video" in video_caps and video_outputs == ("video",)
+    assert "audio" in audio_caps and audio_outputs == ("audio",)
