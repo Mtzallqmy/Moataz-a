@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ from app.config import get_settings
 from app.security import redact_secrets
 
 settings = get_settings()
+_FREE_MODEL_TOKEN = re.compile(r"(?:^|[/:._-])free(?:$|[/:._-])", re.IGNORECASE)
 
 
 class AIProviderError(RuntimeError):
@@ -92,7 +94,7 @@ class OpenAICompatibleProvider:
     @classmethod
     def _is_free_model(cls, item: dict[str, Any]) -> bool | None:
         model_id = str(item.get("id") or "").lower()
-        if model_id.endswith(":free"):
+        if _FREE_MODEL_TOKEN.search(model_id):
             return True
 
         for key in ("is_free", "free"):
