@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -74,9 +75,22 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_openai_base_url(cls, value: str) -> str:
         url = str(value or "").strip().rstrip("/")
-        if url and not url.startswith(("https://", "http://")):
-            raise ValueError("OPENAI_BASE_URL must use HTTP or HTTPS")
+        if not url:
+            return ""
+        try:
+            parsed = urlsplit(url)
+        except ValueError as exc:
+            raise ValueError("OPENAI_BASE_URL must be a valid HTTP/HTTPS API root") from exc
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("OPENAI_BASE_URL must be a valid HTTP/HTTPS API root")
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("OPENAI_BASE_URL cannot contain credentials or a fragment")
         return url
+
+    @field_validator("openai_api_token", mode="before")
+    @classmethod
+    def normalize_openai_api_token(cls, value: str) -> str:
+        return str(value or "").strip()
 
     @field_validator("default_language")
     @classmethod
@@ -137,6 +151,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_ai_history(cls, value: int) -> int:
         return max(2, min(int(value), 50))
+
+    @field_validator("ai_max_reply_chars")
+    @classmethod
+    def validate_ai_reply_chars(cls, value: int) -> int:
+        return max(1000, min(int(value), 60_000))
 
     @property
     def max_file_size_bytes(self) -> int:
