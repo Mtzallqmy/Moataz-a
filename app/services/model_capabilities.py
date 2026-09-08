@@ -5,12 +5,14 @@ from collections.abc import Iterable
 from typing import Any
 
 _CAPABILITY_ORDER = ("text", "vision", "image", "video", "audio", "code", "tools", "embeddings")
+_MODALITY_ORDER = ("text", "image", "video", "audio")
 _CODE_RE = re.compile(r"(?:^|[/:._-])(code|coder|coding|devstral|codestral|swe)(?:$|[/:._-])", re.IGNORECASE)
 _VISION_RE = re.compile(r"(?:^|[/:._-])(vision|vl|multimodal|omni)(?:$|[/:._-])", re.IGNORECASE)
 _IMAGE_RE = re.compile(r"(?:^|[/:._-])(image|flux|sdxl|stable-diffusion|recraft|imagen)(?:$|[/:._-])", re.IGNORECASE)
 _VIDEO_RE = re.compile(r"(?:^|[/:._-])(video|veo|kling|hailuo|wan)(?:$|[/:._-])", re.IGNORECASE)
 _AUDIO_RE = re.compile(r"(?:^|[/:._-])(audio|speech|voice|tts|whisper|realtime)(?:$|[/:._-])", re.IGNORECASE)
 _EMBED_RE = re.compile(r"(?:^|[/:._-])(embed|embedding)(?:$|[/:._-])", re.IGNORECASE)
+_RUNWARE_IO_RE = re.compile(r"(?:^|:)io:([a-z0-9_-]+)-to-([a-z0-9_-]+)(?:$|:)", re.IGNORECASE)
 
 
 def _flatten_strings(value: object) -> list[str]:
@@ -66,7 +68,7 @@ def _normalize_modality(value: str) -> str | None:
 def _modalities_from(value: object) -> tuple[str, ...]:
     found = {_normalize_modality(item) for item in _flatten_strings(value)}
     found.discard(None)
-    return tuple(item for item in ("text", "image", "video", "audio") if item in found)
+    return tuple(item for item in _MODALITY_ORDER if item in found)
 
 
 def _architecture(item: dict[str, Any]) -> dict[str, Any]:
@@ -121,8 +123,8 @@ def extract_modalities(item: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str
     if not outputs and not _EMBED_RE.search(model_id):
         outputs.add("text")
 
-    ordered_inputs = tuple(item for item in ("text", "image", "video", "audio") if item in inputs)
-    ordered_outputs = tuple(item for item in ("text", "image", "video", "audio") if item in outputs)
+    ordered_inputs = tuple(item for item in _MODALITY_ORDER if item in inputs)
+    ordered_outputs = tuple(item for item in _MODALITY_ORDER if item in outputs)
     return ordered_inputs, ordered_outputs
 
 
@@ -160,6 +162,51 @@ def extract_capabilities(item: dict[str, Any]) -> tuple[str, ...]:
         capabilities.add("vision")
 
     return tuple(capability for capability in _CAPABILITY_ORDER if capability in capabilities)
+
+
+def extract_runware_capabilities(
+    item: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Translate Runware's `io:<input>-to-<output>` taxonomy to bot groups."""
+
+    inputs: set[str] = set()
+    outputs: set[str] = set()
+    capabilities: set[str] = set()
+    raw_capabilities = _flatten_strings(item.get("capabilities"))
+    for raw in raw_capabilities:
+        normalized = raw.strip().lower().replace("_", "-")
+        match = _RUNWARE_IO_RE.search(normalized)
+        if match:
+            input_modality = _normalize_modality(match.group(1))
+            output_modality = _normalize_modality(match.group(2))
+            if input_modality:
+                inputs.add(input_modality)
+            if output_modality:
+                outputs.add(output_modality)
+        if "tool" in normalized or "function" in normalized:
+            capabilities.add("tools")
+        if "code" in normalized or "coding" in normalized:
+            capabilities.add("code")
+
+    model_identity = f"{item.get('model') or ''} {item.get('air') or ''} {item.get('name') or ''}"
+    if _CODE_RE.search(model_identity):
+        capabilities.add("code")
+    if not inputs:
+        inputs.add("text")
+    if not outputs:
+        outputs.add("text")
+    if "text" in inputs or "text" in outputs:
+        capabilities.add("text")
+    if "image" in inputs:
+        capabilities.add("vision")
+    for modality in ("image", "video", "audio"):
+        if modality in outputs:
+            capabilities.add(modality)
+
+    ordered_capabilities = tuple(item for item in _CAPABILITY_ORDER if item in capabilities)
+    ordered_inputs = tuple(item for item in _MODALITY_ORDER if item in inputs)
+    ordered_outputs = tuple(item for item in _MODALITY_ORDER if item in outputs)
+    return ordered_capabilities, ordered_inputs, ordered_outputs
 
 
 def capability_icon(capability: str) -> str:
