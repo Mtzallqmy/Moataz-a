@@ -10,15 +10,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Runtime settings.
 
-    BOT_TOKEN and DATABASE_URL are the only variables needed for the normal Railway
-    deployment. Everything else is a non-secret tuning value with a safe default,
-    except DASHBOARD_PASSWORD which is optional and disables the dashboard when empty.
+    BOT_TOKEN and DATABASE_URL are the only variables needed for the media bot.
+    OPENAI_BASE_URL and OPENAI_API_TOKEN are optional and enable AI chat when both
+    are configured. DASHBOARD_PASSWORD is optional and disables the dashboard
+    when empty.
     """
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     bot_token: str = ""
     database_url: str = "sqlite+aiosqlite:///./moataz.db"
+    openai_base_url: str = ""
+    openai_api_token: str = ""
 
     app_name: str = "Moataz Media Bot"
     app_host: str = "0.0.0.0"
@@ -48,6 +51,10 @@ class Settings(BaseSettings):
     ffmpeg_kill_grace_seconds: float = 3.0
     stderr_limit_bytes: int = 16_384
 
+    ai_request_timeout_seconds: int = 120
+    ai_max_history_messages: int = 20
+    ai_max_reply_chars: int = 12_000
+
     dashboard_username: str = "admin"
     dashboard_password: str = ""
 
@@ -61,6 +68,14 @@ class Settings(BaseSettings):
             return "postgresql+asyncpg://" + url[len("postgres://") :]
         if url.startswith("postgresql://") and "+asyncpg" not in url:
             return "postgresql+asyncpg://" + url[len("postgresql://") :]
+        return url
+
+    @field_validator("openai_base_url", mode="before")
+    @classmethod
+    def normalize_openai_base_url(cls, value: str) -> str:
+        url = str(value or "").strip().rstrip("/")
+        if url and not url.startswith(("https://", "http://")):
+            raise ValueError("OPENAI_BASE_URL must use HTTP or HTTPS")
         return url
 
     @field_validator("default_language")
@@ -113,6 +128,16 @@ class Settings(BaseSettings):
     def validate_retry_base(cls, value: float) -> float:
         return max(0.25, min(float(value), 60.0))
 
+    @field_validator("ai_request_timeout_seconds")
+    @classmethod
+    def validate_ai_timeout(cls, value: int) -> int:
+        return max(10, min(int(value), 600))
+
+    @field_validator("ai_max_history_messages")
+    @classmethod
+    def validate_ai_history(cls, value: int) -> int:
+        return max(2, min(int(value), 50))
+
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024
@@ -120,6 +145,10 @@ class Settings(BaseSettings):
     @property
     def telegram_upload_limit_bytes(self) -> int:
         return self.telegram_upload_limit_mb * 1024 * 1024
+
+    @property
+    def ai_enabled(self) -> bool:
+        return bool(self.openai_base_url and self.openai_api_token)
 
 
 @lru_cache
