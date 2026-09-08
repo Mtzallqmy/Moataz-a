@@ -5,7 +5,8 @@ from aiogram.filters import BaseFilter, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from app.bot.handlers import CutState, analyze_text, start
+from app.bot.features import handle_media_text
+from app.bot.handlers import CutState, start
 from app.services.urls import parse_bulk_urls
 
 router = Router(name="state-recovery")
@@ -25,11 +26,6 @@ async def reset_stale_cut_state_on_start(message: Message, state: FSMContext) ->
 
 @router.message(CutState.waiting_range, ContainsMediaURL())
 async def recover_url_from_stale_cut_state(message: Message, state: FSMContext) -> None:
-    """Never parse an HTTP/HTTPS URL as a cut range.
-
-    A user can leave the cut FSM active by abandoning a previous interaction. If
-    their next message is a URL, clear the stale state and send the message to
-    the normal analyzer instead of returning the misleading cut-range error.
-    """
+    """Clear an abandoned legacy cut state and use the current media flow."""
     await state.clear()
-    await analyze_text(message)
+    await handle_media_text(message)
