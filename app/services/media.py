@@ -137,6 +137,144 @@ async def probe_media_file(source: Path) -> MediaProbe:
     return MediaProbe(duration, "video" in stream_types, "audio" in stream_types, source.stat().st_size)
 
 
+def _fast_cut_output(source: Path, probe: MediaProbe) -> Path:
+    supported = {".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".ogg", ".opus"}
+    suffix = source.suffix.lower() if source.suffix.lower() in supported else (".mkv" if probe.has_video else ".m4a")
+    return source.with_name(f"{source.stem}.fast{suffix}")
+
+
+def _precise_cut_output(source: Path, probe: MediaProbe) -> Path:
+    suffix = ".mp4" if probe.has_video else ".m4a"
+    return source.with_name(f"{source.stem}.precise{suffix}")
+
+
+def _fast_cut_args(source: Path, output: Path, start: float, duration: float) -> list[str]:
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        str(start),
+        "-i",
+        str(source),
+        "-t",
+        str(duration),
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(output),
+    ]
+
+
+def _precise_cut_args(
+    source: Path,
+    output: Path,
+    start: float,
+    duration: float,
+    probe: MediaProbe,
+    *,
+    video_codec: str = "libx264",
+) -> list[str]:
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-ss",
+        str(start),
+        "-t",
+        str(duration),
+    ]
+    if probe.has_video:
+        args += [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v",
+            video_codec,
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        if video_codec == "libx264":
+            args += ["-preset", "veryfast", "-crf", "23"]
+        else:
+            args += ["-q:v", "4"]
+        if probe.has_audio:
+            args += ["-c:a", "aac", "-b:a", "160k"]
+        else:
+            args.append("-an")
+        args += [
+            "-movflags",
+            "+faststart",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-max_muxing_queue_size",
+            "2048",
+            str(output),
+        ]
+    elif probe.has_audio:
+        args += [
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(output),
+        ]
+    else:
+        raise FFmpegError("Downloaded media contains no audio or video stream")
+    return args
+
+
+async def _run_precise_cut(
+    source: Path,
+    output: Path,
+    start: float,
+    duration: float,
+    probe: MediaProbe,
+    *,
+    timeout: float,
+    cancel_event: threading.Event | None,
+) -> None:
+    primary = _precise_cut_args(source, output, start, duration, probe, video_codec="libx264")
+    try:
+        await _run_process(*primary, timeout=timeout, cancel_event=cancel_event)
+    except FFmpegError as primary_error:
+        if not probe.has_video:
+            raise
+        output.unlink(missing_ok=True)
+        fallback = _precise_cut_args(source, output, start, duration, probe, video_codec="mpeg4")
+        try:
+            await _run_process(*fallback, timeout=timeout, cancel_event=cancel_event)
+        except FFmpegError as fallback_error:
+            raise FFmpegError(
+                f"Precise cut failed with H.264 and MPEG-4 fallbacks: {fallback_error}"
+            ) from primary_error
+
+
 async def cut_media(
     source: Path,
     start: float,
@@ -149,64 +287,65 @@ async def cut_media(
 ) -> Path:
     if start < 0 or end <= start:
         raise ValueError("Invalid clip range")
-    if source_duration is None:
-        source_duration = (await probe_media_file(source)).duration
-    if end > source_duration + 0.05:
-        raise ValueError("Clip end exceeds media duration")
+    if not source.exists() or source.stat().st_size <= 0:
+        raise FFmpegError("Downloaded source file is missing or empty")
+
+    probe = await probe_media_file(source)
+    actual_duration = probe.duration
+    advertised_duration = float(source_duration) if source_duration is not None else actual_duration
+    if advertised_duration <= 0:
+        advertised_duration = actual_duration
+    if start >= actual_duration:
+        raise ValueError("Clip start exceeds downloaded media duration")
+
+    requested_end = float(end)
+    if requested_end > actual_duration:
+        rounding_tolerance = min(2.0, max(0.50, advertised_duration * 0.002))
+        if requested_end - actual_duration <= rounding_tolerance:
+            requested_end = actual_duration
+        else:
+            raise ValueError("Clip end exceeds downloaded media duration")
 
     cut_mode = mode.upper().strip()
     if cut_mode not in {"FAST", "PRECISE"}:
         raise ValueError("Cut mode must be FAST or PRECISE")
-    duration = end - start
-    output = source.with_name(f"{source.stem}.{cut_mode.lower()}.mp4")
-    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    duration = requested_end - float(start)
+    if duration <= 0.05:
+        raise ValueError("Clip range is too short")
+
+    process_timeout = timeout or settings.ffmpeg_timeout_seconds
     if cut_mode == "FAST":
-        args = [
-            *base,
-            "-ss",
-            str(start),
-            "-i",
-            str(source),
-            "-t",
-            str(duration),
-            "-map",
-            "0:v:0?",
-            "-map",
-            "0:a:0?",
-            "-c",
-            "copy",
-            "-avoid_negative_ts",
-            "make_zero",
-            str(output),
-        ]
+        output = _fast_cut_output(source, probe)
+        try:
+            await _run_process(
+                *_fast_cut_args(source, output, start, duration),
+                timeout=process_timeout,
+                cancel_event=cancel_event,
+            )
+        except FFmpegError:
+            output.unlink(missing_ok=True)
+            output = _precise_cut_output(source, probe)
+            await _run_precise_cut(
+                source,
+                output,
+                start,
+                duration,
+                probe,
+                timeout=process_timeout,
+                cancel_event=cancel_event,
+            )
     else:
-        args = [
-            *base,
-            "-ss",
-            str(start),
-            "-i",
-            str(source),
-            "-t",
-            str(duration),
-            "-map",
-            "0:v:0?",
-            "-map",
-            "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    await _run_process(*args, timeout=timeout or settings.ffmpeg_timeout_seconds, cancel_event=cancel_event)
+        output = _precise_cut_output(source, probe)
+        await _run_precise_cut(
+            source,
+            output,
+            start,
+            duration,
+            probe,
+            timeout=process_timeout,
+            cancel_event=cancel_event,
+        )
+
     if not output.exists() or output.stat().st_size <= 0:
         raise FFmpegError("FFmpeg did not produce a valid clip")
     return output
@@ -215,21 +354,56 @@ async def cut_media(
 async def _compress_audio(source: Path, output: Path, bitrate: int, cancel_event: threading.Event | None) -> None:
     bitrate_k = max(32, min(192, bitrate // 1000))
     await _run_process(
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-vn",
-        "-c:a", "libmp3lame", "-b:a", f"{bitrate_k}k", str(output),
-        timeout=settings.ffmpeg_timeout_seconds, cancel_event=cancel_event,
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-vn",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        f"{bitrate_k}k",
+        str(output),
+        timeout=settings.ffmpeg_timeout_seconds,
+        cancel_event=cancel_event,
     )
 
 
-async def _compress_video(source: Path, output: Path, total_bitrate: int, has_audio: bool, cancel_event: threading.Event | None) -> None:
+async def _compress_video(
+    source: Path,
+    output: Path,
+    total_bitrate: int,
+    has_audio: bool,
+    cancel_event: threading.Event | None,
+) -> None:
     audio_bitrate = min(128_000, max(64_000, total_bitrate // 8)) if has_audio else 0
     video_bitrate = max(180_000, total_bitrate - audio_bitrate)
     height = video_height_for_bitrate(total_bitrate)
     args = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-        "-map", "0:v:0", "-vf", f"scale=w=-2:h=min(ih\\,{height})", "-c:v", "libx264",
-        "-preset", "veryfast", "-b:v", str(video_bitrate), "-maxrate", str(int(video_bitrate * 1.15)),
-        "-bufsize", str(video_bitrate * 2),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-vf",
+        f"scale=w=-2:h=min(ih\\,{height})",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-b:v",
+        str(video_bitrate),
+        "-maxrate",
+        str(int(video_bitrate * 1.15)),
+        "-bufsize",
+        str(video_bitrate * 2),
     ]
     if has_audio:
         args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", str(audio_bitrate)]
