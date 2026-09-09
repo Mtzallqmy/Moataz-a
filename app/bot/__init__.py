@@ -7,6 +7,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 @lru_cache(maxsize=1)
 def create_dispatcher() -> Dispatcher:
     """Return one dispatcher so a module reload cannot re-attach the same Router."""
+    from app.bot.advanced_media import router as advanced_media_router
     from app.bot.ai import router as ai_router
     from app.bot.ai_hub import router as ai_hub_router
     from app.bot.ai_multimodal import router as ai_multimodal_router
@@ -15,6 +16,7 @@ def create_dispatcher() -> Dispatcher:
     from app.bot.state_recovery import router as state_recovery_router
 
     dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(advanced_media_router)
     dispatcher.include_router(ai_hub_router)
     dispatcher.include_router(ai_multimodal_router)
     dispatcher.include_router(ai_router)
