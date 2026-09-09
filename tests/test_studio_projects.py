@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.db import MediaAsset, SessionLocal, User, init_db  # isort: split
+from app.db import init_db, MediaAsset, SessionLocal, User
 from app.services.composer import ComposerService
 from app.services.projects import ProjectService
 
