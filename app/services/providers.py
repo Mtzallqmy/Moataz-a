@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -29,6 +30,10 @@ SUPPORTED_SOURCES = (YOUTUBE, FACEBOOK)
 COMMON_HEIGHTS = (360, 480, 720, 1080, 1440, 2160)
 
 
+def _edge_host() -> bool:
+    return os.environ.get("EDGE_HOST", "").strip() == "1"
+
+
 def _host_matches(host: str, allowed: str) -> bool:
     return host == allowed or host.endswith(f".{allowed}")
 
@@ -52,18 +57,19 @@ def normalize_platform(extractor_key: str | None, url: str) -> str:
     known = detect_source(url)
     if known:
         return known.key
-    # Generic support is based on the extractor that yt-dlp actually selected.
     if extractor and extractor not in {"generic", "unsupported"}:
         return extractor.split(":", 1)[0][:32]
     return "generic"
 
 
 def available_qualities(info: dict[str, Any]) -> list[int]:
+    formats = info.get("formats") or []
     heights = {
         int(fmt["height"])
-        for fmt in info.get("formats") or []
+        for fmt in formats
         if fmt.get("height")
         and fmt.get("vcodec") not in {None, "none"}
+        and (not _edge_host() or fmt.get("acodec") not in {None, "none"})
         and int(fmt["height"]) > 0
     }
     common = [height for height in COMMON_HEIGHTS if height in heights]
@@ -72,6 +78,27 @@ def available_qualities(info: dict[str, Any]) -> list[int]:
 
 def format_selector(quality: str) -> str:
     value = quality.strip().lower()
+
+    # The Android host does not assume a shell FFmpeg binary. In EDGE_HOST mode,
+    # select a single progressive stream which already contains audio+video.
+    # This makes the common download path fully local and reliable.
+    if _edge_host():
+        if value in {"audio", "mp3"}:
+            return "bestaudio[ext=m4a]/bestaudio"
+        if value == "best":
+            return (
+                "best[ext=mp4][vcodec!=none][acodec!=none]/"
+                "best[vcodec!=none][acodec!=none]"
+            )
+        height = int(value.removesuffix("p"))
+        if height < 144 or height > 4320:
+            raise ValueError("Unsupported video height")
+        return (
+            f"best[height={height}][ext=mp4][vcodec!=none][acodec!=none]/"
+            f"best[height<={height}][ext=mp4][vcodec!=none][acodec!=none]/"
+            f"best[height<={height}][vcodec!=none][acodec!=none]"
+        )
+
     if value in {"audio", "mp3"}:
         return "bestaudio/best"
     if value == "best":
@@ -79,7 +106,6 @@ def format_selector(quality: str) -> str:
     height = int(value.removesuffix("p"))
     if height < 144 or height > 4320:
         raise ValueError("Unsupported video height")
-    # Exact height only: never silently downgrade a user-selected resolution.
     return (
         f"bestvideo[height={height}][ext=mp4]+bestaudio[ext=m4a]/"
         f"bestvideo[height={height}]+bestaudio/"
