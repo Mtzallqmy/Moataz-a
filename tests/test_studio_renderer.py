@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
 
 from app.config import Settings
+from app.errors import CancelledError, FFmpegError
 from app.services.composer import RenderAsset, RenderPlan
 from app.services.media import probe_media_file
 from app.services.renderers.ffmpeg_renderer import FFmpegRenderer
@@ -75,6 +78,35 @@ def _video(path: Path, duration: float = 1.0, frequency: int = 440) -> Path:
         "aac",
         str(path),
     )
+    return path
+
+
+def _custom_video(
+    path: Path,
+    *,
+    duration: float,
+    size: str,
+    fps: int,
+    with_audio: bool,
+) -> Path:
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc=size={size}:rate={fps}:duration={duration}",
+    ]
+    if with_audio:
+        args += ["-f", "lavfi", "-i", f"sine=frequency=330:duration={duration}", "-shortest"]
+    args += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    if with_audio:
+        args += ["-c:a", "aac"]
+    args.append(str(path))
+    _run(*args)
     return path
 
 
@@ -159,6 +191,19 @@ async def test_acceptance_slideshow_with_audio_and_fade(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_acceptance_three_image_slideshow_without_audio_is_about_twelve_seconds(
+    tmp_path: Path,
+) -> None:
+    images = [_image(tmp_path / f"silent-{index}.jpg") for index in range(3)]
+    assets = [_asset(index + 1, path, "image", position=index) for index, path in enumerate(images)]
+    renderer = FFmpegRenderer(_settings(tmp_path))
+    result = await renderer.render(_plan("slideshow", assets, 12.0), render_job_id=20)
+    probe = await probe_media_file(result.output_path)
+    assert probe.has_video and probe.has_audio
+    assert probe.duration == pytest.approx(12.0, abs=0.5)
+
+
+@pytest.mark.asyncio
 async def test_acceptance_merge_videos_normalizes_inputs(tmp_path: Path) -> None:
     first = _video(tmp_path / "one.mp4", 0.9, 440)
     second = _video(tmp_path / "two.mp4", 1.1, 660)
@@ -175,6 +220,32 @@ async def test_acceptance_merge_videos_normalizes_inputs(tmp_path: Path) -> None
     probe = await probe_media_file(result.output_path)
     assert probe.has_video and probe.has_audio
     assert probe.duration == pytest.approx(2.0, abs=0.5)
+
+
+@pytest.mark.asyncio
+async def test_merge_mismatched_fps_dimensions_and_missing_audio(tmp_path: Path) -> None:
+    first = _custom_video(
+        tmp_path / "wide-silent.mp4", duration=0.8, size="426x240", fps=15, with_audio=False
+    )
+    second = _custom_video(
+        tmp_path / "square-audio.mp4", duration=1.0, size="240x240", fps=30, with_audio=True
+    )
+    renderer = FFmpegRenderer(_settings(tmp_path))
+    result = await renderer.render(
+        _plan(
+            "merge_videos",
+            [
+                _asset(1, first, "video", duration=0.8),
+                _asset(2, second, "video", duration=1.0, position=1),
+            ],
+            1.8,
+        ),
+        render_job_id=21,
+    )
+    probe = await probe_media_file(result.output_path)
+    assert probe.has_video and probe.has_audio
+    assert (probe.width, probe.height) == (360, 640)
+    assert probe.duration == pytest.approx(1.8, abs=0.5)
 
 
 @pytest.mark.asyncio
@@ -235,3 +306,103 @@ async def test_acceptance_logo_overlay_template(tmp_path: Path) -> None:
     probe = await probe_media_file(result.output_path)
     assert probe.has_video
     assert probe.duration == pytest.approx(1.0, abs=0.35)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("width", "height", "aspect", "fit_mode"),
+    [
+        (360, 640, "9:16", "fit"),
+        (640, 360, "16:9", "fill"),
+        (360, 360, "1:1", "blur-background"),
+    ],
+)
+async def test_aspect_ratio_and_fit_mode_outputs_are_exact(
+    tmp_path: Path,
+    width: int,
+    height: int,
+    aspect: str,
+    fit_mode: str,
+) -> None:
+    image = _image(tmp_path / f"aspect-{aspect.replace(':', '-')}.jpg")
+    audio = _audio(tmp_path / f"aspect-{fit_mode}.mp3", 0.7)
+    plan = _plan(
+        "audio_image",
+        [_asset(1, image, "image"), _asset(2, audio, "audio", duration=0.7)],
+        0.7,
+        fit_mode=fit_mode,
+    )
+    plan = RenderPlan(
+        project_id=plan.project_id,
+        user_id=plan.user_id,
+        template=plan.template,
+        width=width,
+        height=height,
+        fps=plan.fps,
+        aspect_ratio=aspect,
+        fit_mode=plan.fit_mode,
+        transition=plan.transition,
+        audio_mode=plan.audio_mode,
+        logo_position=plan.logo_position,
+        assets=plan.assets,
+        expected_duration=plan.expected_duration,
+    )
+    result = await FFmpegRenderer(_settings(tmp_path)).render(
+        plan,
+        render_job_id=30 + width + height,
+    )
+    probe = await probe_media_file(result.output_path)
+    assert (probe.width, probe.height) == (width, height)
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_clock_progress_is_monotonic_and_not_only_fixed_milestones(tmp_path: Path) -> None:
+    image = _image(tmp_path / "progress.jpg")
+    audio = _audio(tmp_path / "progress.mp3", 2.5)
+    values: list[float] = []
+    await FFmpegRenderer(_settings(tmp_path)).render(
+        _plan(
+            "audio_image",
+            [_asset(1, image, "image"), _asset(2, audio, "audio", duration=2.5)],
+            2.5,
+        ),
+        render_job_id=41,
+        progress_callback=values.append,
+    )
+    assert values == sorted(values)
+    assert any(0.02 < value < 0.94 for value in values)
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_ffmpeg_removes_partial_output_and_workspace(tmp_path: Path) -> None:
+    image = _image(tmp_path / "cancel.jpg")
+    audio = _audio(tmp_path / "cancel.mp3", 20)
+    renderer = FFmpegRenderer(_settings(tmp_path))
+    event = threading.Event()
+    task = asyncio.create_task(
+        renderer.render(
+            _plan(
+                "audio_image",
+                [_asset(1, image, "image"), _asset(2, audio, "audio", duration=20)],
+                20,
+            ),
+            render_job_id=42,
+            cancel_event=event,
+        )
+    )
+    await asyncio.sleep(0.03)
+    event.set()
+    with pytest.raises(CancelledError):
+        await task
+    assert not (tmp_path / "projects" / "7001" / "renders" / "42" / "output.mp4").exists()
+    assert not (tmp_path / "tmp" / "render-42").exists()
+
+
+@pytest.mark.asyncio
+async def test_output_validation_rejects_video_without_expected_audio(tmp_path: Path) -> None:
+    output = _custom_video(
+        tmp_path / "silent.mp4", duration=1.0, size="360x640", fps=24, with_audio=False
+    )
+    plan = _plan("audio_image", [], 1.0)
+    with pytest.raises(FFmpegError, match="expected audio"):
+        await FFmpegRenderer(_settings(tmp_path))._validate_output(output, plan)

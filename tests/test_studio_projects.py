@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from app import db as database
+from app.config import Settings
 from app.services.composer import ComposerService
 from app.services.projects import ProjectService
 
@@ -71,7 +72,9 @@ async def test_project_timeline_is_renderer_independent_and_composer_builds_audi
     assert timeline["template"] == "audio_image"
     assert "ffmpeg" not in project.timeline_json.lower()
     assert str(tmp_path) not in project.timeline_json
-    plan = await ComposerService(projects=projects).build(project.id, user_id=user.id)
+    plan = await ComposerService(Settings(project_dir=tmp_path), projects=projects).build(
+        project.id, user_id=user.id
+    )
     assert plan.template == "audio_image"
     assert plan.width == 1080
     assert plan.height == 1920

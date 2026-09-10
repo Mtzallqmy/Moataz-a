@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -194,3 +195,109 @@ async def test_startup_reconciliation_requeues_only_queued_and_fails_interrupted
     assert recovered is not None
     assert recovered.status == RenderStatus.FAILED.value
     assert recovered.error and "RESTART_INTERRUPTED" in recovered.error
+
+
+@pytest.mark.asyncio
+async def test_cancel_queued_render_is_terminal_and_recoverable(tmp_path: Path) -> None:
+    user_id, project_id = await _project()
+    service = RenderService(_settings(tmp_path), composer=StaticComposer(), renderer=SuccessRenderer(tmp_path))
+    job = await service.create_render(project_id, user_id=user_id)
+    assert await service.cancel_render(job.id, user_id=user_id)
+    stored = await service.get_render(job.id)
+    assert stored is not None and stored.status == RenderStatus.CANCELLED.value
+    async with SessionLocal() as session:
+        project = await session.get(MediaProject, project_id)
+        assert project is not None and project.status == ProjectStatus.READY.value
+
+
+@pytest.mark.asyncio
+async def test_render_queue_rejects_duplicate_and_enforces_per_user_limit() -> None:
+    release = asyncio.Event()
+    active_by_user: dict[int, int] = {}
+    peak_by_user: dict[int, int] = {}
+    users = {1: 10, 2: 10, 3: 20}
+
+    async def lookup(render_id: int) -> int:
+        return users[render_id]
+
+    async def runner(render_id: int) -> None:
+        user_id = users[render_id]
+        active_by_user[user_id] = active_by_user.get(user_id, 0) + 1
+        peak_by_user[user_id] = max(peak_by_user.get(user_id, 0), active_by_user[user_id])
+        await release.wait()
+        active_by_user[user_id] -= 1
+
+    async def canceller(render_id: int, user_id: int | None) -> bool:
+        return True
+
+    queue = RenderQueue(
+        runner=runner,
+        user_lookup=lookup,
+        global_limit=2,
+        per_user_limit=1,
+        canceller=canceller,
+        cancel_requester=lambda render_id: True,
+    )
+    await queue.start()
+    assert await queue.enqueue(1)
+    assert not await queue.enqueue(1)
+    assert await queue.enqueue(2)
+    assert await queue.enqueue(3)
+    for _ in range(100):
+        if len(queue.active_render_ids) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert set(queue.active_render_ids) == {1, 3}
+    assert peak_by_user == {10: 1, 20: 1}
+    release.set()
+    for _ in range(100):
+        if not queue.active_render_ids:
+            break
+        await asyncio.sleep(0.01)
+    await queue.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_restart_preserves_valid_upload_output_and_scopes_workspace_cleanup(tmp_path: Path) -> None:
+    user_id, project_id = await _project()
+    settings = _settings(tmp_path)
+    async with SessionLocal() as session:
+        job = RenderJob(project_id=project_id, user_id=user_id, status=RenderStatus.UPLOADING.value)
+        session.add(job)
+        await session.flush()
+        output = settings.project_dir / str(project_id) / "renders" / str(job.id) / "output.mp4"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=160x90:d=0.5",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        job.output_path = str(output)
+        await session.commit()
+        job_id = job.id
+    stale = settings.render_temp_dir / f"render-{job_id}"
+    unrelated = settings.render_temp_dir / "telegram-upload-live"
+    stale.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    service = RenderService(settings, composer=StaticComposer(), renderer=SuccessRenderer(tmp_path))
+    await service.reconcile_after_restart()
+    stored = await service.get_render(job_id)
+    assert stored is not None and stored.status == RenderStatus.COMPLETED.value
+    assert stored.error and "DELIVERY_INTERRUPTED" in stored.error
+    assert not stale.exists()
+    assert unrelated.exists()
