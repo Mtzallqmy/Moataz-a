@@ -48,9 +48,6 @@ class Settings(BaseSettings):
     max_renders_per_user: int = 1
     render_timeout_seconds: int = 1_800
     default_render_fps: int = 30
-    default_render_height: int = 1080
-    asset_retention_hours: int = 24
-    project_retention_hours: int = 48
 
     ytdlp_socket_timeout_seconds: int = 30
     ytdlp_retries: int = 2
@@ -163,16 +160,6 @@ class Settings(BaseSettings):
     @classmethod
     def validate_render_fps(cls, value: int) -> int:
         return max(15, min(int(value), 60))
-
-    @field_validator("default_render_height")
-    @classmethod
-    def validate_render_height(cls, value: int) -> int:
-        return max(360, min(int(value), 2160))
-
-    @field_validator("asset_retention_hours", "project_retention_hours")
-    @classmethod
-    def validate_retention_hours(cls, value: int) -> int:
-        return max(1, min(int(value), 24 * 30))
 
     @field_validator("ytdlp_retries", "ytdlp_fragment_retries", "job_max_retries")
     @classmethod

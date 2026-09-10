@@ -182,6 +182,8 @@ class RenderService:
                 project = await session.get(MediaProject, project_id)
                 if job is None or project is None:
                     raise LookupError("Render database state disappeared")
+                if project.status == ProjectStatus.CANCELLED.value or event.is_set():
+                    raise CancelledError("Project or render was cancelled")
                 job.status = RenderStatus.COMPLETED.value
                 job.progress = 1.0
                 job.output_path = str(result.output_path)
@@ -263,6 +265,29 @@ class RenderService:
                     project.status = ProjectStatus.READY.value
                 await session.commit()
             return True
+
+    async def cancel_project_renders(self, project_id: int, *, user_id: int) -> int:
+        async with SessionLocal() as session:
+            render_ids = list(
+                await session.scalars(
+                    select(RenderJob.id).where(
+                        RenderJob.project_id == project_id,
+                        RenderJob.user_id == user_id,
+                        RenderJob.status.in_(
+                            {
+                                RenderStatus.QUEUED.value,
+                                RenderStatus.PREPARING.value,
+                                RenderStatus.RENDERING.value,
+                                RenderStatus.UPLOADING.value,
+                            }
+                        ),
+                    )
+                )
+            )
+        cancelled = 0
+        for render_id in render_ids:
+            cancelled += bool(await self.cancel_render(render_id, user_id=user_id))
+        return cancelled
 
     async def mark_uploading(self, render_job_id: int) -> None:
         async with SessionLocal() as session:

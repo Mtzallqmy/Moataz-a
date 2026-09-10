@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable
 
@@ -9,6 +10,7 @@ from app.config import get_settings
 from app.services.render_service import render_service
 
 settings = get_settings()
+logger = logging.getLogger("moataz.studio.queue")
 RenderRunner = Callable[[int], Awaitable[None]]
 UserLookup = Callable[[int], Awaitable[int]]
 RenderCanceller = Callable[[int, int | None], Awaitable[bool]]
@@ -107,8 +109,8 @@ class RenderQueue:
         except asyncio.CancelledError:
             raise
         except Exception:
-            # RenderService persists failures. Queue survival is intentional.
-            pass
+            # RenderService normally persists failures; this catches contract violations too.
+            logger.exception("render queue runner escaped render_job_id=%s", render_job_id)
         finally:
             self._active.pop(render_job_id, None)
             self._known.discard(render_job_id)

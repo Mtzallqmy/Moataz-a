@@ -12,6 +12,7 @@ from app.db import MediaProject, ProjectStatus, RenderJob, RenderStatus, Session
 from app.errors import CancelledError
 from app.render_queue import RenderQueue
 from app.services.composer import RenderPlan
+from app.services.projects import ProjectService
 from app.services.render_service import RenderService
 from app.services.renderers.base import BaseRenderer, RenderResult, emit_progress
 
@@ -301,3 +302,27 @@ async def test_restart_preserves_valid_upload_output_and_scopes_workspace_cleanu
     assert stored.error and "DELIVERY_INTERRUPTED" in stored.error
     assert not stale.exists()
     assert unrelated.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_project_cancels_active_render_and_preserves_project_cancellation(
+    tmp_path: Path,
+) -> None:
+    user_id, project_id = await _project()
+    settings = _settings(tmp_path)
+    service = RenderService(settings, composer=StaticComposer(), renderer=WaitingRenderer(tmp_path))
+    job = await service.create_render(project_id, user_id=user_id)
+    task = asyncio.create_task(service.process_render(job.id))
+    for _ in range(100):
+        current = await service.get_render(job.id)
+        if current and current.status == RenderStatus.RENDERING.value:
+            break
+        await asyncio.sleep(0.01)
+    assert await ProjectService(settings).cancel_project(project_id, user_id=user_id)
+    assert await service.cancel_project_renders(project_id, user_id=user_id) == 1
+    await asyncio.wait_for(task, timeout=2)
+    stored = await service.get_render(job.id)
+    assert stored is not None and stored.status == RenderStatus.CANCELLED.value
+    async with SessionLocal() as session:
+        project = await session.get(MediaProject, project_id)
+        assert project is not None and project.status == ProjectStatus.CANCELLED.value

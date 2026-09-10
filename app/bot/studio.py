@@ -683,7 +683,11 @@ async def cancel_project(callback: CallbackQuery, state: FSMContext) -> None:
     if owned is None:
         return
     user, _ = owned
-    await project_service.cancel_project(project_id, user_id=user.id)
+    cancelled = await project_service.cancel_project(project_id, user_id=user.id)
+    if not cancelled:
+        await callback.answer("لا يمكن إلغاء مشروع مكتمل أو ملغى", show_alert=True)
+        return
+    await render_service.cancel_project_renders(project_id, user_id=user.id)
     await state.clear()
     if callback.message:
         await callback.message.edit_text("🗑 تم إلغاء المشروع.", reply_markup=studio_home_keyboard())

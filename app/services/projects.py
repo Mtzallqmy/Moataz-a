@@ -158,6 +158,8 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 return False
+            if project.status == ProjectStatus.CANCELLED.value:
+                raise ValueError("Cancelled project cannot be modified")
             link = await session.get(ProjectAsset, (project_id, asset_id))
             if link is None:
                 return False
@@ -176,6 +178,8 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 return False
+            if project.status == ProjectStatus.CANCELLED.value:
+                raise ValueError("Cancelled project cannot be modified")
             links = list(await session.scalars(select(ProjectAsset).where(ProjectAsset.project_id == project_id).order_by(ProjectAsset.position, ProjectAsset.asset_id)))
             index = next((idx for idx, item in enumerate(links) if item.asset_id == asset_id), None)
             if index is None:
@@ -202,6 +206,8 @@ class ProjectService:
             link = await session.get(ProjectAsset, (project_id, asset_id))
             if project is None or link is None:
                 raise LookupError("Project asset not found")
+            if project.status == ProjectStatus.CANCELLED.value:
+                raise ValueError("Cancelled project cannot be modified")
             asset = await session.get(MediaAsset, asset_id)
             if asset is None or asset.user_id != user_id:
                 raise LookupError("Project asset not found")
@@ -228,6 +234,8 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 raise LookupError("Project not found")
+            if project.status == ProjectStatus.CANCELLED.value:
+                raise ValueError("Cancelled project cannot be modified")
             project.aspect_ratio = aspect_ratio
             project.width = width
             project.height = height
@@ -245,6 +253,8 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 raise LookupError("Project not found")
+            if project.status == ProjectStatus.CANCELLED.value:
+                raise ValueError("Cancelled project cannot be modified")
             payload = _timeline_config(project)
             payload["template"] = template
             merged = dict(payload.get("options") or {})
@@ -279,6 +289,8 @@ class ProjectService:
         async with SessionLocal() as session:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
+                return False
+            if project.status in {ProjectStatus.COMPLETED.value, ProjectStatus.CANCELLED.value}:
                 return False
             project.status = ProjectStatus.CANCELLED.value
             await session.commit()
