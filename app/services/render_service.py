@@ -10,8 +10,8 @@ from pathlib import Path
 from sqlalchemy import select
 
 from app.config import Settings, get_settings
-from app.db import MediaProject, ProjectStatus, RenderJob, RenderStatus, SessionLocal
-from app.errors import CancelledError
+from app.db import MediaProject, ProjectStatus, RenderJob, RenderRequest, RenderStatus, SessionLocal
+from app.errors import CancelledError, FFmpegError
 from app.security import redact_secrets
 from app.services.composer import ComposerService, composer_service
 from app.services.media import probe_media_file
@@ -56,8 +56,33 @@ class RenderService:
         event.set()
         return not already
 
-    async def create_render(self, project_id: int, *, user_id: int) -> RenderJob:
-        await self.composer.build(project_id, user_id=user_id)
+    async def create_render(
+        self,
+        project_id: int,
+        *,
+        user_id: int,
+        kind: str = "final",
+        preview_duration: float | None = None,
+        preview_width: int | None = None,
+    ) -> RenderJob:
+        if kind not in {"final", "preview"}:
+            raise ValueError("Unknown render kind")
+        if kind == "preview":
+            preview_duration = max(1.0, min(float(preview_duration or 15), 30.0))
+            preview_width = max(160, min(int(preview_width or 480), 720))
+        else:
+            preview_duration = None
+            preview_width = None
+        if kind == "preview":
+            await self.composer.build(
+                project_id,
+                user_id=user_id,
+                render_kind=kind,
+                preview_duration=preview_duration,
+                preview_width=preview_width,
+            )
+        else:
+            await self.composer.build(project_id, user_id=user_id)
         async with SessionLocal() as session:
             project = await session.scalar(
                 select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id)
@@ -88,6 +113,15 @@ class RenderService:
                 progress=0.0,
             )
             session.add(job)
+            await session.flush()
+            session.add(
+                RenderRequest(
+                    render_job_id=job.id,
+                    kind=kind,
+                    max_duration=preview_duration,
+                    max_width=preview_width,
+                )
+            )
             project.status = ProjectStatus.READY.value
             await session.commit()
             await session.refresh(job)
@@ -110,6 +144,11 @@ class RenderService:
         if user_id is None:
             raise LookupError("Render job not found")
         return int(user_id)
+
+    async def get_render_kind(self, render_job_id: int) -> str:
+        async with SessionLocal() as session:
+            request = await session.get(RenderRequest, render_job_id)
+        return request.kind if request is not None else "final"
 
     async def _set_progress(self, render_job_id: int, value: float) -> None:
         value = max(0.0, min(float(value), 0.99))
@@ -148,7 +187,21 @@ class RenderService:
 
             if event.is_set():
                 raise CancelledError("Render cancelled before preparation completed")
-            plan = await self.composer.build(project_id, user_id=user_id)
+            async with SessionLocal() as session:
+                request = await session.get(RenderRequest, render_job_id)
+                render_kind = request.kind if request is not None else "final"
+                preview_duration = request.max_duration if request is not None else None
+                preview_width = request.max_width if request is not None else None
+            if render_kind == "preview":
+                plan = await self.composer.build(
+                    project_id,
+                    user_id=user_id,
+                    render_kind=render_kind,
+                    preview_duration=preview_duration,
+                    preview_width=preview_width,
+                )
+            else:
+                plan = await self.composer.build(project_id, user_id=user_id)
             async with SessionLocal() as session:
                 job = await session.get(RenderJob, render_job_id)
                 if job is None:
@@ -157,15 +210,34 @@ class RenderService:
                 job.progress = max(float(job.progress or 0), 0.01)
                 await session.commit()
 
-            result = await asyncio.wait_for(
-                self.renderer.render(
-                    plan,
-                    render_job_id=render_job_id,
-                    progress_callback=lambda value: self._set_progress(render_job_id, value),
-                    cancel_event=event,
-                ),
-                timeout=self.settings.render_timeout_seconds,
-            )
+            result = None
+            for attempt in range(self.settings.max_render_retries + 1):
+                try:
+                    result = await asyncio.wait_for(
+                        self.renderer.render(
+                            plan,
+                            render_job_id=render_job_id,
+                            progress_callback=lambda value: self._set_progress(render_job_id, value),
+                            cancel_event=event,
+                        ),
+                        timeout=self.settings.render_timeout_seconds,
+                    )
+                    break
+                except FFmpegError as exc:
+                    if (
+                        attempt >= self.settings.max_render_retries
+                        or not self._is_transient_ffmpeg_error(exc)
+                        or event.is_set()
+                    ):
+                        raise
+                    logger.warning(
+                        "transient render failure; retrying render_job_id=%s attempt=%s",
+                        render_job_id,
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(min(2.0, 0.5 * (attempt + 1)))
+            if result is None:
+                raise FFmpegError("Renderer exhausted retry attempts")
             output_path = result.output_path
             if event.is_set():
                 raise CancelledError("Render cancelled")
@@ -190,7 +262,11 @@ class RenderService:
                 job.file_size = int(result.file_size)
                 job.error = None
                 job.completed_at = datetime.now(UTC)
-                project.status = ProjectStatus.COMPLETED.value
+                project.status = (
+                    ProjectStatus.READY.value
+                    if render_kind == "preview"
+                    else ProjectStatus.COMPLETED.value
+                )
                 await session.commit()
             logger.info(
                 "render completed project_id=%s render_job_id=%s operation=render duration=%.3f ffmpeg_exit_status=0",
@@ -220,14 +296,45 @@ class RenderService:
                 database_url=self.settings.database_url,
                 api_token=self.settings.openai_api_token,
             )[-1000:]
-            await self._finish_failed(render_job_id, cancelled=False, message=safe)
+            await self._finish_failed(
+                render_job_id,
+                cancelled=False,
+                message=self._friendly_render_error(safe),
+            )
             logger.warning(
-                "render failed render_job_id=%s operation=render error=%s",
+                "render failed render_job_id=%s operation=render error=%s detail=%s",
                 render_job_id,
                 type(exc).__name__,
+                safe[:500],
             )
         finally:
             self._release(render_job_id)
+
+    @staticmethod
+    def _is_transient_ffmpeg_error(error: Exception) -> bool:
+        detail = str(error).lower()
+        return any(
+            marker in detail
+            for marker in (
+                "resource temporarily unavailable",
+                "device or resource busy",
+                "input/output error",
+                "temporarily unavailable",
+            )
+        )
+
+    @staticmethod
+    def _friendly_render_error(detail: str) -> str:
+        lowered = detail.lower()
+        if "no space left" in lowered:
+            return "Render failed: temporary storage is full. Free space and retry."
+        if "invalid data found" in lowered or "error while decoding" in lowered:
+            return "Render failed: one of the media files is corrupt or cannot be decoded."
+        if "permission denied" in lowered:
+            return "Render failed: media storage is not writable."
+        if "unknown encoder" in lowered or "error initializing output stream" in lowered:
+            return "Render failed: the server FFmpeg build cannot initialize the required H.264 encoder."
+        return detail[-1000:]
 
     async def _finish_failed(self, render_job_id: int, *, cancelled: bool, message: str) -> None:
         async with SessionLocal() as session:

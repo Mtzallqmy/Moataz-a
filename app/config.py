@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     max_concurrent_renders: int = 1
     max_renders_per_user: int = 1
     render_timeout_seconds: int = 1_800
+    max_render_retries: int = 1
     default_render_fps: int = 30
 
     ytdlp_socket_timeout_seconds: int = 30
@@ -161,7 +162,9 @@ class Settings(BaseSettings):
     def validate_render_fps(cls, value: int) -> int:
         return max(15, min(int(value), 60))
 
-    @field_validator("ytdlp_retries", "ytdlp_fragment_retries", "job_max_retries")
+    @field_validator(
+        "ytdlp_retries", "ytdlp_fragment_retries", "job_max_retries", "max_render_retries"
+    )
     @classmethod
     def validate_retry_count(cls, value: int) -> int:
         return max(0, min(int(value), 10))
