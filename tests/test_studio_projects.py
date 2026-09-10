@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-import app.db as database
+from app import db as database
 from app.services.composer import ComposerService
 from app.services.projects import ProjectService
 
