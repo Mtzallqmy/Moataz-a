@@ -245,8 +245,17 @@ async def test_url_download_becomes_project_asset_with_existing_downloader_contr
     )
     projects = ProjectService(settings)
     await projects.add_asset(project.id, stored.id, user_id=user.id)
+    uploaded = await assets.ingest_file(
+        _image(tmp_path / "uploaded.jpg"),
+        user_id=user.id,
+        project_id=project.id,
+        declared_type="image",
+        source_type="telegram",
+        telegram_file_id="telegram-photo-id",
+    )
+    await projects.add_asset(project.id, uploaded.id, user_id=user.id)
     linked = await projects.list_assets(project.id, user_id=user.id)
-    assert linked[0].asset.source_type == "url"
+    assert {item.asset.source_type for item in linked} == {"url", "telegram"}
     assert linked[0].asset.source_url == "https://media.example/watch/1"
     assert downloader.forgotten
     assert not list(settings.render_temp_dir.glob("ingest-*"))
