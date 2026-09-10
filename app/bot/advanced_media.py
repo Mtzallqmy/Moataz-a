@@ -55,6 +55,7 @@ def public_menu_keyboard(language: str = "ar") -> InlineKeyboardMarkup:
             "ai": "🤖 AI Chat",
             "lang": "🌐 Language",
             "help": "ℹ️ Help",
+            "studio": "🎞 Media Studio",
         }
     else:
         labels = {
@@ -67,6 +68,7 @@ def public_menu_keyboard(language: str = "ar") -> InlineKeyboardMarkup:
             "ai": "🤖 دردشة AI",
             "lang": "🌐 اللغة",
             "help": "ℹ️ مساعدة",
+            "studio": "🎞 مشروع مونتاج",
         }
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -83,6 +85,7 @@ def public_menu_keyboard(language: str = "ar") -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=labels["saved"], callback_data="menu:saved"),
             ],
             [InlineKeyboardButton(text=labels["ai"], callback_data="menu:ai")],
+            [InlineKeyboardButton(text=labels["studio"], callback_data="menu:studio")],
             [
                 InlineKeyboardButton(text=labels["lang"], callback_data="menu:lang"),
                 InlineKeyboardButton(text=labels["help"], callback_data="menu:help"),

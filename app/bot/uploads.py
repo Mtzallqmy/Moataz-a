@@ -69,7 +69,9 @@ def upload_candidate(message: Message) -> UploadCandidate | None:
 
 
 def _name_for_mime(mime_type: str | None, fallback: str) -> str:
-    suffix = mimetypes.guess_extension(mime_type or "") or Path(fallback).suffix
+    normalized = (mime_type or "").lower().split(";", 1)[0].strip()
+    suffix = ".ogg" if normalized in {"audio/ogg", "audio/opus"} else mimetypes.guess_extension(normalized)
+    suffix = suffix or Path(fallback).suffix
     if suffix == ".jpe":
         suffix = ".jpg"
     return f"upload{suffix}" if suffix else fallback

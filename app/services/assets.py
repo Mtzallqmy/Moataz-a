@@ -127,6 +127,8 @@ def _infer_asset_type(
             requested = "audio"
         elif mime.startswith("video/") or suffix in _ALLOWED_VIDEO:
             requested = "video"
+        elif suffix in _ALLOWED_SUBTITLE:
+            requested = "subtitle"
         else:
             raise ValueError("Unsupported document type")
 
@@ -256,6 +258,10 @@ class AssetService:
             info = await asyncio.to_thread(self.downloader.probe, url)
             if info.is_playlist:
                 raise ValueError("Use individual media URLs inside Media Studio")
+            if info.duration and info.duration > self.settings.max_video_duration_seconds:
+                raise ValueError("Media duration exceeds configured limit")
+            if info.duration and info.duration > self.settings.max_project_duration_seconds:
+                raise ValueError("Media duration exceeds project limit")
             output = await asyncio.to_thread(
                 self.downloader.download,
                 url,
@@ -301,6 +307,10 @@ class AssetService:
             if linked is not None:
                 raise ValueError("Asset is attached to a project")
             path = Path(asset.local_path)
+            resolved = path.resolve()
+            storage_root = self.settings.project_dir.resolve()
+            if storage_root not in resolved.parents or path.name != f"source{path.suffix}":
+                raise ValueError("Asset storage path is unsafe")
             await session.delete(asset)
             await session.commit()
         shutil.rmtree(path.parent, ignore_errors=True)

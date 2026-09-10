@@ -11,6 +11,8 @@ from app.services.render_service import render_service
 settings = get_settings()
 RenderRunner = Callable[[int], Awaitable[None]]
 UserLookup = Callable[[int], Awaitable[int]]
+RenderCanceller = Callable[[int, int | None], Awaitable[bool]]
+CancelRequester = Callable[[int], bool]
 
 
 class RenderQueue:
@@ -23,11 +25,19 @@ class RenderQueue:
         user_lookup: UserLookup,
         global_limit: int,
         per_user_limit: int,
+        canceller: RenderCanceller | None = None,
+        cancel_requester: CancelRequester | None = None,
     ) -> None:
         self.runner = runner
         self.user_lookup = user_lookup
         self.global_limit = max(1, int(global_limit))
         self.per_user_limit = max(1, int(per_user_limit))
+        self.canceller = canceller or (
+            lambda render_job_id, user_id: render_service.cancel_render(
+                render_job_id, user_id=user_id
+            )
+        )
+        self.cancel_requester = cancel_requester or render_service.request_cancel
         self.queue: asyncio.PriorityQueue[tuple[int, int, int, int]] = asyncio.PriorityQueue()
         self._sequence = itertools.count()
         self._known: set[int] = set()
@@ -109,14 +119,14 @@ class RenderQueue:
                 self._condition.notify_all()
 
     async def cancel(self, render_job_id: int, *, user_id: int | None = None) -> bool:
-        return await render_service.cancel_render(render_job_id, user_id=user_id)
+        return await self.canceller(render_job_id, user_id)
 
     async def shutdown(self) -> None:
         if not self._running:
             return
         self._running = False
         for render_job_id in list(self._active):
-            render_service.request_cancel(render_job_id)
+            self.cancel_requester(render_job_id)
         if self._dispatcher is not None:
             self._dispatcher.cancel()
             await asyncio.gather(self._dispatcher, return_exceptions=True)
@@ -133,6 +143,13 @@ class RenderQueue:
         self._active.clear()
         self._known.clear()
         self._active_users.clear()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self.queue.task_done()
 
     @property
     def active_render_ids(self) -> tuple[int, ...]:
@@ -158,10 +175,10 @@ async def start_render_queue() -> None:
     await get_render_queue().start()
 
 
-async def enqueue_render(render_job_id: int, *, priority: int = 0) -> None:
+async def enqueue_render(render_job_id: int, *, priority: int = 0) -> bool:
     manager = get_render_queue()
     await manager.start()
-    await manager.enqueue(render_job_id, priority=priority)
+    return await manager.enqueue(render_job_id, priority=priority)
 
 
 async def cancel_render(render_job_id: int, *, user_id: int | None = None) -> bool:

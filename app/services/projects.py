@@ -202,6 +202,20 @@ class ProjectService:
             link = await session.get(ProjectAsset, (project_id, asset_id))
             if project is None or link is None:
                 raise LookupError("Project asset not found")
+            asset = await session.get(MediaAsset, asset_id)
+            if asset is None or asset.user_id != user_id:
+                raise LookupError("Project asset not found")
+            compatible = {
+                "intro": {"video"},
+                "outro": {"video"},
+                "music": {"audio", "voice"},
+                "voice": {"audio", "voice"},
+                "logo": {"image", "logo"},
+                "background": {"image", "video"},
+                "main": {"video", "image", "audio", "voice", "subtitle"},
+            }
+            if asset.asset_type not in compatible[role]:
+                raise ValueError(f"Role {role} is not valid for {asset.asset_type}")
             link.role = role
             await self._write_timeline(session, project)
             await session.commit()

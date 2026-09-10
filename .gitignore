@@ -13,3 +13,4 @@ htmlcov/
 downloads/
 *.session
 *.log
+*.egg-info/

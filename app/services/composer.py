@@ -80,31 +80,50 @@ def _duration_for(template: str, items: list[RenderAsset]) -> float:
     images = [item for item in primary if item.asset_type == "image"]
     audios = [item for item in primary if item.asset_type in {"audio", "voice", "music"}]
     videos = [item for item in primary if item.asset_type == "video"]
+    unsupported = [
+        item
+        for item in primary
+        if item.asset_type not in {"image", "video", "audio", "voice"}
+    ]
+    if unsupported:
+        raise ValueError(
+            "The selected template cannot render asset types: "
+            + ", ".join(sorted({item.asset_type for item in unsupported}))
+        )
     if template == "audio_image":
-        if len(images) != 1 or len(audios) < 1 or videos:
+        if len(images) != 1 or len(audios) != 1 or videos or len(primary) != 2:
             raise ValueError("Audio + Image requires one image and one audio asset")
         return float(audios[0].duration or 0)
     if template == "slideshow":
-        if not images:
-            raise ValueError("Slideshow requires at least one image")
+        if not images or videos or len(audios) > 1 or len(primary) != len(images) + len(audios):
+            raise ValueError("Slideshow requires images and at most one optional audio asset")
         audio = next((item for item in audios if item.role != "music"), audios[0] if audios else None)
         return float(audio.duration or 0) if audio else float(len(images) * 4)
     if template == "merge_videos":
-        if not videos:
-            raise ValueError("Merge Videos requires video assets")
+        if not videos or images or audios or len(primary) != len(videos):
+            raise ValueError("Merge Videos requires only video assets (an optional logo is allowed)")
         return sum(float(item.duration or 0) for item in videos)
     if template == "video_audio":
-        if not videos or not audios:
-            raise ValueError("Video + Audio requires a video and audio asset")
+        if len(videos) != 1 or len(audios) != 1 or images or len(primary) != 2:
+            raise ValueError("Video + Audio requires exactly one video and one audio asset")
         return float(videos[0].duration or 0)
     if template == "intro_main_outro":
         ordered = [item for item in primary if item.asset_type == "video"]
-        if not ordered or not any(item.role == "intro" for item in ordered) or not any(item.role == "outro" for item in ordered):
-            raise ValueError("Intro/Main/Outro requires intro and outro video roles")
+        role_counts = {role: sum(item.role == role for item in ordered) for role in {"intro", "main", "outro"}}
+        if (
+            images
+            or audios
+            or len(primary) != len(ordered)
+            or role_counts["intro"] != 1
+            or role_counts["outro"] != 1
+            or role_counts["main"] < 1
+        ):
+            raise ValueError("Intro/Main/Outro requires one intro, at least one main, and one outro video")
         return sum(float(item.duration or 0) for item in ordered)
     if template == "logo_overlay":
-        if not videos or not any(item.role == "logo" for item in items):
-            raise ValueError("Logo Overlay requires a video and logo")
+        logos = [item for item in items if item.role == "logo"]
+        if len(videos) != 1 or len(logos) != 1 or images or audios or len(primary) != 1:
+            raise ValueError("Logo Overlay requires exactly one video and one logo")
         return float(videos[0].duration or 0)
     raise ValueError("Unsupported renderer template")
 
@@ -124,7 +143,10 @@ class ComposerService:
         if not linked:
             raise ValueError("Project has no assets")
         items = [self._render_asset(item) for item in linked]
+        storage_root = self.settings.project_dir.resolve()
         for item in items:
+            if storage_root not in item.path.resolve().parents:
+                raise ValueError(f"Asset #{item.asset_id} has an unsafe storage path")
             if not item.path.exists() or item.path.stat().st_size <= 0:
                 raise FileNotFoundError(f"Asset #{item.asset_id} is missing from storage")
         timeline = _timeline(project)
