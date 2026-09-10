@@ -51,12 +51,24 @@ Railway يمرر `PORT` تلقائيًا، والتطبيق يستخدمه مب�
 1. أنشئ مشروعًا جديدًا.
 2. أرسل فيديوهات أو صورًا أو ملفات صوت/voice أو documents وسائط، وأضف روابط URL مفردة أو متعددة ضمن حدود المشروع.
 3. راجع **📦 المواد**، غيّر الترتيب، احذف الرابط من المشروع، أو عيّن أدوار `main / intro / outro / music / voice / logo / background` المتوافقة مع نوع الملف.
-4. اختر Canvas: `9:16` أو `16:9` أو `1:1`، وFit: `fit / fill / blur-background`، وانتقال `none / fade`، ووضع الصوت `replace / mix / background music`، ومكان الشعار.
+4. اختر Canvas: `9:16` أو `16:9` أو `1:1`، وFit: `fit / fill / blur-background`، وانتقال `fade / dissolve / slide / wipe / zoom / blur / push / dip-to-black`، ووضع الصوت `replace / mix / background music`، ومكان الشعار.
 5. اختر القالب المقترح، تابع تقدم FFmpeg الحقيقي، ألغِ عند الحاجة، ثم استلم MP4 صالحًا. إذا تجاوز الناتج ميزانية Telegram يُضغط تكيفيًا قبل الإرسال.
 
 القوالب المنفذة فعليًا: **Audio + Image، Slideshow بصوت اختياري، Merge Videos، Video + Audio، Intro/Main/Outro، Logo Overlay**. يتم توحيد المقاس وFPS وSAR وpixel format والصوت قبل الدمج، وتضاف silent audio للفيديو الصامت. الملفات الأصلية للأصول لا تُعدّل أثناء الرندر.
 
 الرابط داخل المشروع يستخدم `DownloaderService` والحماية نفسها ضد SSRF والـprivate networks؛ Playlists لا تُضاف ككيان واحد في MVP، ويجب إرسال روابط العناصر المفردة. الملفات المرفوعة تمر بفحص الامتداد/MIME وFFprobe ولا يُستخدم اسم Telegram كمسار تخزين.
+
+### Timeline V2 والمونتاج بالمحادثة
+
+زر **🤖 مونتاج بالذكاء الاصطناعي** داخل المشروع يربط المشروع بأي نموذج نصي مفعّل في `AIProviderRegistry`. يمكن متابعة رفع الملفات والصور والصوت والـvoice والروابط في الوضع نفسه، ثم كتابة تعليمات طبيعية لتعديل المشروع الحالي بدل إنشاء نتيجة جديدة.
+
+مصدر الحقيقة هو Timeline JSON مستقل عن FFmpeg وTelegram. يدعم مسارات visual/audio/overlay/text/subtitle، وعمليات trim/split/move/reorder، السرعة والصوت وfade، crop/scale/position، canvas وfit modes، الانتقالات، النصوص والترجمة، Intro/Main/Outro، keyframes قابلة للتوسعة، ونسخ revisions كاملة مع undo/redo. كل مجموعة تعديلات من Agent تحفظ كعملية ذرية قابلة للمراجعة والتراجع.
+
+الـAI لا يحصل على shell ولا يبني FFmpeg command. النموذج يستدعي catalog أدوات محددة، ثم يتحقق `TimelineService` من الأداة والملكية والأنواع والحدود قبل تعديل Timeline. النماذج التي تدعم native tool calling تستخدمه، والبقية تستخدم Structured JSON مع تحقق وإعادة محاولة محدودة. مفاتيح المزود تبقى في متغيرات البيئة ولا تُكتب في Timeline أو سجل المحادثة.
+
+يمكن طلب **معاينة** قصيرة منخفضة الدقة ثم متابعة المحادثة والتعديل، أو طلب **تصدير نهائي**. FFmpegRenderer يترجم Timeline إلى filter graph آمن ويدعم compositing للنصوص والشعارات والترجمة والمزج متعدد المسارات. Remotion ليس dependency؛ واجهة `BaseRenderer` تبقي إضافة renderer اختياري لاحقًا ممكنة.
+
+اعتمد التصميم على فصل Timeline/commands الموجود في OpenChatCut وفكرة composition/op-log في MakeMyClip كمرجع معماري فقط. لم يُنسخ كود AGPL من OpenChatCut.
 
 ### متغيرات Media Studio
 
@@ -71,6 +83,7 @@ MAX_RENDER_DURATION_SECONDS=1800
 MAX_CONCURRENT_RENDERS=1
 MAX_RENDERS_PER_USER=1
 RENDER_TIMEOUT_SECONDS=1800
+MAX_RENDER_RETRIES=1
 DEFAULT_RENDER_FPS=30
 ```
 
@@ -84,6 +97,8 @@ DEFAULT_RENDER_FPS=30
 - `POST {OPENAI_BASE_URL}/chat/completions` للمحادثة.
 
 تختار النموذج من Telegram ثم ترسل الرسائل بشكل طبيعي، ويحتفظ البوت بسياق قصير للمحادثة داخل جلسة Telegram. يمكن بدء محادثة جديدة أو تغيير النموذج من الأزرار. إذا كان المزود لا يدعم `/models` أو `/chat/completions` بالشكل المتوافق مع OpenAI فلن يتم الادعاء بأنه مدعوم.
+
+يدعم registry إعدادات OpenAI وOpenRouter وDeepSeek وواجهة Gemini المتوافقة مع OpenAI، إضافة إلى Runware وNVIDIA وAgentRouter وxAI وGroq وأي عدد من المزودين المخصصين عبر `AI_PROVIDER_<ID>_*`. لكل مزود Base URL وAPI key وأولوية، ولكل نموذج capabilities مكتشفة من catalog المزود.
 
 ### أين أضع Base URL وAPI Token؟
 
@@ -135,4 +150,4 @@ python -m compileall -q app tests
 pytest -q
 ```
 
-الاختبارات لا تعتمد على Telegram أو YouTube أو AI provider حي. وهي تغطي أيضًا fixtures مولدة بـFFmpeg لكل قوالب الاستوديو، نسب العرض وfit modes، الفيديو الصامت واختلاف FPS/المقاسات، تقدم FFmpeg، الإلغاء والتنظيف، recovery بعد restart، ownership، Telegram uploads، URL ingestion، وفشل التسليم دون تحويل render ناجح إلى FAILED.
+الاختبارات لا تعتمد على Telegram أو YouTube أو AI provider حي. وهي تغطي أيضًا fixtures مولدة بـFFmpeg لكل قوالب الاستوديو، Timeline متعدد المسارات، الانتقالات الثمانية، النصوص والترجمة والـoverlays، revisions وundo/redo، Agent tool validation وStructured JSON/native tools، preview، نسب العرض وfit modes، الفيديو الصامت واختلاف FPS/المقاسات، تقدم FFmpeg، الإلغاء والتنظيف، recovery بعد restart، ownership، Telegram uploads، URL ingestion، وفشل التسليم دون تحويل render ناجح إلى FAILED.

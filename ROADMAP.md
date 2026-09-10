@@ -60,6 +60,19 @@ Acceptance implemented:
 
 Status: **IMPLEMENTED — local acceptance gate passing; GitHub CI required before merge**.
 
+### Intelligent Media Studio — Timeline V2
+
+- Renderer-neutral, versioned multitrack Timeline JSON with visual, audio, overlay, text and subtitle tracks.
+- Deterministic editing commands for trim, split, move, reorder, duration, speed, volume, fades, transforms, canvas, fit modes and extensible keyframes.
+- Fade, dissolve, slide, wipe, zoom, blur, push and dip-to-black transitions.
+- Project timeline revisions with atomic undo/redo.
+- Provider-neutral Telegram editing agent using native tool calls or validated Structured JSON fallback.
+- Persistent per-project Agent conversation context and ownership validation.
+- Low-resolution bounded preview renders followed by continued editing or final export.
+- Optional renderer abstraction remains ready for a future Remotion sidecar; Node is not required.
+
+Status: **IMPLEMENTED — CI and a supervised real-Telegram smoke test required before merge**.
+
 ## Next candidates
 
 Future work should be scoped separately after v0.3.0 is stable in production. No later phase is implied by this document until explicitly approved.
@@ -68,7 +81,7 @@ Future work should be scoped separately after v0.3.0 is stable in production. No
 - Whisper subtitles.
 - Auto Editor.
 - AI scene generation.
-- Advanced transitions.
+- Additional shader/motion-graphics transitions beyond the implemented FFmpeg set.
 - Remotion renderer.
 - OpenTimelineIO interchange.
 - Web timeline editor.
