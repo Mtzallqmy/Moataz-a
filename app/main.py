@@ -21,8 +21,10 @@ from app.dashboard import router as dashboard_router
 from app.db import DownloadJob, SessionLocal, init_db
 from app.operations import mark_stale_workers_offline, readiness_snapshot, reconcile_stale_jobs
 from app.queue import enqueue_download, shutdown_queue, start_queue
+from app.render_queue import enqueue_render, shutdown_render_queue, start_render_queue
 from app.security import redact_secrets
 from app.services.ai_registry import get_ai_provider_registry
+from app.services.render_service import render_service
 from app.version import RELEASE
 
 settings = get_settings()
@@ -87,7 +89,17 @@ async def _cleanup_temp_dirs() -> None:
             active = set(
                 await session.scalars(
                     select(DownloadJob.id).where(
-                        DownloadJob.status.in_(["QUEUED", "RETRYING", "DOWNLOADING", "MERGING", "PROCESSING", "CUTTING", "UPLOADING"])
+                        DownloadJob.status.in_(
+                            [
+                                "QUEUED",
+                                "RETRYING",
+                                "DOWNLOADING",
+                                "MERGING",
+                                "PROCESSING",
+                                "CUTTING",
+                                "UPLOADING",
+                            ]
+                        )
                     )
                 )
             )
@@ -140,7 +152,11 @@ async def _probe_ai_providers() -> None:
                 capabilities,
             )
         else:
-            logger.warning("AI provider %s unavailable: %s", name, str(check.get("error") or "unknown error")[:180])
+            logger.warning(
+                "AI provider %s unavailable: %s",
+                name,
+                str(check.get("error") or "unknown error")[:180],
+            )
 
 
 @asynccontextmanager
@@ -150,12 +166,18 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     if not settings.bot_token.strip():
         raise RuntimeError("BOT_TOKEN is required")
     await init_db()
+
     await start_queue()
     reconciliation = await reconcile_stale_jobs()
     for job_id in reconciliation.requeue_ids:
         await enqueue_download(job_id)
-    await mark_stale_workers_offline()
 
+    render_requeue_ids = await render_service.reconcile_after_restart()
+    await start_render_queue()
+    for render_job_id in render_requeue_ids:
+        await enqueue_render(render_job_id)
+
+    await mark_stale_workers_offline()
     bot = create_bot()
     polling_task = asyncio.create_task(_run_polling_forever(bot), name="telegram-polling")
     maintenance_task = asyncio.create_task(_maintenance_loop(), name="maintenance")
@@ -176,6 +198,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             ai_probe_task.cancel()
             with suppress(asyncio.CancelledError):
                 await ai_probe_task
+        await shutdown_render_queue()
         await shutdown_queue()
         if bot:
             await bot.session.close()
@@ -195,6 +218,7 @@ async def root():
         "release": RELEASE,
         "mode": "polling",
         "queue": "inline",
+        "render_queue": "inline",
         "dashboard": "/dashboard" if settings.dashboard_password else "disabled",
         "ai_provider": "configured" if get_ai_provider_registry().enabled else "disabled",
     }
