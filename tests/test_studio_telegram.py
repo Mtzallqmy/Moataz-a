@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 from app import db as database
 from app.bot import studio
@@ -116,6 +117,37 @@ class FakeMessage:
     async def answer(self, text: str, **kwargs):
         self.answers.append(text)
         return SimpleNamespace(message_id=len(self.answers))
+
+
+@pytest.mark.asyncio
+async def test_safe_edit_treats_message_not_modified_as_success() -> None:
+    class Bot:
+        async def edit_message_text(self, **kwargs):
+            raise TelegramBadRequest(method=SimpleNamespace(), message="message is not modified")
+
+    assert await studio._safe_edit(Bot(), 1, 2, "same") is True
+
+
+@pytest.mark.asyncio
+async def test_safe_edit_retries_once_after_rate_limit(monkeypatch) -> None:
+    calls = 0
+
+    class Bot:
+        async def edit_message_text(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TelegramRetryAfter(
+                    method=SimpleNamespace(), message="retry", retry_after=1
+                )
+            return True
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(studio.asyncio, "sleep", no_sleep)
+    assert await studio._safe_edit(Bot(), 1, 2, "updated") is True
+    assert calls == 2
 
 
 @pytest.mark.asyncio

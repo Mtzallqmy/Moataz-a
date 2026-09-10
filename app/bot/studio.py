@@ -261,8 +261,26 @@ async def _safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, markup=
         return True
     except TelegramRetryAfter as exc:
         await asyncio.sleep(min(float(exc.retry_after), 5.0))
-    except (TelegramBadRequest, TelegramNetworkError):
-        pass
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=markup,
+            )
+            return True
+        except TelegramBadRequest as retry_exc:
+            if "message is not modified" in str(retry_exc).lower():
+                return True
+        except (TelegramRetryAfter, TelegramNetworkError):
+            return False
+    except TelegramBadRequest as exc:
+        # Telegram reports this as an error even though the requested UI state is
+        # already visible. Treat it as success so delivery monitoring continues.
+        if "message is not modified" in str(exc).lower():
+            return True
+    except TelegramNetworkError:
+        return False
     return False
 
 
