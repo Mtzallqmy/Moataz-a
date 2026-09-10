@@ -47,6 +47,29 @@ Acceptance:
 
 Status: **IMPLEMENTED — CI gate required on every commit**.
 
+### Media Studio MVP — v0.5.0
+
+Acceptance implemented:
+
+- Telegram project creation, uploads, URL ingestion, ordered assets, ownership-safe callbacks, roles and project listing.
+- Audio + Image, Slideshow, normalized video merge, Video + Audio modes, Intro/Main/Outro and Logo Overlay.
+- 9:16 / 16:9 / 1:1 canvases with fit, fill and blur-background without distortion.
+- FFmpeg-clock progress, deterministic cancellation, isolated render queue, scoped cleanup and restart reconciliation.
+- FFprobe output validation and adaptive Telegram delivery; delivery errors remain separate from render success.
+- Offline acceptance coverage using FFmpeg fixtures and Telegram/downloader mocks.
+
+Status: **IMPLEMENTED — local acceptance gate passing; GitHub CI required before merge**.
+
 ## Next candidates
 
 Future work should be scoped separately after v0.3.0 is stable in production. No later phase is implied by this document until explicitly approved.
+
+- Audiogram / waveform rendering.
+- Whisper subtitles.
+- Auto Editor.
+- AI scene generation.
+- Advanced transitions.
+- Remotion renderer.
+- OpenTimelineIO interchange.
+- Web timeline editor.
+- Motion graphics.

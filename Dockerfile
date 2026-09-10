@@ -7,5 +7,5 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 COPY app ./app
 RUN pip install --upgrade pip && pip install .
-RUN mkdir -p /data/downloads
+RUN mkdir -p /data/downloads /data/projects /data/tmp
 CMD ["python", "-m", "app.main"]
