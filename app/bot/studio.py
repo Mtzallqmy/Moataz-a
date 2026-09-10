@@ -19,11 +19,13 @@ from app.bot.uploads import download_upload, upload_candidate
 from app.config import get_settings
 from app.db import MediaProject, ProjectStatus, RenderStatus, User
 from app.render_queue import cancel_render, enqueue_render
+from app.services.ai_registry import get_ai_provider_registry
 from app.services.assets import AssetService, asset_service
 from app.services.composer import composer_service
 from app.services.media import fit_media_for_upload, probe_media_file
 from app.services.projects import ProjectAssetItem, ProjectService, project_service
 from app.services.render_service import RenderService, render_service
+from app.services.studio_agent import StudioAgentService, studio_agent_service
 from app.services.urls import parse_bulk_urls
 from app.utils import seconds_to_hms
 
@@ -35,6 +37,7 @@ _delivery_tasks: set[asyncio.Task] = set()
 
 class StudioState(StatesGroup):
     collecting = State()
+    agent = State()
 
 
 def studio_home_keyboard() -> InlineKeyboardMarkup:
@@ -58,8 +61,25 @@ def project_keyboard(project_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⚙️ الإعدادات", callback_data=f"studio:settings:{project_id}"),
                 InlineKeyboardButton(text="✅ بدء المونتاج", callback_data=f"studio:start:{project_id}"),
             ],
+            [InlineKeyboardButton(text="🤖 مونتاج بالذكاء الاصطناعي", callback_data=f"studio:agent:{project_id}")],
             [InlineKeyboardButton(text="🗑 إلغاء المشروع", callback_data=f"studio:cancelproject:{project_id}")],
             [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="menu:home")],
+        ]
+    )
+
+
+def agent_keyboard(project_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👁 معاينة", callback_data=f"studio:agentrender:{project_id}:preview"),
+                InlineKeyboardButton(text="🎬 تصدير نهائي", callback_data=f"studio:agentrender:{project_id}:final"),
+            ],
+            [
+                InlineKeyboardButton(text="↩️ تراجع", callback_data=f"studio:agentundo:{project_id}"),
+                InlineKeyboardButton(text="↪️ إعادة", callback_data=f"studio:agentredo:{project_id}"),
+            ],
+            [InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")],
         ]
     )
 
@@ -331,6 +351,8 @@ async def watch_render_and_deliver(
         if job.status != RenderStatus.COMPLETED.value or not job.output_path:
             return
 
+        kind_getter = getattr(service, "get_render_kind", None)
+        render_kind = await kind_getter(job.id) if kind_getter is not None else "final"
         delivery_root = settings.render_temp_dir / f"delivery-{job.id}"
         delivery_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -349,11 +371,24 @@ async def watch_render_and_deliver(
             await bot.send_video(
                 chat_id=chat_id,
                 video=FSInputFile(prepared, filename=f"project-{job.project_id}.mp4"),
-                caption=f"✅ Project #{job.project_id} • Render #{job.id}",
+                caption=(
+                    f"👁 معاينة Project #{job.project_id} • Render #{job.id}"
+                    if render_kind == "preview"
+                    else f"✅ Project #{job.project_id} • Render #{job.id}"
+                ),
                 supports_streaming=True,
             )
             await service.finish_delivery(job.id)
-            await _safe_edit(bot, chat_id, message_id, f"✅ اكتمل Project #{job.project_id} وتم إرسال الفيديو.")
+            await _safe_edit(
+                bot,
+                chat_id,
+                message_id,
+                (
+                    f"👁 تم إرسال معاينة Project #{job.project_id}. يمكنك متابعة التعديل."
+                    if render_kind == "preview"
+                    else f"✅ اكتمل Project #{job.project_id} وتم إرسال الفيديو."
+                ),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -373,6 +408,33 @@ async def watch_render_and_deliver(
 def _track(task: asyncio.Task) -> None:
     _delivery_tasks.add(task)
     task.add_done_callback(_delivery_tasks.discard)
+
+
+async def _enqueue_agent_render(message: Message, project_id: int, user_id: int, kind: str) -> None:
+    job = await render_service.create_render(
+        project_id,
+        user_id=user_id,
+        kind=kind,
+        preview_duration=15 if kind == "preview" else None,
+        preview_width=480 if kind == "preview" else None,
+    )
+    await enqueue_render(job.id)
+    progress = await message.answer(
+        _progress_text(project_id, 0.0, time.monotonic()),
+        reply_markup=render_cancel_keyboard(job.id),
+    )
+    _track(
+        asyncio.create_task(
+            watch_render_and_deliver(
+                message.bot,
+                chat_id=message.chat.id,
+                message_id=progress.message_id,
+                render_job_id=job.id,
+                user_id=user_id,
+            ),
+            name=f"studio-agent-delivery-{job.id}",
+        )
+    )
 
 
 @router.callback_query(F.data == "menu:studio")
@@ -424,6 +486,187 @@ async def add_more(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(StudioState.collecting)
     await state.update_data(studio_project_id=project_id)
     await callback.message.edit_text(_project_text(project_id), reply_markup=project_keyboard(project_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:agent:"))
+async def open_agent(callback: CallbackQuery, state: FSMContext) -> None:
+    project_id = int(callback.data.rsplit(":", 1)[1])
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
+        return
+    registry = get_ai_provider_registry()
+    if not registry.enabled:
+        await callback.answer("لا يوجد مزود AI مفعّل.", show_alert=True)
+        return
+    models, errors = await registry.models_for("text")
+    models = models[:12]
+    if not models:
+        detail = next(iter(errors.values()), "لا توجد نماذج نصية متاحة")
+        await callback.answer(detail[:180], show_alert=True)
+        return
+    await state.update_data(
+        studio_project_id=project_id,
+        studio_agent_models=[model.state_dict() for model in models],
+    )
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{model.provider_name} · {model.model_id}"[:60],
+                callback_data=f"studio:agentmodel:{project_id}:{index}",
+            )
+        ]
+        for index, model in enumerate(models)
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")])
+    await callback.message.edit_text(
+        "🤖 اختر نموذج المونتاج. سيعدل النموذج نفس Timeline عبر أدوات آمنة فقط:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:agentmodel:"))
+async def choose_agent_model(callback: CallbackQuery, state: FSMContext) -> None:
+    _, _, raw_project, raw_index = callback.data.split(":")
+    project_id = int(raw_project)
+    if await _owned_project(callback, project_id) is None or callback.message is None:
+        return
+    data = await state.get_data()
+    models = list(data.get("studio_agent_models") or [])
+    try:
+        selected = models[int(raw_index)]
+        provider_id = str(selected["provider_id"])
+        model = str(selected["model_id"])
+        native_tools = "tools" in set(selected.get("capabilities") or [])
+    except (IndexError, KeyError, TypeError, ValueError):
+        await callback.answer("أعد فتح قائمة النماذج", show_alert=True)
+        return
+    await state.set_state(StudioState.agent)
+    await state.update_data(
+        studio_project_id=project_id,
+        studio_agent_provider_id=provider_id,
+        studio_agent_model=model,
+        studio_agent_native_tools=native_tools,
+    )
+    await callback.message.edit_text(
+        f"🤖 مونتاج بالذكاء الاصطناعي — Project #{project_id}\n\n"
+        "أرسل ملفات أو روابط، أو اكتب تعليماتك الطبيعية. كل تعديل يطبق على نفس Timeline "
+        "ويمكن التراجع عنه. استخدم المعاينة قبل التصدير النهائي.",
+        reply_markup=agent_keyboard(project_id),
+    )
+    await callback.answer("تم اختيار النموذج")
+
+
+@router.message(StudioState.agent, F.video | F.photo | F.audio | F.voice | F.document)
+async def receive_agent_upload(message: Message, state: FSMContext) -> None:
+    await ingest_upload_message(message, state)
+
+
+async def handle_agent_instruction(
+    message: Message,
+    state: FSMContext,
+    *,
+    agent: StudioAgentService = studio_agent_service,
+) -> None:
+    user = await _message_user(message)
+    if user is None or not message.text:
+        return
+    data = await state.get_data()
+    project_id = int(data.get("studio_project_id") or 0)
+    if await project_service.get_project(project_id, user_id=user.id) is None:
+        await state.clear()
+        await message.answer("المشروع غير متاح.")
+        return
+    parsed = parse_bulk_urls(message.text, limit=settings.max_bulk_urls)
+    stripped_lines = [line.strip() for line in message.text.splitlines() if line.strip()]
+    if parsed.urls and len(parsed.urls) == len(stripped_lines):
+        await receive_project_url(message, state)
+        return
+    provider_id = str(data.get("studio_agent_provider_id") or "")
+    model = str(data.get("studio_agent_model") or "")
+    if not provider_id or not model:
+        await message.answer("أعد فتح وضع الذكاء الاصطناعي واختر نموذجًا.")
+        return
+    thinking = await message.answer("🤖 أحلل Timeline وأطبق التعديلات…")
+    try:
+        reply = await agent.handle(
+            project_id,
+            user_id=user.id,
+            instruction=message.text,
+            provider_id=provider_id,
+            model=model,
+            native_tools=bool(data.get("studio_agent_native_tools")),
+        )
+        tools = "، ".join(reply.applied_tools)
+        await thinking.edit_text(
+            f"✅ {reply.text[:1000]}\n\nالأدوات: {tools[:600]}",
+            reply_markup=agent_keyboard(project_id),
+        )
+        if reply.render_action:
+            await _enqueue_agent_render(message, project_id, user.id, reply.render_action)
+    except Exception as exc:
+        logger.warning(
+            "studio agent request failed project_id=%s error=%s",
+            project_id,
+            type(exc).__name__,
+        )
+        await thinking.edit_text(
+            f"تعذر تطبيق التعليمات بأمان: {str(exc)[:700]}",
+            reply_markup=agent_keyboard(project_id),
+        )
+
+
+@router.message(StudioState.agent, F.text)
+async def receive_agent_instruction(message: Message, state: FSMContext) -> None:
+    await handle_agent_instruction(message, state)
+
+
+@router.callback_query(F.data.startswith("studio:agentrender:"))
+async def agent_render(callback: CallbackQuery) -> None:
+    _, _, raw_project, kind = callback.data.split(":")
+    project_id = int(raw_project)
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None or kind not in {"preview", "final"}:
+        return
+    user, _ = owned
+    try:
+        await _enqueue_agent_render(callback.message, project_id, user.id, kind)
+    except Exception as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+        return
+    await callback.answer("بدأت المعاينة" if kind == "preview" else "بدأ التصدير")
+
+
+@router.callback_query(F.data.startswith("studio:agentundo:"))
+async def agent_undo(callback: CallbackQuery) -> None:
+    project_id = int(callback.data.rsplit(":", 1)[1])
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
+        return
+    user, _ = owned
+    try:
+        await studio_agent_service.timelines.undo(project_id, user_id=user.id)
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.message.answer("↩️ تم التراجع عن آخر تعديل.", reply_markup=agent_keyboard(project_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:agentredo:"))
+async def agent_redo(callback: CallbackQuery) -> None:
+    project_id = int(callback.data.rsplit(":", 1)[1])
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
+        return
+    user, _ = owned
+    try:
+        await studio_agent_service.timelines.redo(project_id, user_id=user.id)
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.message.answer("↪️ تمت إعادة التعديل.", reply_markup=agent_keyboard(project_id))
     await callback.answer()
 
 
