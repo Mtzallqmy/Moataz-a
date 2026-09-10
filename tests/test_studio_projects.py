@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.db import MediaAsset, SessionLocal, User, init_db
+import app.db as database
 from app.services.composer import ComposerService
 from app.services.projects import ProjectService
 
@@ -14,17 +14,17 @@ from app.services.projects import ProjectService
 _USER_IDS = itertools.count(991001)
 
 
-async def _fixture_assets(tmp_path: Path) -> tuple[User, MediaAsset, MediaAsset]:
-    await init_db()
+async def _fixture_assets(tmp_path: Path) -> tuple[database.User, database.MediaAsset, database.MediaAsset]:
+    await database.init_db()
     image_path = tmp_path / "stored-cover.jpg"
     audio_path = tmp_path / "stored-audio.mp3"
     image_path.write_bytes(b"image-fixture")
     audio_path.write_bytes(b"audio-fixture")
-    async with SessionLocal() as session:
-        user = User(telegram_id=next(_USER_IDS), username="studio-projects")
+    async with database.SessionLocal() as session:
+        user = database.User(telegram_id=next(_USER_IDS), username="studio-projects")
         session.add(user)
         await session.flush()
-        image = MediaAsset(
+        image = database.MediaAsset(
             user_id=user.id,
             asset_type="image",
             source_type="local",
@@ -35,7 +35,7 @@ async def _fixture_assets(tmp_path: Path) -> tuple[User, MediaAsset, MediaAsset]
             file_size=image_path.stat().st_size,
             metadata_json="{}",
         )
-        audio = MediaAsset(
+        audio = database.MediaAsset(
             user_id=user.id,
             asset_type="audio",
             source_type="local",
@@ -59,7 +59,12 @@ async def test_project_timeline_is_renderer_independent_and_composer_builds_audi
     project = await projects.create_project(user_id=user.id, chat_id=123, preset="vertical")
     await projects.add_asset(project.id, image.id, user_id=user.id)
     await projects.add_asset(project.id, audio.id, user_id=user.id)
-    project = await projects.apply_template(project.id, user_id=user.id, template="audio_image", options={"fit_mode": "fit"})
+    project = await projects.apply_template(
+        project.id,
+        user_id=user.id,
+        template="audio_image",
+        options={"fit_mode": "fit"},
+    )
     timeline = json.loads(project.timeline_json)
     assert timeline["version"] == 1
     assert timeline["template"] == "audio_image"
