@@ -68,7 +68,7 @@ async def test_project_timeline_is_renderer_independent_and_composer_builds_audi
         options={"fit_mode": "fit"},
     )
     timeline = json.loads(project.timeline_json)
-    assert timeline["version"] == 1
+    assert timeline["version"] == 2
     assert timeline["template"] == "audio_image"
     assert "ffmpeg" not in project.timeline_json.lower()
     assert str(tmp_path) not in project.timeline_json

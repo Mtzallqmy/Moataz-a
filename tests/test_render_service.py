@@ -9,7 +9,7 @@ import pytest
 
 from app.config import Settings
 from app.db import MediaProject, ProjectStatus, RenderJob, RenderStatus, SessionLocal, User, init_db
-from app.errors import CancelledError
+from app.errors import CancelledError, FFmpegError
 from app.render_queue import RenderQueue
 from app.services.composer import RenderPlan
 from app.services.projects import ProjectService
@@ -78,6 +78,19 @@ class FailOnceRenderer(BaseRenderer):
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"ok")
         return RenderResult(output_path=output, duration=1.0, file_size=2, has_audio=True)
+
+
+class TransientOnceRenderer(FailOnceRenderer):
+    async def render(self, plan, *, render_job_id, progress_callback=None, cancel_event=None):
+        if self.calls == 0:
+            self.calls += 1
+            raise FFmpegError("resource temporarily unavailable")
+        return await super().render(
+            plan,
+            render_job_id=render_job_id,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
 
 
 async def _project() -> tuple[int, int]:
@@ -176,6 +189,25 @@ async def test_render_queue_survives_one_renderer_failure(tmp_path: Path) -> Non
     two = await service.get_render(second.id)
     assert one is not None and one.status == RenderStatus.FAILED.value
     assert two is not None and two.status == RenderStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_render_retries_only_transient_ffmpeg_failure(tmp_path: Path, monkeypatch) -> None:
+    user_id, project_id = await _project()
+    renderer = TransientOnceRenderer(tmp_path)
+    settings = _settings(tmp_path)
+    settings.max_render_retries = 1
+    service = RenderService(settings, composer=StaticComposer(), renderer=renderer)
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("app.services.render_service.asyncio.sleep", no_sleep)
+    job = await service.create_render(project_id, user_id=user_id)
+    await service.process_render(job.id)
+    stored = await service.get_render(job.id)
+    assert stored is not None and stored.status == RenderStatus.COMPLETED.value
+    assert renderer.calls == 2
 
 
 @pytest.mark.asyncio
