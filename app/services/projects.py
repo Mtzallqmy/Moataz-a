@@ -139,6 +139,10 @@ class ProjectService:
             count = int(await session.scalar(select(func.count()).select_from(ProjectAsset).where(ProjectAsset.project_id == project_id)) or 0)
             if count >= self.settings.max_project_assets:
                 raise ValueError("Project asset limit reached")
+            if project.status == ProjectStatus.CANCELLED.value:
+                raise ValueError("Cancelled project cannot be modified")
+            if not asset.local_path:
+                raise ValueError("Asset storage path is missing")
             max_position = await session.scalar(select(func.max(ProjectAsset.position)).where(ProjectAsset.project_id == project_id))
             link = ProjectAsset(project_id=project_id, asset_id=asset_id, position=(int(max_position) + 1) if max_position is not None else 0, role=role)
             session.add(link)
@@ -179,7 +183,12 @@ class ProjectService:
             target = index + step
             if target < 0 or target >= len(links):
                 return False
-            links[index].position, links[target].position = links[target].position, links[index].position
+            original = links[index].position
+            links[index].position = len(links) + 1
+            await session.flush()
+            links[target].position = original
+            await session.flush()
+            links[index].position = target
             await session.flush()
             await self._write_timeline(session, project)
             await session.commit()
@@ -230,6 +239,20 @@ class ProjectService:
                 raise ValueError("Unknown fit mode")
             if merged.get("transition", "none") not in {"none", "fade"}:
                 raise ValueError("Unknown transition")
+            if merged.get("audio_mode", "replace_audio") not in {
+                "replace_audio",
+                "mix_audio",
+                "background_music",
+            }:
+                raise ValueError("Unknown audio mode")
+            if merged.get("logo_position", "top-right") not in {
+                "top-left",
+                "top-right",
+                "bottom-left",
+                "bottom-right",
+                "center",
+            }:
+                raise ValueError("Unknown logo position")
             payload["options"] = merged
             project.timeline_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             await self._write_timeline(session, project)

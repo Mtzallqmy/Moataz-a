@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.config import Settings, get_settings
-from app.db import MediaAsset, ProjectAsset, SessionLocal
+from app.db import MediaAsset, MediaProject, ProjectAsset, SessionLocal
 from app.errors import FFmpegError
 from app.services.downloader import DownloaderService, get_downloader_service
 from app.services.media import _run_process
@@ -20,7 +20,8 @@ from app.services.media import _run_process
 _ALLOWED_IMAGE = {".jpg", ".jpeg", ".png", ".webp"}
 _ALLOWED_VIDEO = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 _ALLOWED_AUDIO = {".mp3", ".wav", ".m4a", ".ogg", ".opus", ".aac", ".flac"}
-_ALLOWED_SUFFIXES = _ALLOWED_IMAGE | _ALLOWED_VIDEO | _ALLOWED_AUDIO
+_ALLOWED_SUBTITLE = {".srt", ".vtt"}
+_ALLOWED_SUFFIXES = _ALLOWED_IMAGE | _ALLOWED_VIDEO | _ALLOWED_AUDIO | _ALLOWED_SUBTITLE
 _ALLOWED_TYPES = {"video", "image", "audio", "voice", "logo", "subtitle"}
 
 
@@ -96,6 +97,18 @@ async def probe_asset_file(source: Path) -> AssetProbe:
     )
 
 
+def _validate_subtitle(source: Path) -> AssetProbe:
+    if source.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError("Subtitle file exceeds the 2 MB safety limit")
+    try:
+        text = source.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Subtitle file must be UTF-8 text") from exc
+    if "-->" not in text or "\x00" in text:
+        raise ValueError("File is not a supported SRT/VTT subtitle")
+    return AssetProbe(None, False, False, None, None, (), source.stat().st_size)
+
+
 def _infer_asset_type(
     *,
     declared_type: str | None,
@@ -129,7 +142,8 @@ def _infer_asset_type(
         if suffix not in _ALLOWED_VIDEO or not probe.has_video or probe.duration is None:
             raise ValueError("File is not a supported video asset")
     elif requested == "subtitle":
-        raise ValueError("Subtitle ingestion is not enabled in the MVP")
+        if suffix not in _ALLOWED_SUBTITLE:
+            raise ValueError("File is not a supported subtitle")
     return requested
 
 
@@ -166,7 +180,7 @@ class AssetService:
         if source.stat().st_size > self.settings.max_file_size_bytes:
             raise ValueError("File exceeds configured size limit")
         suffix = _pick_suffix(source, mime_type)
-        probe = await probe_asset_file(source)
+        probe = _validate_subtitle(source) if suffix in _ALLOWED_SUBTITLE else await probe_asset_file(source)
         asset_type = _infer_asset_type(
             declared_type=declared_type,
             mime_type=mime_type,
@@ -175,6 +189,16 @@ class AssetService:
         )
         if probe.duration and probe.duration > self.settings.max_video_duration_seconds:
             raise ValueError("Media duration exceeds configured limit")
+
+        async with SessionLocal() as session:
+            owned_project = await session.scalar(
+                select(MediaProject.id).where(
+                    MediaProject.id == project_id,
+                    MediaProject.user_id == user_id,
+                )
+            )
+        if owned_project is None:
+            raise LookupError("Project not found or not owned by user")
 
         guessed_mime = mime_type or mimetypes.guess_type(f"x{suffix}")[0]
         asset_key = uuid.uuid4().hex

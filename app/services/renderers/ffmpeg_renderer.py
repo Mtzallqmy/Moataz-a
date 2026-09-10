@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import threading
 from pathlib import Path
@@ -40,15 +41,15 @@ class FFmpegRenderer(BaseRenderer):
         await emit_progress(progress_callback, 0.02)
         try:
             if plan.template == "audio_image":
-                await self._audio_image(plan, output, cancel_event)
+                await self._audio_image(plan, output, cancel_event, progress_callback)
             elif plan.template == "slideshow":
-                await self._slideshow(plan, output, cancel_event)
+                await self._slideshow(plan, output, cancel_event, progress_callback)
             elif plan.template in {"merge_videos", "intro_main_outro"}:
                 await self._merge_videos(plan, output, workspace, cancel_event, progress_callback)
             elif plan.template == "video_audio":
-                await self._video_audio(plan, output, cancel_event)
+                await self._video_audio(plan, output, cancel_event, progress_callback)
             elif plan.template == "logo_overlay":
-                await self._logo_overlay(plan, output, cancel_event)
+                await self._logo_overlay(plan, output, cancel_event, progress_callback)
             else:
                 raise ValueError(f"Unsupported FFmpeg renderer template: {plan.template}")
 
@@ -62,6 +63,9 @@ class FFmpegRenderer(BaseRenderer):
                     destination=logo_output,
                     plan=plan,
                     cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                    progress_start=0.88,
+                    progress_end=0.96,
                 )
                 logo_output.replace(output)
 
@@ -69,7 +73,7 @@ class FFmpegRenderer(BaseRenderer):
             result = await self._validate_output(output, plan)
             await emit_progress(progress_callback, 1.0)
             return result
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             output.unlink(missing_ok=True)
             raise
         finally:
@@ -79,6 +83,47 @@ class FFmpegRenderer(BaseRenderer):
     def _check_cancel(cancel_event: threading.Event | None) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError("Media Studio render cancelled")
+
+    async def _run_ffmpeg(
+        self,
+        args: list[str],
+        *,
+        expected_duration: float,
+        cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None,
+        progress_start: float = 0.02,
+        progress_end: float = 0.94,
+    ) -> None:
+        """Run FFmpeg and translate its media clock into monotonic render progress."""
+        last = progress_start
+        saw_out_time_us = False
+
+        async def consume(line: str) -> None:
+            nonlocal last, saw_out_time_us
+            key, separator, raw = line.partition("=")
+            if not separator:
+                return
+            if key == "out_time_us":
+                saw_out_time_us = True
+            elif key != "out_time_ms" or saw_out_time_us:
+                return
+            try:
+                rendered_seconds = max(0.0, int(raw) / 1_000_000)
+            except ValueError:
+                return
+            ratio = min(1.0, rendered_seconds / max(expected_duration, 0.001))
+            value = max(last, progress_start + (progress_end - progress_start) * ratio)
+            if value - last >= 0.002 or ratio >= 1.0:
+                last = value
+                await emit_progress(progress_callback, value)
+
+        command = [args[0], "-progress", "pipe:1", "-nostats", *args[1:]]
+        await _run_process(
+            *command,
+            timeout=self.settings.render_timeout_seconds,
+            cancel_event=cancel_event,
+            stdout_line_callback=consume,
+        )
 
     def _visual_filter(self, source: str, target: str, plan: RenderPlan, *, prefix: str) -> str:
         width, height, fps = plan.width, plan.height, plan.fps
@@ -118,11 +163,12 @@ class FFmpegRenderer(BaseRenderer):
         plan: RenderPlan,
         output: Path,
         cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None,
     ) -> None:
         image = self._image_assets(plan)[0]
         audio = self._audio_assets(plan)[0]
         filters = self._visual_filter("0:v", "v", plan, prefix="ai")
-        await _run_process(
+        args = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
@@ -163,8 +209,12 @@ class FFmpegRenderer(BaseRenderer):
             "-movflags",
             "+faststart",
             str(output),
-            timeout=self.settings.render_timeout_seconds,
+        ]
+        await self._run_ffmpeg(
+            args,
+            expected_duration=plan.expected_duration,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
 
     async def _slideshow(
@@ -172,11 +222,14 @@ class FFmpegRenderer(BaseRenderer):
         plan: RenderPlan,
         output: Path,
         cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None,
     ) -> None:
         images = self._image_assets(plan)
         audios = self._audio_assets(plan)
         count = len(images)
-        image_duration = plan.expected_duration / count if count else 4.0
+        fade = min(0.35, plan.expected_duration / max(4, count * 4)) if count > 1 else 0.0
+        overlap_total = fade * (count - 1) if plan.transition == "fade" else 0.0
+        image_duration = (plan.expected_duration + overlap_total) / count if count else 4.0
         image_duration = max(0.25, image_duration)
         args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
         for image in images:
@@ -204,19 +257,21 @@ class FFmpegRenderer(BaseRenderer):
             ]
 
         filters: list[str] = []
-        video_labels: list[str] = []
         for index in range(count):
-            base = f"s{index}base" if plan.transition == "fade" else f"s{index}"
-            filters.append(self._visual_filter(f"{index}:v", base, plan, prefix=f"s{index}"))
-            if plan.transition == "fade":
-                fade = min(0.35, image_duration / 4)
-                out_start = max(0.0, image_duration - fade)
+            filters.append(self._visual_filter(f"{index}:v", f"s{index}", plan, prefix=f"s{index}"))
+        if plan.transition == "fade" and count > 1:
+            previous = "s0"
+            for index in range(1, count):
+                target = "v" if index == count - 1 else f"xf{index}"
+                offset = image_duration * index - fade * index
                 filters.append(
-                    f"[{base}]fade=t=in:st=0:d={fade:.3f},"
-                    f"fade=t=out:st={out_start:.3f}:d={fade:.3f}[s{index}]"
+                    f"[{previous}][s{index}]xfade=transition=fade:duration={fade:.3f}:"
+                    f"offset={offset:.3f}[{target}]"
                 )
-            video_labels.append(f"[s{index}]")
-        filters.append(f"{''.join(video_labels)}concat=n={count}:v=1:a=0[v]")
+                previous = target
+        else:
+            video_labels = "".join(f"[s{index}]" for index in range(count))
+            filters.append(f"{video_labels}concat=n={count}:v=1:a=0[v]")
         args += [
             "-filter_complex",
             ";".join(filters),
@@ -246,10 +301,11 @@ class FFmpegRenderer(BaseRenderer):
             "+faststart",
             str(output),
         ]
-        await _run_process(
-            *args,
-            timeout=self.settings.render_timeout_seconds,
+        await self._run_ffmpeg(
+            args,
+            expected_duration=plan.expected_duration,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
 
     async def _normalize_video(
@@ -258,6 +314,9 @@ class FFmpegRenderer(BaseRenderer):
         output: Path,
         plan: RenderPlan,
         cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None = None,
+        progress_start: float = 0.02,
+        progress_end: float = 0.94,
     ) -> None:
         probe = await probe_media_file(asset.path)
         args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(asset.path)]
@@ -295,15 +354,21 @@ class FFmpegRenderer(BaseRenderer):
             "48000",
             "-ac",
             "2",
-            "-shortest",
+            "-af",
+            "apad",
+            "-t",
+            f"{float(asset.duration or probe.duration):.3f}",
             "-movflags",
             "+faststart",
             str(output),
         ]
-        await _run_process(
-            *args,
-            timeout=self.settings.render_timeout_seconds,
+        await self._run_ffmpeg(
+            args,
+            expected_duration=float(asset.duration or probe.duration),
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
         )
 
     async def _merge_videos(
@@ -322,15 +387,24 @@ class FFmpegRenderer(BaseRenderer):
         for index, asset in enumerate(videos):
             self._check_cancel(cancel_event)
             target = workspace / f"normalized-{index:03d}.mp4"
-            await self._normalize_video(asset, target, plan, cancel_event)
+            start = 0.03 + 0.72 * (index / max(1, len(videos)))
+            end = 0.03 + 0.72 * ((index + 1) / max(1, len(videos)))
+            await self._normalize_video(
+                asset,
+                target,
+                plan,
+                cancel_event,
+                progress_callback,
+                start,
+                end,
+            )
             normalized.append(target)
-            await emit_progress(progress_callback, 0.08 + 0.72 * ((index + 1) / max(1, len(videos))))
         concat_file = workspace / "concat.txt"
         concat_file.write_text(
             "".join(f"file '{str(path).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n" for path in normalized),
             encoding="utf-8",
         )
-        await _run_process(
+        args = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
@@ -347,8 +421,14 @@ class FFmpegRenderer(BaseRenderer):
             "-movflags",
             "+faststart",
             str(output),
-            timeout=self.settings.render_timeout_seconds,
+        ]
+        await self._run_ffmpeg(
+            args,
+            expected_duration=plan.expected_duration,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            progress_start=0.76,
+            progress_end=0.94,
         )
 
     async def _video_audio(
@@ -356,6 +436,7 @@ class FFmpegRenderer(BaseRenderer):
         plan: RenderPlan,
         output: Path,
         cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None,
     ) -> None:
         video = self._video_assets(plan)[0]
         audio = self._audio_assets(plan)[0]
@@ -366,11 +447,11 @@ class FFmpegRenderer(BaseRenderer):
             filters += [
                 "[0:a:0]aresample=48000,aformat=channel_layouts=stereo[a0]",
                 f"[1:a:0]volume={new_volume:.2f},aresample=48000,aformat=channel_layouts=stereo[a1]",
-                "[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]",
+                "[a0][a1]amix=inputs=2:duration=first:dropout_transition=2,apad[a]",
             ]
         else:
             filters.append("[1:a:0]aresample=48000,aformat=channel_layouts=stereo,apad[a]")
-        await _run_process(
+        args = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
@@ -403,8 +484,12 @@ class FFmpegRenderer(BaseRenderer):
             "-movflags",
             "+faststart",
             str(output),
-            timeout=self.settings.render_timeout_seconds,
+        ]
+        await self._run_ffmpeg(
+            args,
+            expected_duration=plan.expected_duration,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
 
     @staticmethod
@@ -427,6 +512,9 @@ class FFmpegRenderer(BaseRenderer):
         destination: Path,
         plan: RenderPlan,
         cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None = None,
+        progress_start: float = 0.02,
+        progress_end: float = 0.94,
     ) -> None:
         x, y = self._overlay_expression(plan.logo_position)
         probe = await probe_media_file(source)
@@ -441,7 +529,9 @@ class FFmpegRenderer(BaseRenderer):
             "-i",
             str(logo),
             "-filter_complex",
-            f"[1:v]scale=240:240:force_original_aspect_ratio=decrease[logo];[0:v][logo]overlay={x}:{y}[v]",
+            f"[1:v]scale='min(240,min(iw,{max(1, plan.width - 64)}))':"
+            f"'min(240,min(ih,{max(1, plan.height - 64)}))':"
+            f"force_original_aspect_ratio=decrease[logo];[0:v][logo]overlay={x}:{y}[v]",
             "-map",
             "[v]",
         ]
@@ -462,10 +552,13 @@ class FFmpegRenderer(BaseRenderer):
             "+faststart",
             str(destination),
         ]
-        await _run_process(
-            *args,
-            timeout=self.settings.render_timeout_seconds,
+        await self._run_ffmpeg(
+            args,
+            expected_duration=probe.duration,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
         )
 
     async def _logo_overlay(
@@ -473,6 +566,7 @@ class FFmpegRenderer(BaseRenderer):
         plan: RenderPlan,
         output: Path,
         cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None,
     ) -> None:
         video = self._video_assets(plan)[0]
         logo = next((item for item in plan.assets if item.role == "logo"), None)
@@ -480,13 +574,24 @@ class FFmpegRenderer(BaseRenderer):
             raise ValueError("Logo Overlay requires an asset with role=logo")
         normalized = output.with_name("base-video.mp4")
         try:
-            await self._normalize_video(video, normalized, plan, cancel_event)
+            await self._normalize_video(
+                video,
+                normalized,
+                plan,
+                cancel_event,
+                progress_callback,
+                0.02,
+                0.70,
+            )
             await self._overlay_existing_video(
                 source=normalized,
                 logo=logo.path,
                 destination=output,
                 plan=plan,
                 cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                progress_start=0.70,
+                progress_end=0.94,
             )
         finally:
             normalized.unlink(missing_ok=True)
@@ -497,6 +602,22 @@ class FFmpegRenderer(BaseRenderer):
         probe = await probe_media_file(output)
         if not probe.has_video or probe.duration <= 0:
             raise FFmpegError("Rendered output is not a valid video")
+        if probe.width != plan.width or probe.height != plan.height:
+            raise FFmpegError(
+                f"Rendered dimensions mismatch: expected {plan.width}x{plan.height}, "
+                f"got {probe.width}x{probe.height}"
+            )
+        if "mp4" not in (probe.format_name or "").lower():
+            raise FFmpegError("Rendered output is not a playable MP4 container")
+        expects_audio = plan.template in {
+            "audio_image",
+            "slideshow",
+            "merge_videos",
+            "video_audio",
+            "intro_main_outro",
+        }
+        if expects_audio and not probe.has_audio:
+            raise FFmpegError("Rendered output is missing its expected audio stream")
         tolerance = max(1.0, min(3.0, plan.expected_duration * 0.05))
         if abs(probe.duration - plan.expected_duration) > tolerance:
             raise FFmpegError(

@@ -14,6 +14,7 @@ from app.db import MediaProject, ProjectStatus, RenderJob, RenderStatus, Session
 from app.errors import CancelledError
 from app.security import redact_secrets
 from app.services.composer import ComposerService, composer_service
+from app.services.media import probe_media_file
 from app.services.renderers.base import BaseRenderer
 from app.services.renderers.ffmpeg_renderer import ffmpeg_renderer
 
@@ -168,6 +169,14 @@ class RenderService:
             output_path = result.output_path
             if event.is_set():
                 raise CancelledError("Render cancelled")
+            expected_output_dir = (
+                self.settings.project_dir / str(project_id) / "renders" / str(render_job_id)
+            ).resolve()
+            resolved_output = result.output_path.resolve()
+            if expected_output_dir not in resolved_output.parents:
+                raise ValueError("Renderer returned an unsafe output path")
+            if not result.output_path.exists() or result.output_path.stat().st_size <= 0:
+                raise ValueError("Renderer returned a missing or empty output")
             async with SessionLocal() as session:
                 job = await session.get(RenderJob, render_job_id)
                 project = await session.get(MediaProject, project_id)
@@ -246,7 +255,7 @@ class RenderService:
             }:
                 return False
             self.request_cancel(render_job_id)
-            if job.status == RenderStatus.QUEUED.value:
+            if job.status in {RenderStatus.QUEUED.value, RenderStatus.UPLOADING.value}:
                 job.status = RenderStatus.CANCELLED.value
                 job.completed_at = datetime.now(UTC)
                 project = await session.get(MediaProject, job.project_id)
@@ -258,7 +267,12 @@ class RenderService:
     async def mark_uploading(self, render_job_id: int) -> None:
         async with SessionLocal() as session:
             job = await session.get(RenderJob, render_job_id)
-            if job is not None and job.status == RenderStatus.COMPLETED.value:
+            if (
+                job is not None
+                and job.status == RenderStatus.COMPLETED.value
+                and job.output_path
+                and Path(job.output_path).is_file()
+            ):
                 job.status = RenderStatus.UPLOADING.value
                 await session.commit()
 
@@ -269,8 +283,7 @@ class RenderService:
                 return
             if job.output_path and Path(job.output_path).exists():
                 job.status = RenderStatus.COMPLETED.value
-                if error:
-                    job.error = f"DELIVERY_FAILED: {error[:800]}"
+                job.error = f"DELIVERY_FAILED: {error[:800]}" if error else None
                 await session.commit()
 
     async def reconcile_after_restart(self) -> list[int]:
@@ -281,7 +294,13 @@ class RenderService:
             )
             requeue.extend(job.id for job in queued)
             interrupted = list(
-                await session.scalars(select(RenderJob).where(RenderJob.status.in_(_ACTIVE_STATES)))
+                await session.scalars(
+                    select(RenderJob).where(
+                        RenderJob.status.in_(
+                            {RenderStatus.PREPARING.value, RenderStatus.RENDERING.value}
+                        )
+                    )
+                )
             )
             for job in interrupted:
                 job.status = RenderStatus.FAILED.value
@@ -290,9 +309,43 @@ class RenderService:
                 project = await session.get(MediaProject, job.project_id)
                 if project is not None and project.status != ProjectStatus.CANCELLED.value:
                     project.status = ProjectStatus.READY.value
+            uploading = list(
+                await session.scalars(
+                    select(RenderJob).where(RenderJob.status == RenderStatus.UPLOADING.value)
+                )
+            )
+            for job in uploading:
+                valid_output = False
+                if job.output_path:
+                    try:
+                        output = Path(job.output_path)
+                        expected = (
+                            self.settings.project_dir / str(job.project_id) / "renders" / str(job.id)
+                        ).resolve()
+                        resolved = output.resolve()
+                        if expected in resolved.parents and output.is_file() and output.stat().st_size > 0:
+                            probe = await probe_media_file(output)
+                            valid_output = probe.has_video and probe.duration > 0
+                    except Exception:
+                        valid_output = False
+                if valid_output:
+                    job.status = RenderStatus.COMPLETED.value
+                    job.error = "DELIVERY_INTERRUPTED: output is ready; delivery can be retried"
+                else:
+                    job.status = RenderStatus.FAILED.value
+                    job.error = "RESTART_INTERRUPTED: upload output is missing or invalid"
+                    project = await session.get(MediaProject, job.project_id)
+                    if project is not None and project.status != ProjectStatus.CANCELLED.value:
+                        project.status = ProjectStatus.READY.value
+                job.completed_at = datetime.now(UTC)
             await session.commit()
-        shutil.rmtree(self.settings.render_temp_dir, ignore_errors=True)
         self.settings.render_temp_dir.mkdir(parents=True, exist_ok=True)
+        for workspace in self.settings.render_temp_dir.glob("render-*"):
+            if not workspace.is_dir():
+                continue
+            suffix = workspace.name.removeprefix("render-")
+            if suffix.isdigit():
+                shutil.rmtree(workspace, ignore_errors=True)
         return requeue
 
 

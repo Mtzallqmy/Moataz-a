@@ -42,7 +42,7 @@ class SuccessRenderer(BaseRenderer):
 
     async def render(self, plan, *, render_job_id, progress_callback=None, cancel_event=None):
         await emit_progress(progress_callback, 0.45)
-        output = self.root / f"success-{render_job_id}.mp4"
+        output = self.root / "projects" / str(plan.project_id) / "renders" / str(render_job_id) / "output.mp4"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"valid-render")
         await emit_progress(progress_callback, 1.0)
@@ -54,7 +54,7 @@ class WaitingRenderer(BaseRenderer):
         self.root = root
 
     async def render(self, plan, *, render_job_id, progress_callback=None, cancel_event=None):
-        output = self.root / f"partial-{render_job_id}.mp4"
+        output = self.root / "projects" / str(plan.project_id) / "renders" / str(render_job_id) / "output.mp4"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"partial")
         while cancel_event is None or not cancel_event.is_set():
@@ -72,7 +72,7 @@ class FailOnceRenderer(BaseRenderer):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("synthetic ffmpeg failure")
-        output = self.root / f"recovered-{render_job_id}.mp4"
+        output = self.root / "projects" / str(plan.project_id) / "renders" / str(render_job_id) / "output.mp4"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"ok")
         return RenderResult(output_path=output, duration=1.0, file_size=2, has_audio=True)

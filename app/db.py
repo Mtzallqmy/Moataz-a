@@ -4,7 +4,20 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -141,6 +154,10 @@ class WorkerNode(Base):
 
 class MediaAsset(Base):
     __tablename__ = "media_assets"
+    __table_args__ = (
+        CheckConstraint("file_size > 0", name="ck_media_assets_file_size_positive"),
+        Index("ix_media_assets_user_created", "user_id", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
@@ -160,6 +177,7 @@ class MediaAsset(Base):
 
 class MediaProject(Base):
     __tablename__ = "media_projects"
+    __table_args__ = (Index("ix_media_projects_user_updated", "user_id", "updated_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
@@ -186,6 +204,10 @@ class MediaProject(Base):
 
 class ProjectAsset(Base):
     __tablename__ = "project_assets"
+    __table_args__ = (
+        UniqueConstraint("project_id", "position", name="uq_project_assets_project_position"),
+        CheckConstraint("position >= 0", name="ck_project_assets_position_nonnegative"),
+    )
 
     project_id: Mapped[int] = mapped_column(
         ForeignKey("media_projects.id", ondelete="CASCADE"), primary_key=True
@@ -200,9 +222,14 @@ class ProjectAsset(Base):
 
 class RenderJob(Base):
     __tablename__ = "render_jobs"
+    __table_args__ = (
+        CheckConstraint("progress >= 0 AND progress <= 1", name="ck_render_jobs_progress_range"),
+        Index("ix_render_jobs_user_status", "user_id", "status"),
+        Index("ix_render_jobs_project_created", "project_id", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("media_projects.id"), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("media_projects.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     status: Mapped[str] = mapped_column(String(32), default=RenderStatus.QUEUED.value, index=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
