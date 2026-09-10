@@ -84,6 +84,40 @@ async def test_openai_compatible_rejects_invalid_chat_payload():
         await provider.chat("model-a", [{"role": "user", "content": "hello"}])
 
 
+@pytest.mark.asyncio
+async def test_openai_compatible_parses_native_tool_calls_without_executing_them():
+    provider = StubProvider(
+        {
+            "chat/completions": {
+                "model": "tool-model",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "سأضبط المقاس",
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "set_canvas",
+                                        "arguments": '{"preset":"9:16"}',
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                ],
+            }
+        }
+    )
+    tools = [{"type": "function", "function": {"name": "set_canvas"}}]
+    reply = await provider.chat_tools(
+        "tool-model", [{"role": "user", "content": "Reels"}], tools
+    )
+    assert reply.tool_calls == (({"name": "set_canvas", "arguments": {"preset": "9:16"}}),)
+    body = provider.calls[0][2]
+    assert body["tools"] == tools
+    assert body["tool_choice"] == "auto"
+
+
 def test_ai_token_is_redacted_from_errors_and_authorization_text():
     token = "placeholder-api-token-123456"
     provider = OpenAICompatibleProvider("https://provider.example/v1", token)

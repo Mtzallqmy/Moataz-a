@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from app.config import Settings, get_settings
@@ -50,6 +51,10 @@ class FFmpegRenderer(BaseRenderer):
                 await self._video_audio(plan, output, cancel_event, progress_callback)
             elif plan.template == "logo_overlay":
                 await self._logo_overlay(plan, output, cancel_event, progress_callback)
+            elif plan.template == "timeline":
+                await self._render_timeline(
+                    plan, output, workspace, cancel_event, progress_callback
+                )
             else:
                 raise ValueError(f"Unsupported FFmpeg renderer template: {plan.template}")
 
@@ -78,6 +83,272 @@ class FFmpegRenderer(BaseRenderer):
             raise
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
+
+    @staticmethod
+    def _timeline_tracks(plan: RenderPlan, kind: str) -> list[dict]:
+        timeline = plan.timeline or {}
+        return [
+            track
+            for track in timeline.get("tracks") or []
+            if isinstance(track, dict) and track.get("kind") == kind
+        ]
+
+    @staticmethod
+    def _transition_name(name: str) -> str:
+        return {
+            "fade": "fade",
+            "dissolve": "dissolve",
+            "slide": "slideleft",
+            "wipe": "wipeleft",
+            "zoom": "zoomin",
+            "blur": "hblur",
+            "push": "smoothleft",
+            "dip-to-black": "fadeblack",
+        }.get(name, "fade")
+
+    async def _render_timeline(
+        self,
+        plan: RenderPlan,
+        output: Path,
+        workspace: Path,
+        cancel_event: threading.Event | None,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        """Compile Timeline JSON to one deterministic FFmpeg filter graph."""
+        assets = {item.asset_id: item for item in plan.assets}
+        visual_clips = sorted(
+            [
+                clip
+                for track in self._timeline_tracks(plan, "visual")
+                for clip in track.get("clips") or []
+                if isinstance(clip, dict)
+            ],
+            key=lambda clip: (float(clip.get("start") or 0), int(clip.get("position") or 0)),
+        )
+        if not visual_clips:
+            raise ValueError("Timeline requires at least one visual clip")
+        media_clips = [
+            clip
+            for kind in ("visual", "audio", "overlay")
+            for track in self._timeline_tracks(plan, kind)
+            for clip in track.get("clips") or []
+            if isinstance(clip, dict) and isinstance(clip.get("asset_id"), int)
+        ]
+        args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        input_indexes: dict[str, int] = {}
+        probes = {}
+        for input_index, clip in enumerate(media_clips):
+            asset = assets.get(int(clip["asset_id"]))
+            if asset is None:
+                raise ValueError(f"Timeline references missing asset #{clip['asset_id']}")
+            duration = min(float(clip.get("duration") or 0), plan.expected_duration)
+            source_start = float(clip.get("source_start") or 0)
+            speed = float(clip.get("speed") or 1)
+            if asset.asset_type in {"image", "logo"}:
+                args += ["-loop", "1", "-framerate", str(plan.fps), "-t", f"{duration:.6f}"]
+            elif source_start > 0:
+                args += ["-ss", f"{source_start:.6f}"]
+            args += ["-i", str(asset.path)]
+            input_indexes[str(clip["id"])] = input_index
+            if asset.asset_type == "video":
+                probes[asset.asset_id] = await probe_media_file(asset.path)
+            clip["_render_duration"] = duration
+            clip["_render_speed"] = speed
+
+        filters: list[str] = []
+        visual_labels: list[str] = []
+        for index, clip in enumerate(visual_clips):
+            input_index = input_indexes[str(clip["id"])]
+            speed = float(clip.get("_render_speed") or 1)
+            duration = float(clip.get("_render_duration") or clip.get("duration") or 0)
+            raw = f"tvraw{index}"
+            target = f"tv{index}"
+            filters.append(
+                f"[{input_index}:v]trim=duration={duration * speed:.6f},"
+                f"setpts=(PTS-STARTPTS)/{speed:.6f}[{raw}]"
+            )
+            filters.extend(
+                self._timeline_visual_filter(
+                    raw, target, plan, clip, prefix=f"tl{index}"
+                )
+            )
+            faded = target
+            fade_in = min(float(clip.get("fade_in") or 0), duration / 2)
+            fade_out = min(float(clip.get("fade_out") or 0), duration / 2)
+            if fade_in or fade_out:
+                next_label = f"tvf{index}"
+                chain = []
+                if fade_in:
+                    chain.append(f"fade=t=in:st=0:d={fade_in:.6f}")
+                if fade_out:
+                    chain.append(
+                        f"fade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}"
+                    )
+                filters.append(f"[{target}]{','.join(chain)}[{next_label}]")
+                faded = next_label
+            visual_labels.append(faded)
+
+        current = visual_labels[0]
+        composed_duration = float(visual_clips[0].get("_render_duration") or 0)
+        for index in range(1, len(visual_clips)):
+            transition = visual_clips[index - 1].get("transition_out") or {}
+            kind = str(transition.get("type") or "none")
+            requested = float(transition.get("duration") or 0)
+            duration = min(
+                requested if kind != "none" else 0.0,
+                composed_duration / 2,
+                float(visual_clips[index].get("_render_duration") or 0) / 2,
+            )
+            target = f"tvc{index}"
+            if duration > 0:
+                offset = max(0.0, composed_duration - duration)
+                filters.append(
+                    f"[{current}][{visual_labels[index]}]xfade="
+                    f"transition={self._transition_name(kind)}:duration={duration:.6f}:"
+                    f"offset={offset:.6f}[{target}]"
+                )
+                composed_duration += float(visual_clips[index]["_render_duration"]) - duration
+            else:
+                filters.append(f"[{current}][{visual_labels[index]}]concat=n=2:v=1:a=0[{target}]")
+                composed_duration += float(visual_clips[index]["_render_duration"])
+            current = target
+
+        overlay_number = 0
+        for track in self._timeline_tracks(plan, "overlay"):
+            for clip in track.get("clips") or []:
+                if not isinstance(clip, dict) or str(clip.get("id")) not in input_indexes:
+                    continue
+                input_index = input_indexes[str(clip["id"])]
+                scale = min(1.0, max(0.02, float(clip.get("scale") or 0.2)))
+                overlay_label = f"tlo{overlay_number}"
+                target = f"tlov{overlay_number}"
+                position = str(clip.get("position_name") or "top-right")
+                x, y = self._overlay_expression(position)
+                start = float(clip.get("start") or 0)
+                end = min(plan.expected_duration, start + float(clip.get("duration") or 0))
+                filters.append(
+                    f"[{input_index}:v]scale="
+                    f"'min(iw,{max(2, int(plan.width * scale))})':"
+                    f"'min(ih,{max(2, int(plan.height * scale))})':"
+                    f"force_original_aspect_ratio=decrease,format=rgba[{overlay_label}]"
+                )
+                filters.append(
+                    f"[{current}][{overlay_label}]overlay={x}:{y}:"
+                    f"enable='between(t,{start:.6f},{end:.6f})'[{target}]"
+                )
+                current = target
+                overlay_number += 1
+
+        text_number = 0
+        text_clips = [
+            clip
+            for kind in ("text", "subtitle")
+            for track in self._timeline_tracks(plan, kind)
+            for clip in track.get("clips") or []
+            if isinstance(clip, dict)
+        ]
+        for clip in text_clips:
+            text_path = workspace / f"text-{text_number:03d}.txt"
+            text_path.write_text(str(clip.get("text") or ""), encoding="utf-8")
+            target = f"tlt{text_number}"
+            start = float(clip.get("start") or 0)
+            end = min(plan.expected_duration, start + float(clip.get("duration") or 0))
+            position = str(clip.get("position_name") or "center")
+            x = "(w-text_w)/2"
+            y = "h-text_h-80" if position in {"bottom", "bottom-center"} else "(h-text_h)/2"
+            color = str(clip.get("color") or "white").replace("'", "")[:32]
+            size = max(12, min(int(clip.get("font_size") or 48), 240))
+            filters.append(
+                f"[{current}]drawtext=textfile='{text_path}':fontcolor={color}:"
+                f"fontsize={size}:x={x}:y={y}:box=1:boxcolor=black@0.45:boxborderw=12:"
+                f"enable='between(t,{start:.6f},{end:.6f})'[{target}]"
+            )
+            current = target
+            text_number += 1
+        filters.append(f"[{current}]trim=duration={plan.expected_duration:.6f},setpts=PTS-STARTPTS[v]")
+
+        audio_labels: list[str] = []
+        explicit_audio = [
+            clip
+            for track in self._timeline_tracks(plan, "audio")
+            for clip in track.get("clips") or []
+            if isinstance(clip, dict) and str(clip.get("id")) in input_indexes
+        ]
+        replace_original = plan.audio_mode == "replace_audio" and explicit_audio
+        audio_sources = list(explicit_audio)
+        if not replace_original:
+            audio_sources.extend(
+                clip
+                for clip in visual_clips
+                if (
+                    (asset := assets.get(int(clip.get("asset_id") or 0))) is not None
+                    and asset.asset_type == "video"
+                    and probes.get(asset.asset_id) is not None
+                    and probes[asset.asset_id].has_audio
+                )
+            )
+        for index, clip in enumerate(audio_sources):
+            input_index = input_indexes[str(clip["id"])]
+            speed = float(clip.get("_render_speed") or clip.get("speed") or 1)
+            duration = min(float(clip.get("duration") or 0), plan.expected_duration)
+            volume = min(2.0, max(0.0, float(clip.get("volume") or 0)))
+            delay = max(0, int(float(clip.get("start") or 0) * 1000))
+            label = f"tla{index}"
+            chain = (
+                f"atrim=duration={duration * speed:.6f},asetpts=(PTS-STARTPTS)/{speed:.6f},"
+                f"aresample=48000,aformat=channel_layouts=stereo,volume={volume:.6f}"
+            )
+            fade_in = min(float(clip.get("fade_in") or 0), duration / 2)
+            fade_out = min(float(clip.get("fade_out") or 0), duration / 2)
+            if fade_in:
+                chain += f",afade=t=in:st=0:d={fade_in:.6f}"
+            if fade_out:
+                chain += f",afade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}"
+            if delay:
+                chain += f",adelay={delay}|{delay}"
+            filters.append(f"[{input_index}:a:0]{chain}[{label}]")
+            audio_labels.append(label)
+        if audio_labels:
+            joined = "".join(f"[{label}]" for label in audio_labels)
+            filters.append(
+                f"{joined}amix=inputs={len(audio_labels)}:duration=longest:"
+                f"dropout_transition=2,apad,atrim=duration={plan.expected_duration:.6f}[a]"
+            )
+        else:
+            filters.append(
+                f"anullsrc=r=48000:cl=stereo,atrim=duration={plan.expected_duration:.6f}[a]"
+            )
+        args += [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-t",
+            f"{plan.expected_duration:.6f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast" if plan.render_kind == "preview" else "veryfast",
+            "-crf",
+            "30" if plan.render_kind == "preview" else "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k" if plan.render_kind == "preview" else "160k",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+        await self._run_ffmpeg(
+            args,
+            expected_duration=plan.expected_duration,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
 
     @staticmethod
     def _check_cancel(cancel_event: threading.Event | None) -> None:
@@ -145,6 +416,54 @@ class FFmpegRenderer(BaseRenderer):
             f"[{source}]scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,{common}[{target}]"
         )
+
+    def _timeline_visual_filter(
+        self,
+        source: str,
+        target: str,
+        plan: RenderPlan,
+        clip: dict,
+        *,
+        prefix: str,
+    ) -> list[str]:
+        filters: list[str] = []
+        current = source
+        crop = clip.get("crop")
+        if isinstance(crop, dict) and any(float(crop.get(key) or 0) for key in crop):
+            left = float(crop.get("left") or 0)
+            top = float(crop.get("top") or 0)
+            right = float(crop.get("right") or 0)
+            bottom = float(crop.get("bottom") or 0)
+            cropped = f"{prefix}crop"
+            filters.append(
+                f"[{current}]crop=iw*{1-left-right:.8f}:ih*{1-top-bottom:.8f}:"
+                f"iw*{left:.8f}:ih*{top:.8f}[{cropped}]"
+            )
+            current = cropped
+        fitted = f"{prefix}fit"
+        clip_plan = replace(plan, fit_mode=str(clip.get("fit_mode") or plan.fit_mode))
+        filters.append(self._visual_filter(current, fitted, clip_plan, prefix=prefix))
+        scale = float(clip.get("scale") or 1)
+        if abs(scale - 1) < 0.0001 and clip.get("x") is None and clip.get("y") is None:
+            filters.append(f"[{fitted}]null[{target}]")
+            return filters
+        scale = min(4.0, max(0.02, scale))
+        x = min(2.0, max(-2.0, float(clip.get("x") or 0)))
+        y = min(2.0, max(-2.0, float(clip.get("y") or 0)))
+        scaled = f"{prefix}scaled"
+        background = f"{prefix}background"
+        filters.append(
+            f"[{fitted}]scale={max(2, int(plan.width * scale))}:"
+            f"{max(2, int(plan.height * scale))}[{scaled}]"
+        )
+        filters.append(
+            f"color=c=black:s={plan.width}x{plan.height}:r={plan.fps}[{background}]"
+        )
+        filters.append(
+            f"[{background}][{scaled}]overlay=(W-w)*{(x+1)/2:.8f}:"
+            f"(H-h)*{(y+1)/2:.8f},format=yuv420p[{target}]"
+        )
+        return filters
 
     @staticmethod
     def _video_assets(plan: RenderPlan) -> list[RenderAsset]:
@@ -228,7 +547,7 @@ class FFmpegRenderer(BaseRenderer):
         audios = self._audio_assets(plan)
         count = len(images)
         fade = min(0.35, plan.expected_duration / max(4, count * 4)) if count > 1 else 0.0
-        overlap_total = fade * (count - 1) if plan.transition == "fade" else 0.0
+        overlap_total = fade * (count - 1) if plan.transition != "none" else 0.0
         image_duration = (plan.expected_duration + overlap_total) / count if count else 4.0
         image_duration = max(0.25, image_duration)
         args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
@@ -259,13 +578,14 @@ class FFmpegRenderer(BaseRenderer):
         filters: list[str] = []
         for index in range(count):
             filters.append(self._visual_filter(f"{index}:v", f"s{index}", plan, prefix=f"s{index}"))
-        if plan.transition == "fade" and count > 1:
+        if plan.transition != "none" and count > 1:
             previous = "s0"
             for index in range(1, count):
                 target = "v" if index == count - 1 else f"xf{index}"
                 offset = image_duration * index - fade * index
                 filters.append(
-                    f"[{previous}][s{index}]xfade=transition=fade:duration={fade:.3f}:"
+                    f"[{previous}][s{index}]xfade="
+                    f"transition={self._transition_name(plan.transition)}:duration={fade:.3f}:"
                     f"offset={offset:.3f}[{target}]"
                 )
                 previous = target
@@ -615,6 +935,7 @@ class FFmpegRenderer(BaseRenderer):
             "merge_videos",
             "video_audio",
             "intro_main_outro",
+            "timeline",
         }
         if expects_audio and not probe.has_audio:
             raise FFmpegError("Rendered output is missing its expected audio stream")

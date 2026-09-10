@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any
 from app.config import Settings, get_settings
 from app.db import MediaProject
 from app.services.projects import ProjectAssetItem, ProjectService, project_service
+from app.services.timeline import TRANSITIONS
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,8 @@ class RenderPlan:
     logo_position: str
     assets: tuple[RenderAsset, ...]
     expected_duration: float
+    timeline: dict[str, Any] | None = None
+    render_kind: str = "final"
 
 
 def _metadata(raw: str) -> dict[str, Any]:
@@ -135,7 +139,15 @@ class ComposerService:
         self.settings = settings or get_settings()
         self.projects = projects or project_service
 
-    async def build(self, project_id: int, *, user_id: int | None = None) -> RenderPlan:
+    async def build(
+        self,
+        project_id: int,
+        *,
+        user_id: int | None = None,
+        render_kind: str = "final",
+        preview_duration: float | None = None,
+        preview_width: int | None = None,
+    ) -> RenderPlan:
         project = await self.projects.get_project(project_id, user_id=user_id)
         if project is None:
             raise LookupError("Project not found")
@@ -152,6 +164,48 @@ class ComposerService:
         timeline = _timeline(project)
         options = timeline.get("options") if isinstance(timeline.get("options"), dict) else {}
         template = str(timeline.get("template") or "auto")
+        visual_clips = [
+            clip
+            for track in timeline.get("tracks") or []
+            if isinstance(track, dict) and track.get("kind") == "visual"
+            for clip in track.get("clips") or []
+            if isinstance(clip, dict)
+        ]
+        use_timeline = timeline.get("version") == 2 and (
+            template == "timeline" or (len(visual_clips) > 1 and str(options.get("transition") or "none") != "none")
+        )
+        if use_timeline:
+            timeline = self._prepare_timeline(timeline, template=template)
+            duration = self._timeline_duration(timeline)
+            if preview_duration is not None:
+                duration = min(duration, max(1.0, float(preview_duration)))
+            width, height = project.width, project.height
+            if render_kind == "preview":
+                maximum = max(160, min(int(preview_width or 480), 720))
+                ratio = min(1.0, maximum / max(width, height))
+                width = max(2, int(width * ratio) // 2 * 2)
+                height = max(2, int(height * ratio) // 2 * 2)
+            if duration <= 0:
+                raise ValueError("Timeline has no renderable visual duration")
+            if duration > self.settings.max_render_duration_seconds:
+                raise ValueError("Render duration exceeds configured limit")
+            return RenderPlan(
+                project_id=project.id,
+                user_id=project.user_id,
+                template="timeline",
+                width=width,
+                height=height,
+                fps=project.fps,
+                aspect_ratio=project.aspect_ratio,
+                fit_mode=str(options.get("fit_mode") or "fit"),
+                transition=str(options.get("transition") or "none"),
+                audio_mode=str(options.get("audio_mode") or "mix_audio"),
+                logo_position=str(options.get("logo_position") or "top-right"),
+                assets=tuple(items),
+                expected_duration=duration,
+                timeline=timeline,
+                render_kind=render_kind,
+            )
         if template == "auto":
             template = _auto_template(items)
         fit_mode = str(options.get("fit_mode") or "fit")
@@ -160,7 +214,7 @@ class ComposerService:
         logo_position = str(options.get("logo_position") or "top-right")
         if fit_mode not in {"fit", "fill", "blur-background"}:
             raise ValueError("Unsupported fit mode")
-        if transition not in {"none", "fade"}:
+        if transition not in TRANSITIONS:
             raise ValueError("Unsupported transition")
         if audio_mode not in {"replace_audio", "mix_audio", "background_music"}:
             raise ValueError("Unsupported audio mode")
@@ -187,7 +241,52 @@ class ComposerService:
             logo_position=logo_position,
             assets=tuple(items),
             expected_duration=duration,
+            render_kind=render_kind,
         )
+
+    @staticmethod
+    def _timeline_duration(timeline: dict[str, Any]) -> float:
+        visual_ends: list[float] = []
+        fallback_ends: list[float] = []
+        for track in timeline.get("tracks") or []:
+            if not isinstance(track, dict):
+                continue
+            for clip in track.get("clips") or []:
+                if not isinstance(clip, dict):
+                    continue
+                end = float(clip.get("start") or 0) + float(clip.get("duration") or 0)
+                fallback_ends.append(end)
+                if track.get("kind") == "visual":
+                    visual_ends.append(end)
+        return max(visual_ends or fallback_ends or [0.0])
+
+    @staticmethod
+    def _prepare_timeline(timeline: dict[str, Any], *, template: str) -> dict[str, Any]:
+        prepared = copy.deepcopy(timeline)
+        transition = str((prepared.get("options") or {}).get("transition") or "none")
+        for track in prepared.get("tracks") or []:
+            if not isinstance(track, dict) or track.get("kind") != "visual":
+                continue
+            clips = [clip for clip in track.get("clips") or [] if isinstance(clip, dict)]
+            if template == "intro_main_outro":
+                order = {"intro": 0, "main": 1, "outro": 2}
+                clips.sort(key=lambda clip: (order.get(str(clip.get("role")), 1), int(clip.get("position") or 0)))
+                track["clips"] = clips
+            cursor = 0.0
+            for index, clip in enumerate(clips):
+                clip["start"] = cursor
+                if index < len(clips) - 1 and transition != "none":
+                    overlap = min(
+                        0.35,
+                        float(clip.get("duration") or 0) / 2,
+                        float(clips[index + 1].get("duration") or 0) / 2,
+                    )
+                    clip["transition_out"] = {"type": transition, "duration": overlap}
+                else:
+                    overlap = 0.0
+                cursor += float(clip.get("duration") or 0) - overlap
+        prepared["template"] = "timeline"
+        return prepared
 
     @staticmethod
     def _render_asset(item: ProjectAssetItem) -> RenderAsset:

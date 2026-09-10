@@ -1,1 +1,1 @@
-RELEASE = "0.5.0-cut-presets-live-flows"
+RELEASE = "0.6.0-studio-agent-timeline"

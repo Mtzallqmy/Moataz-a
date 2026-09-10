@@ -7,14 +7,22 @@ from typing import Any
 from sqlalchemy import func, select
 
 from app.config import Settings, get_settings
-from app.db import MediaAsset, MediaProject, ProjectAsset, ProjectStatus, SessionLocal
+from app.db import (
+    MediaAsset,
+    MediaProject,
+    ProjectAsset,
+    ProjectStatus,
+    SessionLocal,
+    TimelineRevision,
+)
+from app.services.timeline import TRANSITIONS, new_timeline, parse_timeline, sync_assets
 
 PRESETS: dict[str, tuple[str, int, int]] = {
     "vertical": ("9:16", 1080, 1920),
     "horizontal": ("16:9", 1920, 1080),
     "square": ("1:1", 1080, 1080),
 }
-TEMPLATES = {"auto", "audio_image", "slideshow", "merge_videos", "video_audio", "intro_main_outro", "logo_overlay"}
+TEMPLATES = {"auto", "timeline", "audio_image", "slideshow", "merge_videos", "video_audio", "intro_main_outro", "logo_overlay"}
 ROLES = {"main", "intro", "outro", "music", "voice", "logo", "background"}
 
 
@@ -45,13 +53,8 @@ class ProjectService:
         if preset not in PRESETS:
             raise ValueError("Unknown render preset")
         aspect_ratio, width, height = PRESETS[preset]
-        timeline = {
-            "version": 1,
-            "canvas": {"width": width, "height": height, "fps": self.settings.default_render_fps, "background": "black"},
-            "template": "auto",
-            "options": {"fit_mode": "fit", "transition": "none"},
-            "tracks": [],
-        }
+        timeline = new_timeline(width, height, self.settings.default_render_fps)
+        timeline["template"] = "auto"
         async with SessionLocal() as session:
             project = MediaProject(
                 user_id=user_id,
@@ -108,20 +111,64 @@ class ProjectService:
                 result.append(ProjectAssetItem(link=link, asset=asset))
             return result
 
-    async def _write_timeline(self, session, project: MediaProject) -> None:
+    async def _write_timeline(
+        self,
+        session,
+        project: MediaProject,
+        *,
+        override: dict[str, Any] | None = None,
+    ) -> None:
         rows = (await session.execute(
             select(ProjectAsset, MediaAsset)
             .join(MediaAsset, MediaAsset.id == ProjectAsset.asset_id)
             .where(ProjectAsset.project_id == project.id)
             .order_by(ProjectAsset.position, ProjectAsset.asset_id)
         )).all()
-        payload = _timeline_config(project)
-        payload["canvas"] = {"width": project.width, "height": project.height, "fps": project.fps, "background": "black"}
-        payload["tracks"] = [{"type": "ordered", "clips": [
-            {"asset_id": asset.id, "asset_type": asset.asset_type, "position": link.position, "role": link.role}
-            for link, asset in rows
-        ]}] if rows else []
+        previous = parse_timeline(
+            project.timeline_json,
+            width=project.width,
+            height=project.height,
+            fps=project.fps,
+        )
+        payload = override or previous
+        payload["canvas"].update(
+            {"width": project.width, "height": project.height, "fps": project.fps}
+        )
+        payload = sync_assets(payload, list(rows))
+        maximum = await session.scalar(
+            select(func.max(TimelineRevision.revision)).where(
+                TimelineRevision.project_id == project.id
+            )
+        )
+        if maximum is None:
+            previous["revision"] = 0
+            session.add(
+                TimelineRevision(
+                    project_id=project.id,
+                    revision=0,
+                    timeline_json=json.dumps(
+                        previous, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    operation_json='{"name":"initial"}',
+                )
+            )
+            maximum = 0
+        history = payload.setdefault("history", {"undo": [], "redo": []})
+        history["undo"] = [
+            *list(history.get("undo") or []),
+            int(previous.get("revision", maximum)),
+        ][-100:]
+        history["redo"] = []
+        payload["revision"] = int(maximum) + 1
         project.timeline_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        session.add(
+            TimelineRevision(
+                project_id=project.id,
+                revision=payload["revision"],
+                timeline_json=project.timeline_json,
+                operation_json='{"name":"project_sync"}',
+            )
+        )
         project.status = ProjectStatus.READY.value if rows else ProjectStatus.DRAFT.value
 
     async def add_asset(self, project_id: int, asset_id: int, *, user_id: int, role: str = "main") -> ProjectAsset:
@@ -261,7 +308,7 @@ class ProjectService:
             merged.update(options or {})
             if merged.get("fit_mode", "fit") not in {"fit", "fill", "blur-background"}:
                 raise ValueError("Unknown fit mode")
-            if merged.get("transition", "none") not in {"none", "fade"}:
+            if merged.get("transition", "none") not in TRANSITIONS:
                 raise ValueError("Unknown transition")
             if merged.get("audio_mode", "replace_audio") not in {
                 "replace_audio",
@@ -278,8 +325,13 @@ class ProjectService:
             }:
                 raise ValueError("Unknown logo position")
             payload["options"] = merged
-            project.timeline_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            await self._write_timeline(session, project)
+            if options and "fit_mode" in options:
+                for track in payload.get("tracks") or []:
+                    if isinstance(track, dict) and track.get("kind") in {"visual", "overlay"}:
+                        for clip in track.get("clips") or []:
+                            if isinstance(clip, dict):
+                                clip["fit_mode"] = merged["fit_mode"]
+            await self._write_timeline(session, project, override=payload)
             await session.commit()
             await session.refresh(project)
             session.expunge(project)

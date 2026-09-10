@@ -200,6 +200,12 @@ class MediaProject(Base):
     render_jobs: Mapped[list[RenderJob]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    timeline_revisions: Mapped[list[TimelineRevision]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    agent_messages: Mapped[list[StudioAgentMessage]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
 
 class ProjectAsset(Base):
@@ -241,6 +247,58 @@ class RenderJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     project: Mapped[MediaProject] = relationship(back_populates="render_jobs")
+    request: Mapped[RenderRequest | None] = relationship(
+        back_populates="render_job", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class TimelineRevision(Base):
+    __tablename__ = "timeline_revisions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "revision", name="uq_timeline_revision_project_number"),
+        Index("ix_timeline_revision_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("media_projects.id", ondelete="CASCADE"), index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer)
+    timeline_json: Mapped[str] = mapped_column(Text)
+    operation_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    project: Mapped[MediaProject] = relationship(back_populates="timeline_revisions")
+
+
+class StudioAgentMessage(Base):
+    __tablename__ = "studio_agent_messages"
+    __table_args__ = (Index("ix_studio_agent_project_created", "project_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("media_projects.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text)
+    provider_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    project: Mapped[MediaProject] = relationship(back_populates="agent_messages")
+
+
+class RenderRequest(Base):
+    __tablename__ = "render_requests"
+
+    render_job_id: Mapped[int] = mapped_column(
+        ForeignKey("render_jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), default="final")
+    max_duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    render_job: Mapped[RenderJob] = relationship(back_populates="request")
 
 
 async def init_db() -> None:

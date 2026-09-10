@@ -26,7 +26,10 @@ def test_load_provider_specs_supports_multiple_keys_for_same_vendor():
 def test_named_presets_use_official_openai_compatible_roots():
     specs = load_provider_specs(
         {
+            "OPENAI_API_KEY": "placeholder-openai",
             "OPENROUTER_API_TOKEN": "placeholder-openrouter",
+            "DEEPSEEK_API_TOKEN": "placeholder-deepseek",
+            "GEMINI_API_TOKEN": "placeholder-gemini",
             "RUNWARE_API_TOKEN": "placeholder-runware",
             "NVIDIA_API_TOKEN": "placeholder-nvidia",
             "AGENTROUTER_API_TOKEN": "placeholder-agentrouter",
@@ -36,7 +39,10 @@ def test_named_presets_use_official_openai_compatible_roots():
     )
     by_id = {spec.provider_id: spec for spec in specs}
 
+    assert by_id["openai"].base_url == "https://api.openai.com/v1"
     assert by_id["openrouter"].base_url == "https://openrouter.ai/api/v1"
+    assert by_id["deepseek"].base_url == "https://api.deepseek.com/v1"
+    assert by_id["gemini"].base_url == "https://generativelanguage.googleapis.com/v1beta/openai"
     assert by_id["runware"].base_url == "https://api.runware.ai/v1"
     assert by_id["nvidia"].base_url == "https://integrate.api.nvidia.com/v1"
     assert by_id["agentrouter"].base_url == "https://co.agentrouter.org/v1"
