@@ -325,6 +325,12 @@ class ProjectService:
             }:
                 raise ValueError("Unknown logo position")
             payload["options"] = merged
+            if options and "fit_mode" in options:
+                for track in payload.get("tracks") or []:
+                    if isinstance(track, dict) and track.get("kind") in {"visual", "overlay"}:
+                        for clip in track.get("clips") or []:
+                            if isinstance(clip, dict):
+                                clip["fit_mode"] = merged["fit_mode"]
             await self._write_timeline(session, project, override=payload)
             await session.commit()
             await session.refresh(project)
