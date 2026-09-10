@@ -12,9 +12,8 @@ class Settings(BaseSettings):
     """Runtime settings.
 
     BOT_TOKEN and DATABASE_URL are the only variables needed for the media bot.
-    OPENAI_BASE_URL and OPENAI_API_TOKEN are optional and enable AI chat when both
-    are configured. DASHBOARD_PASSWORD is optional and disables the dashboard
-    when empty.
+    AI provider variables remain optional. Media Studio limits also have safe
+    defaults, so enabling the Studio does not introduce a new required secret.
     """
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -28,6 +27,8 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = Field(default=8000, validation_alias=AliasChoices("PORT", "APP_PORT"))
     download_dir: Path = Path("/data/downloads")
+    project_dir: Path = Path("/data/projects")
+    render_temp_dir: Path = Path("/data/tmp")
     default_language: str = "ar"
 
     max_concurrent_jobs: int = 2
@@ -39,6 +40,14 @@ class Settings(BaseSettings):
     telegram_upload_limit_mb: int = 49
     progress_update_seconds: float = 2.5
     temp_retention_seconds: int = 21_600
+
+    max_project_assets: int = 20
+    max_project_duration_seconds: int = 1_800
+    max_render_duration_seconds: int = 1_800
+    max_concurrent_renders: int = 1
+    max_renders_per_user: int = 1
+    render_timeout_seconds: int = 1_800
+    default_render_fps: int = 30
 
     ytdlp_socket_timeout_seconds: int = 30
     ytdlp_retries: int = 2
@@ -126,6 +135,31 @@ class Settings(BaseSettings):
     @classmethod
     def validate_telegram_limit(cls, value: int) -> int:
         return max(1, min(int(value), 2048))
+
+    @field_validator("max_project_assets")
+    @classmethod
+    def validate_project_assets(cls, value: int) -> int:
+        return max(2, min(int(value), 100))
+
+    @field_validator("max_project_duration_seconds", "max_render_duration_seconds", "render_timeout_seconds")
+    @classmethod
+    def validate_studio_duration(cls, value: int) -> int:
+        return max(30, min(int(value), 21_600))
+
+    @field_validator("max_concurrent_renders")
+    @classmethod
+    def validate_render_concurrency(cls, value: int) -> int:
+        return max(1, min(int(value), 4))
+
+    @field_validator("max_renders_per_user")
+    @classmethod
+    def validate_render_user_concurrency(cls, value: int) -> int:
+        return max(1, min(int(value), 2))
+
+    @field_validator("default_render_fps")
+    @classmethod
+    def validate_render_fps(cls, value: int) -> int:
+        return max(15, min(int(value), 60))
 
     @field_validator("ytdlp_retries", "ytdlp_fragment_retries", "job_max_retries")
     @classmethod

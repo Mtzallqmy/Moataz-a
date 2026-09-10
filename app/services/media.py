@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +19,12 @@ class MediaProbe:
     has_video: bool
     has_audio: bool
     size_bytes: int
+    width: int | None = None
+    height: int | None = None
+    format_name: str | None = None
+
+
+LineCallback = Callable[[str], Awaitable[None] | None]
 
 
 def target_total_bitrate(limit_bytes: int, duration_seconds: float, margin: float = 0.90) -> int:
@@ -51,6 +58,24 @@ async def _drain(stream: asyncio.StreamReader | None, limit: int) -> bytes:
     return bytes(retained)
 
 
+async def _drain_lines(
+    stream: asyncio.StreamReader | None,
+    limit: int,
+    callback: LineCallback,
+) -> bytes:
+    if stream is None:
+        return b""
+    retained = bytearray()
+    while line := await stream.readline():
+        retained.extend(line)
+        if len(retained) > limit:
+            del retained[: len(retained) - limit]
+        result = callback(line.decode("utf-8", errors="replace").rstrip("\r\n"))
+        if asyncio.iscoroutine(result):
+            await result
+    return bytes(retained)
+
+
 async def _watch_cancel(event: threading.Event | None) -> None:
     if event is None:
         await asyncio.Future()
@@ -75,13 +100,18 @@ async def _run_process(
     cancel_event: threading.Event | None = None,
     stdout_limit: int = 1_048_576,
     stderr_limit: int | None = None,
+    stdout_line_callback: LineCallback | None = None,
 ) -> tuple[bytes, bytes]:
     process = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out_task = asyncio.create_task(_drain(process.stdout, stdout_limit))
+    out_task = asyncio.create_task(
+        _drain_lines(process.stdout, stdout_limit, stdout_line_callback)
+        if stdout_line_callback is not None
+        else _drain(process.stdout, stdout_limit)
+    )
     err_task = asyncio.create_task(_drain(process.stderr, stderr_limit or settings.stderr_limit_bytes))
     wait_task = asyncio.create_task(process.wait())
     cancel_task = asyncio.create_task(_watch_cancel(cancel_event)) if cancel_event is not None else None
@@ -120,7 +150,7 @@ async def probe_media_file(source: Path) -> MediaProbe:
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type",
+        "format=duration,format_name:stream=codec_type,width,height",
         "-of",
         "json",
         str(source),
@@ -129,12 +159,25 @@ async def probe_media_file(source: Path) -> MediaProbe:
     try:
         payload = json.loads(stdout.decode("utf-8"))
         duration = float(payload.get("format", {}).get("duration") or 0)
-        stream_types = {stream.get("codec_type") for stream in payload.get("streams") or []}
+        streams = payload.get("streams") or []
+        stream_types = {stream.get("codec_type") for stream in streams}
+        video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+        width = int(video_stream["width"]) if video_stream.get("width") else None
+        height = int(video_stream["height"]) if video_stream.get("height") else None
+        format_name = str(payload.get("format", {}).get("format_name") or "") or None
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise FFmpegError("FFprobe returned invalid media metadata") from exc
     if duration <= 0:
         raise FFmpegError("FFprobe could not determine media duration")
-    return MediaProbe(duration, "video" in stream_types, "audio" in stream_types, source.stat().st_size)
+    return MediaProbe(
+        duration,
+        "video" in stream_types,
+        "audio" in stream_types,
+        source.stat().st_size,
+        width,
+        height,
+        format_name,
+    )
 
 
 def _fast_cut_output(source: Path, probe: MediaProbe) -> Path:

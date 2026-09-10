@@ -44,6 +44,38 @@ Railway يمرر `PORT` تلقائيًا، والتطبيق يستخدمه مب�
 - Dashboard: Overview / Downloads / Jobs / Users / Workers / Errors / System، مع Analyze وDownload وDownload All وCancel، إضافة إلى قص حر/30ث/60ث مع FAST/PRECISE.
 - تبويب System يعرض `RAILWAY_GIT_COMMIT_SHA` وbranch وdeployment ID عندما يكون التشغيل من Railway، لتعرف أي Commit يعمل فعليًا.
 
+## Media Studio MVP
+
+زر **🎞 مشروع مونتاج** في Telegram يفتح workflow مستقلًا عن Download Jobs:
+
+1. أنشئ مشروعًا جديدًا.
+2. أرسل فيديوهات أو صورًا أو ملفات صوت/voice أو documents وسائط، وأضف روابط URL مفردة أو متعددة ضمن حدود المشروع.
+3. راجع **📦 المواد**، غيّر الترتيب، احذف الرابط من المشروع، أو عيّن أدوار `main / intro / outro / music / voice / logo / background` المتوافقة مع نوع الملف.
+4. اختر Canvas: `9:16` أو `16:9` أو `1:1`، وFit: `fit / fill / blur-background`، وانتقال `none / fade`، ووضع الصوت `replace / mix / background music`، ومكان الشعار.
+5. اختر القالب المقترح، تابع تقدم FFmpeg الحقيقي، ألغِ عند الحاجة، ثم استلم MP4 صالحًا. إذا تجاوز الناتج ميزانية Telegram يُضغط تكيفيًا قبل الإرسال.
+
+القوالب المنفذة فعليًا: **Audio + Image، Slideshow بصوت اختياري، Merge Videos، Video + Audio، Intro/Main/Outro، Logo Overlay**. يتم توحيد المقاس وFPS وSAR وpixel format والصوت قبل الدمج، وتضاف silent audio للفيديو الصامت. الملفات الأصلية للأصول لا تُعدّل أثناء الرندر.
+
+الرابط داخل المشروع يستخدم `DownloaderService` والحماية نفسها ضد SSRF والـprivate networks؛ Playlists لا تُضاف ككيان واحد في MVP، ويجب إرسال روابط العناصر المفردة. الملفات المرفوعة تمر بفحص الامتداد/MIME وFFprobe ولا يُستخدم اسم Telegram كمسار تخزين.
+
+### متغيرات Media Studio
+
+جميعها اختيارية ولها defaults آمنة، وأسماؤها موثقة أيضًا في `.env.example`:
+
+```env
+PROJECT_DIR=/data/projects
+RENDER_TEMP_DIR=/data/tmp
+MAX_PROJECT_ASSETS=20
+MAX_PROJECT_DURATION_SECONDS=1800
+MAX_RENDER_DURATION_SECONDS=1800
+MAX_CONCURRENT_RENDERS=1
+MAX_RENDERS_PER_USER=1
+RENDER_TIMEOUT_SECONDS=1800
+DEFAULT_RENDER_FPS=30
+```
+
+تُطبّق كذلك الحدود العامة `MAX_FILE_SIZE_MB` و`MAX_VIDEO_DURATION_SECONDS` و`TELEGRAM_UPLOAD_LIMIT_MB` على ingestion والتسليم. تحديث رسالة Telegram مضبوط بواسطة `PROGRESS_UPDATE_SECONDS` ولا يستخدم timer وهميًا.
+
 ## OpenAI-compatible AI Chat
 
 عند ضبط `OPENAI_BASE_URL` و`OPENAI_API_TOKEN` يظهر مسار **🤖 دردشة AI** في Telegram. البوت يتصل فعليًا بـ:
@@ -103,4 +135,4 @@ python -m compileall -q app tests
 pytest -q
 ```
 
-الاختبارات تستخدم mocks للـTelegram وyt-dlp وFFmpeg والمواقع الخارجية ومزود AI، وتغطي URL/SSRF، probing/formats، generic extractors، bulk/dedup، playlists، MP3، progress، retries، cancellation، FAST/PRECISE cuts، القص الحر و30ث و60ث، OpenAI-compatible models/chat، redaction، settings/DB URL، stale recovery، transitions، وregressions الخاصة بالـRouter/import/Telegram API/Redis dependencies/background tasks.
+الاختبارات لا تعتمد على Telegram أو YouTube أو AI provider حي. وهي تغطي أيضًا fixtures مولدة بـFFmpeg لكل قوالب الاستوديو، نسب العرض وfit modes، الفيديو الصامت واختلاف FPS/المقاسات، تقدم FFmpeg، الإلغاء والتنظيف، recovery بعد restart، ownership، Telegram uploads، URL ingestion، وفشل التسليم دون تحويل render ناجح إلى FAILED.

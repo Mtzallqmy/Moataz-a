@@ -24,6 +24,16 @@ def test_env_example_documents_core_and_multi_provider_ai_variables():
 
     assert {"BOT_TOKEN", "DATABASE_URL", "OPENAI_BASE_URL", "OPENAI_API_TOKEN"} <= names
     assert {
+        "PROJECT_DIR",
+        "RENDER_TEMP_DIR",
+        "MAX_PROJECT_ASSETS",
+        "MAX_PROJECT_DURATION_SECONDS",
+        "MAX_RENDER_DURATION_SECONDS",
+        "MAX_CONCURRENT_RENDERS",
+        "MAX_RENDERS_PER_USER",
+        "RENDER_TIMEOUT_SECONDS",
+    } <= names
+    assert {
         "OPENROUTER_BASE_URL",
         "OPENROUTER_API_TOKEN",
         "RUNWARE_BASE_URL",
@@ -53,6 +63,15 @@ def test_router_can_be_requested_repeatedly_without_already_attached_error():
     first = create_dispatcher()
     second = create_dispatcher()
     assert first is second
+
+
+def test_public_menu_exposes_working_media_studio_entrypoint():
+    pytest.importorskip("aiogram")
+    from app.bot.advanced_media import public_menu_keyboard
+
+    markup = public_menu_keyboard("ar")
+    callbacks = {button.callback_data for row in markup.inline_keyboard for button in row}
+    assert "menu:studio" in callbacks
 
 
 def test_telegram_client_is_pinned_to_official_production_api():
