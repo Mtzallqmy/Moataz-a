@@ -547,7 +547,7 @@ class FFmpegRenderer(BaseRenderer):
         audios = self._audio_assets(plan)
         count = len(images)
         fade = min(0.35, plan.expected_duration / max(4, count * 4)) if count > 1 else 0.0
-        overlap_total = fade * (count - 1) if plan.transition == "fade" else 0.0
+        overlap_total = fade * (count - 1) if plan.transition != "none" else 0.0
         image_duration = (plan.expected_duration + overlap_total) / count if count else 4.0
         image_duration = max(0.25, image_duration)
         args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
@@ -578,13 +578,14 @@ class FFmpegRenderer(BaseRenderer):
         filters: list[str] = []
         for index in range(count):
             filters.append(self._visual_filter(f"{index}:v", f"s{index}", plan, prefix=f"s{index}"))
-        if plan.transition == "fade" and count > 1:
+        if plan.transition != "none" and count > 1:
             previous = "s0"
             for index in range(1, count):
                 target = "v" if index == count - 1 else f"xf{index}"
                 offset = image_duration * index - fade * index
                 filters.append(
-                    f"[{previous}][s{index}]xfade=transition=fade:duration={fade:.3f}:"
+                    f"[{previous}][s{index}]xfade="
+                    f"transition={self._transition_name(plan.transition)}:duration={fade:.3f}:"
                     f"offset={offset:.3f}[{target}]"
                 )
                 previous = target

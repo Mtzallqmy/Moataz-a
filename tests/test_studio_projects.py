@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from app import db as database
 from app.config import Settings
@@ -91,9 +92,27 @@ async def test_project_reorder_roles_and_presets_are_persistent(tmp_path: Path) 
     await projects.add_asset(project.id, audio.id, user_id=user.id)
     assert await projects.move_asset(project.id, audio.id, user_id=user.id, direction=-1)
     await projects.set_role(project.id, audio.id, user_id=user.id, role="voice")
+    await projects.set_role(project.id, image.id, user_id=user.id, role="logo")
     project = await projects.set_preset(project.id, user_id=user.id, preset="square")
     items = await projects.list_assets(project.id, user_id=user.id)
     assert [item.asset.id for item in items] == [audio.id, image.id]
     assert items[0].link.role == "voice"
     assert project.aspect_ratio == "1:1"
     assert (project.width, project.height) == (1080, 1080)
+    timeline = json.loads(project.timeline_json)
+    overlay_ids = {
+        clip["asset_id"]
+        for track in timeline["tracks"]
+        if track["kind"] == "overlay"
+        for clip in track["clips"]
+    }
+    assert image.id in overlay_ids
+    async with database.SessionLocal() as session:
+        revisions = list(
+            await session.scalars(
+                select(database.TimelineRevision).where(
+                    database.TimelineRevision.project_id == project.id
+                )
+            )
+        )
+        assert len(revisions) >= 6

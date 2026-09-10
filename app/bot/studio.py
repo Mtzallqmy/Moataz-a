@@ -216,6 +216,17 @@ async def _show_settings(message: Message, project_id: int, user_id: int) -> Non
         [
             InlineKeyboardButton(text="Transition: none", callback_data=f"studio:set:{project_id}:transition:none"),
             InlineKeyboardButton(text="fade", callback_data=f"studio:set:{project_id}:transition:fade"),
+            InlineKeyboardButton(text="dissolve", callback_data=f"studio:set:{project_id}:transition:dissolve"),
+        ],
+        [
+            InlineKeyboardButton(text="slide", callback_data=f"studio:set:{project_id}:transition:slide"),
+            InlineKeyboardButton(text="wipe", callback_data=f"studio:set:{project_id}:transition:wipe"),
+            InlineKeyboardButton(text="zoom", callback_data=f"studio:set:{project_id}:transition:zoom"),
+        ],
+        [
+            InlineKeyboardButton(text="blur", callback_data=f"studio:set:{project_id}:transition:blur"),
+            InlineKeyboardButton(text="push", callback_data=f"studio:set:{project_id}:transition:push"),
+            InlineKeyboardButton(text="dip black", callback_data=f"studio:set:{project_id}:transition:dip-to-black"),
         ],
         [
             InlineKeyboardButton(text="🔇 replace", callback_data=f"studio:set:{project_id}:audio_mode:replace_audio"),

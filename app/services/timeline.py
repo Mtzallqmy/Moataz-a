@@ -245,7 +245,7 @@ def sync_assets(
         kind, clip = _asset_clip(asset, role=link.role, position=link.position)
         _track(result, kind)["clips"].append(clip)
     _reflow_visuals(result)
-    validate_timeline(result)
+    validate_timeline(result, max_clips=1000)
     return result
 
 
