@@ -4,7 +4,7 @@ import asyncio
 import logging
 import shutil
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import select
@@ -56,8 +56,6 @@ class RenderService:
         return not already
 
     async def create_render(self, project_id: int, *, user_id: int) -> RenderJob:
-        # Composer validation happens before any render row is queued. A bad project
-        # therefore cannot consume queue capacity or become stuck in QUEUED.
         await self.composer.build(project_id, user_id=user_id)
         async with SessionLocal() as session:
             project = await session.scalar(
@@ -140,7 +138,7 @@ class RenderService:
                 if project is None:
                     raise LookupError("Project not found")
                 job.status = RenderStatus.PREPARING.value
-                job.started_at = datetime.now(timezone.utc)
+                job.started_at = datetime.now(UTC)
                 job.error = None
                 project.status = ProjectStatus.RENDERING.value
                 project_id = project.id
@@ -180,7 +178,7 @@ class RenderService:
                 job.output_path = str(result.output_path)
                 job.file_size = int(result.file_size)
                 job.error = None
-                job.completed_at = datetime.now(timezone.utc)
+                job.completed_at = datetime.now(UTC)
                 project.status = ProjectStatus.COMPLETED.value
                 await session.commit()
             logger.info(
@@ -189,12 +187,15 @@ class RenderService:
                 render_job_id,
                 result.duration,
             )
-        except (CancelledError, asyncio.CancelledError):
+        except asyncio.CancelledError:
             if output_path is not None:
                 output_path.unlink(missing_ok=True)
             await self._finish_failed(render_job_id, cancelled=True, message="Render cancelled")
-            if isinstance(asyncio.current_task(), asyncio.Task) and asyncio.current_task().cancelled():
-                raise
+            raise
+        except CancelledError:
+            if output_path is not None:
+                output_path.unlink(missing_ok=True)
+            await self._finish_failed(render_job_id, cancelled=True, message="Render cancelled")
         except TimeoutError:
             if output_path is not None:
                 output_path.unlink(missing_ok=True)
@@ -225,9 +226,8 @@ class RenderService:
             project = await session.get(MediaProject, job.project_id)
             job.status = RenderStatus.CANCELLED.value if cancelled else RenderStatus.FAILED.value
             job.error = None if cancelled else message[:1000]
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             if project is not None and project.status != ProjectStatus.CANCELLED.value:
-                # Source assets remain immutable and the project stays retryable.
                 project.status = ProjectStatus.READY.value
             await session.commit()
 
@@ -248,7 +248,7 @@ class RenderService:
             self.request_cancel(render_job_id)
             if job.status == RenderStatus.QUEUED.value:
                 job.status = RenderStatus.CANCELLED.value
-                job.completed_at = datetime.now(timezone.utc)
+                job.completed_at = datetime.now(UTC)
                 project = await session.get(MediaProject, job.project_id)
                 if project is not None and project.status != ProjectStatus.CANCELLED.value:
                     project.status = ProjectStatus.READY.value
@@ -267,7 +267,6 @@ class RenderService:
             job = await session.get(RenderJob, render_job_id)
             if job is None:
                 return
-            # A Telegram delivery failure does not invalidate a successful render.
             if job.output_path and Path(job.output_path).exists():
                 job.status = RenderStatus.COMPLETED.value
                 if error:
@@ -277,13 +276,17 @@ class RenderService:
     async def reconcile_after_restart(self) -> list[int]:
         requeue: list[int] = []
         async with SessionLocal() as session:
-            queued = list(await session.scalars(select(RenderJob).where(RenderJob.status == RenderStatus.QUEUED.value)))
+            queued = list(
+                await session.scalars(select(RenderJob).where(RenderJob.status == RenderStatus.QUEUED.value))
+            )
             requeue.extend(job.id for job in queued)
-            interrupted = list(await session.scalars(select(RenderJob).where(RenderJob.status.in_(_ACTIVE_STATES))))
+            interrupted = list(
+                await session.scalars(select(RenderJob).where(RenderJob.status.in_(_ACTIVE_STATES)))
+            )
             for job in interrupted:
                 job.status = RenderStatus.FAILED.value
                 job.error = "RESTART_INTERRUPTED: render can be retried safely"
-                job.completed_at = datetime.now(timezone.utc)
+                job.completed_at = datetime.now(UTC)
                 project = await session.get(MediaProject, job.project_id)
                 if project is not None and project.status != ProjectStatus.CANCELLED.value:
                     project.status = ProjectStatus.READY.value
