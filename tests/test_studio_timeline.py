@@ -13,6 +13,7 @@ from app.db import MediaAsset, MediaProject, ProjectAsset, SessionLocal, Timelin
 from app.services.composer import ComposerService, RenderAsset, RenderPlan
 from app.services.media import probe_media_file
 from app.services.projects import ProjectService
+from app.services.render_service import RenderService
 from app.services.renderers.ffmpeg_renderer import FFmpegRenderer
 from app.services.timeline import TimelineService, new_timeline
 
@@ -283,6 +284,21 @@ async def _database_project(tmp_path: Path) -> tuple[int, int, ProjectService, T
         session.add(asset)
         await session.flush()
         session.add(ProjectAsset(project_id=project.id, asset_id=asset.id, position=0, role="main"))
+        audio_path = settings.project_dir / str(project.id) / "assets" / "2" / "source.mp3"
+        audio_path.parent.mkdir(parents=True)
+        _audio(audio_path, duration=4)
+        audio = MediaAsset(
+            user_id=user.id,
+            asset_type="audio",
+            source_type="local",
+            local_path=str(audio_path),
+            mime_type="audio/mpeg",
+            duration=10,
+            file_size=audio_path.stat().st_size,
+        )
+        session.add(audio)
+        await session.flush()
+        session.add(ProjectAsset(project_id=project.id, asset_id=audio.id, position=1, role="music"))
         await session.commit()
         return user.id, project.id, projects, timelines
 
@@ -332,6 +348,50 @@ async def test_timeline_rejects_invalid_calls_and_cross_user_access(tmp_path: Pa
             user_id=user_id,
             calls=[{"name": "run_shell", "arguments": {"command": "rm -rf /"}}],
         )
+
+
+@pytest.mark.asyncio
+async def test_timeline_tool_catalog_handles_multitrack_edits(tmp_path: Path) -> None:
+    user_id, project_id, _, service = await _database_project(tmp_path)
+    timeline = await service.get(project_id, user_id=user_id)
+    visual = timeline["tracks"][0]["clips"][0]
+    audio = timeline["tracks"][1]["clips"][0]
+    split = await service.apply(
+        project_id,
+        user_id=user_id,
+        calls=[
+            {"name": "split_clip", "arguments": {"clip_id": visual["id"], "at": 1}},
+            {"name": "set_volume", "arguments": {"clip_id": audio["id"], "volume": 0.15}},
+            {"name": "set_fades", "arguments": {"clip_id": audio["id"], "fade_in": 0.2, "fade_out": 0.3}},
+            {"name": "set_transform", "arguments": {"clip_id": visual["id"], "scale": 0.8, "x": 0.2, "crop": {"left": 0.1}}},
+            {"name": "set_keyframes", "arguments": {"clip_id": visual["id"], "keyframes": [{"time": 0.5, "property": "scale", "value": 1.1}]}},
+            {"name": "add_subtitles", "arguments": {"cues": [{"start": 0, "end": 1, "text": "مرحباً"}]}},
+            {"name": "add_overlay", "arguments": {"asset_id": visual["asset_id"], "start": 0, "duration": 1, "position": "top-left"}},
+            {"name": "add_background_music", "arguments": {"asset_id": audio["asset_id"], "duration": 3, "volume": 0.1}},
+            {"name": "set_fit_mode", "arguments": {"mode": "blur-background", "apply_to_all": True}},
+            {"name": "set_audio_mode", "arguments": {"mode": "background_music"}},
+        ],
+    )
+    visuals = split.timeline["tracks"][0]["clips"]
+    assert len(visuals) == 2
+    assert visuals[0]["scale"] == 0.8
+    assert visuals[0]["keyframes"][0]["property"] == "scale"
+    assert split.timeline["tracks"][1]["clips"][0]["volume"] == 0.15
+    assert split.timeline["tracks"][4]["clips"][0]["text"] == "مرحباً"
+    assert len(split.timeline["tracks"][2]["clips"]) == 1
+    assert len(split.timeline["tracks"][1]["clips"]) == 2
+    assert split.timeline["options"]["audio_mode"] == "background_music"
+
+    order = [visuals[1]["id"], visuals[0]["id"]]
+    reordered = await service.apply(
+        project_id,
+        user_id=user_id,
+        calls=[
+            {"name": "reorder_clips", "arguments": {"clip_id": visuals[0]["id"], "order": order}},
+            {"name": "move_clip", "arguments": {"clip_id": visuals[0]["id"], "start": 9}},
+        ],
+    )
+    assert [clip["id"] for clip in reordered.timeline["tracks"][0]["clips"]] == order
     with pytest.raises(ValueError, match="not attached"):
         await service.apply(
             project_id,
@@ -361,3 +421,45 @@ async def test_composer_builds_low_resolution_bounded_preview(tmp_path: Path) ->
     assert plan.render_kind == "preview"
     assert max(plan.width, plan.height) <= 320
     assert plan.expected_duration == 2
+
+
+@pytest.mark.asyncio
+async def test_timeline_preview_renders_end_to_end_and_keeps_project_editable(
+    tmp_path: Path,
+) -> None:
+    user_id, project_id, projects, timelines = await _database_project(tmp_path)
+    timeline = await timelines.get(project_id, user_id=user_id)
+    clip_id = timeline["tracks"][0]["clips"][0]["id"]
+    edit = await timelines.apply(
+        project_id,
+        user_id=user_id,
+        calls=[
+            {"name": "set_duration", "arguments": {"clip_id": clip_id, "duration": 3}},
+            {"name": "add_text", "arguments": {"text": "Preview", "start": 0, "duration": 1}},
+            {"name": "render_preview", "arguments": {}},
+        ],
+    )
+    assert edit.render_action == "preview"
+    settings = projects.settings
+    service = RenderService(
+        settings,
+        composer=ComposerService(settings=settings, projects=projects),
+        renderer=FFmpegRenderer(settings),
+    )
+    job = await service.create_render(
+        project_id,
+        user_id=user_id,
+        kind="preview",
+        preview_duration=2,
+        preview_width=320,
+    )
+    await service.process_render(job.id)
+    stored = await service.get_render(job.id, user_id=user_id)
+    assert stored is not None and stored.status == "COMPLETED"
+    assert stored.output_path
+    probe = await probe_media_file(Path(stored.output_path))
+    assert probe.has_video and probe.has_audio
+    assert max(probe.width or 0, probe.height or 0) <= 320
+    async with SessionLocal() as session:
+        project = await session.get(MediaProject, project_id)
+        assert project is not None and project.status == "READY"
