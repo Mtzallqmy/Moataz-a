@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,13 @@ class AIProviderError(RuntimeError):
 class ChatReply:
     text: str
     model: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolChatReply:
+    text: str
+    model: str
+    tool_calls: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +210,54 @@ class OpenAICompatibleProvider:
         requested_limit = settings.ai_max_reply_chars if max_reply_chars is None else int(max_reply_chars)
         reply_limit = max(1000, min(requested_limit, _MAX_ARTIFACT_REPLY_CHARS))
         return ChatReply(text=text[:reply_limit], model=response_model)
+
+    async def chat_tools(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ToolChatReply:
+        """Use native OpenAI tool calling without ever executing model output."""
+        model = model.strip()
+        if not model:
+            raise AIProviderError("A model must be selected")
+        cleaned = [
+            {"role": str(item.get("role") or "user"), "content": item.get("content")}
+            for item in messages[-settings.ai_max_history_messages :]
+            if item.get("content") not in (None, "", [])
+        ]
+        payload = await self._request_json(
+            "POST",
+            "chat/completions",
+            json_body={
+                "model": model,
+                "messages": cleaned,
+                "tools": tools,
+                "tool_choice": "auto",
+                "stream": False,
+            },
+        )
+        try:
+            message = payload["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AIProviderError("AI provider returned an invalid tool response") from exc
+        calls: list[dict[str, Any]] = []
+        for raw in message.get("tool_calls") or []:
+            if not isinstance(raw, dict) or not isinstance(raw.get("function"), dict):
+                continue
+            function = raw["function"]
+            arguments = function.get("arguments") or "{}"
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (ValueError, TypeError) as exc:
+                    raise AIProviderError("AI provider returned invalid tool arguments") from exc
+            if not isinstance(arguments, dict):
+                raise AIProviderError("AI provider returned non-object tool arguments")
+            calls.append({"name": str(function.get("name") or ""), "arguments": arguments})
+        text = str(message.get("content") or "").strip()
+        response_model = str(payload.get("model") or model) if isinstance(payload, dict) else model
+        return ToolChatReply(text=text[: settings.ai_max_reply_chars], model=response_model, tool_calls=tuple(calls))
 
     def _error_message(self, status: int, payload: object) -> str:
         detail = ""

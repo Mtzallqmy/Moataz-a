@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,12 @@ class StaticComposer:
             assets=(),
             expected_duration=1.0,
         )
+
+
+class PreviewComposer(StaticComposer):
+    async def build(self, project_id: int, *, user_id: int | None = None, **kwargs) -> RenderPlan:
+        plan = await super().build(project_id, user_id=user_id)
+        return replace(plan, render_kind=str(kwargs.get("render_kind") or "final"))
 
 
 class SuccessRenderer(BaseRenderer):
@@ -178,12 +185,14 @@ async def test_render_queue_survives_one_renderer_failure(tmp_path: Path) -> Non
     await queue.start()
     await queue.enqueue(first.id)
     await queue.enqueue(second.id)
-    for _ in range(200):
+    # SQLite CI workers can briefly serialize the failure and completion commits.
+    # Keep this a bounded wait while avoiding a scheduler-speed assertion.
+    for _ in range(500):
         one = await service.get_render(first.id)
         two = await service.get_render(second.id)
         if one and two and one.status == RenderStatus.FAILED.value and two.status == RenderStatus.COMPLETED.value:
             break
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
     await queue.shutdown()
     one = await service.get_render(first.id)
     two = await service.get_render(second.id)
@@ -208,6 +217,28 @@ async def test_render_retries_only_transient_ffmpeg_failure(tmp_path: Path, monk
     stored = await service.get_render(job.id)
     assert stored is not None and stored.status == RenderStatus.COMPLETED.value
     assert renderer.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_preview_render_is_persisted_without_completing_project(tmp_path: Path) -> None:
+    user_id, project_id = await _project()
+    service = RenderService(
+        _settings(tmp_path), composer=PreviewComposer(), renderer=SuccessRenderer(tmp_path)
+    )
+    job = await service.create_render(
+        project_id,
+        user_id=user_id,
+        kind="preview",
+        preview_duration=10,
+        preview_width=480,
+    )
+    assert await service.get_render_kind(job.id) == "preview"
+    await service.process_render(job.id)
+    stored = await service.get_render(job.id)
+    assert stored is not None and stored.status == RenderStatus.COMPLETED.value
+    async with SessionLocal() as session:
+        project = await session.get(MediaProject, project_id)
+        assert project is not None and project.status == ProjectStatus.READY.value
 
 
 @pytest.mark.asyncio

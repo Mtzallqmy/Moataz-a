@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from app.config import get_settings
-from app.services.openai_compatible import AIProviderError, ChatReply, OpenAICompatibleProvider
+from app.services.openai_compatible import (
+    AIProviderError,
+    ChatReply,
+    OpenAICompatibleProvider,
+    ToolChatReply,
+)
 from app.services.runware_provider import RunwareOpenAIProvider
 
 _PROVIDER_ENV_RE = re.compile(
@@ -17,12 +22,36 @@ _PROVIDER_ENV_RE = re.compile(
 
 _PRESETS = (
     (
+        "openai",
+        "OpenAI",
+        ("OPENAI_API_TOKEN", "OPENAI_API_KEY"),
+        "OPENAI_BASE_URL",
+        "https://api.openai.com/v1",
+        10,
+    ),
+    (
         "openrouter",
         "OpenRouter",
         ("OPENROUTER_API_TOKEN", "OPENROUTER_API_KEY"),
         "OPENROUTER_BASE_URL",
         "https://openrouter.ai/api/v1",
         20,
+    ),
+    (
+        "deepseek",
+        "DeepSeek",
+        ("DEEPSEEK_API_TOKEN", "DEEPSEEK_API_KEY"),
+        "DEEPSEEK_BASE_URL",
+        "https://api.deepseek.com/v1",
+        22,
+    ),
+    (
+        "gemini",
+        "Google Gemini",
+        ("GEMINI_API_TOKEN", "GEMINI_API_KEY"),
+        "GEMINI_BASE_URL",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        23,
     ),
     (
         "runware",
@@ -376,6 +405,16 @@ class AIProviderRegistry:
         if max_reply_chars is None:
             return await client.chat(model, messages)
         return await client.chat(model, messages, max_reply_chars=max_reply_chars)
+
+    async def chat_tools(
+        self,
+        provider_id: str,
+        model: str,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]],
+    ) -> ToolChatReply:
+        spec = self.provider(provider_id)
+        return await self._client(spec).chat_tools(model, messages, tools)
 
 
 _registry: AIProviderRegistry | None = None
