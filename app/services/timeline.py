@@ -17,6 +17,7 @@ from app.db import (
     SessionLocal,
     TimelineRevision,
 )
+from app.services.editing_styles import caption_style, style
 from app.services.project_locks import project_mutation_lock
 
 TRANSITIONS = {
@@ -48,6 +49,7 @@ TOOL_NAMES = {
     "add_text",
     "add_overlay",
     "set_volume",
+    "normalize_audio",
     "set_volume_range",
     "set_original_audio",
     "replace_clip_audio",
@@ -57,6 +59,8 @@ TOOL_NAMES = {
     "set_canvas",
     "set_fit_mode",
     "set_keyframes",
+    "select_ranges",
+    "apply_editing_style",
     "set_transform",
     "set_fades",
     "add_subtitles",
@@ -509,6 +513,7 @@ class TimelineService:
             "set_duration": TRACK_KINDS,
             "set_speed": {"visual", "audio", "overlay"},
             "set_volume": {"audio", "visual"},
+            "normalize_audio": {"audio", "visual"},
             "set_volume_range": {"audio", "visual"},
             "set_original_audio": {"visual"},
             "replace_clip_audio": {"visual"},
@@ -517,6 +522,7 @@ class TimelineService:
             "set_transform": {"visual", "overlay"},
             "add_transition": {"visual"},
             "set_keyframes": TRACK_KINDS,
+            "select_ranges": {"visual", "audio"},
             "set_fit_mode": {"visual", "overlay"},
         }.get(name)
         if target_kinds is None or args.get("clip_id"):
@@ -744,6 +750,28 @@ class TimelineService:
             cues = args.get("cues")
             if not isinstance(cues, list) or not cues or len(cues) > 200:
                 raise ValueError("Subtitles require 1-200 cues")
+            preset_name = str(args.get("preset") or "minimal")
+            preset = caption_style(preset_name)
+            overrides = args.get("style") or {}
+            if not isinstance(overrides, dict):
+                raise ValueError("Caption style must be an object")
+            allowed_style = {
+                "font_size",
+                "color",
+                "highlight_color",
+                "background",
+                "position",
+                "animation",
+                "rtl",
+            }
+            if set(overrides) - allowed_style:
+                raise ValueError("Caption style contains unsupported fields")
+            preset.update(overrides)
+            if not 12 <= int(preset["font_size"]) <= 240:
+                raise ValueError("Caption font size is out of range")
+            if str(preset.get("animation")) not in {"none", "fade", "pop"}:
+                raise ValueError("Caption animation is unsupported")
+            timeline.setdefault("options", {})["caption_style"] = preset
             clips = _track(timeline, "subtitle")["clips"]
             for cue in cues:
                 if not isinstance(cue, dict):
@@ -759,9 +787,16 @@ class TimelineService:
                         "speed": 1.0,
                         "volume": 0.0,
                         "fit_mode": "fit",
-                        "position_name": "bottom",
-                        "font_size": 42,
-                        "color": "white",
+                        "position_name": str(preset["position"]),
+                        "font_size": int(preset["font_size"]),
+                        "color": str(
+                            preset["highlight_color"]
+                            if cue.get("highlight")
+                            else preset["color"]
+                        )[:32],
+                        "background": str(preset["background"])[:32],
+                        "animation": str(preset["animation"]),
+                        "rtl": bool(preset["rtl"]),
                         "keyframes": [],
                         "transition_out": {"type": "none", "duration": 0.0},
                     }
@@ -792,6 +827,37 @@ class TimelineService:
                 raise ValueError("Canvas dimensions must be even")
             timeline["canvas"].update({"width": width, "height": height})
             return True, f"Canvas set to {width}x{height}"
+        if name == "apply_editing_style":
+            style_name = str(args.get("style") or "")
+            values = style(style_name)
+            options = timeline.setdefault("options", {})
+            options["style_preset"] = style_name
+            options["pacing"] = values["pacing"]
+            options["caption_style"] = caption_style(values["caption_preset"])
+            visual_clips = _track(timeline, "visual")["clips"]
+            for index, item in enumerate(visual_clips):
+                item["transition_out"] = {
+                    "type": values["transition"] if index < len(visual_clips) - 1 else "none",
+                    "duration": (
+                        min(float(values["transition_duration"]), float(item["duration"]) / 2)
+                        if index < len(visual_clips) - 1
+                        else 0.0
+                    ),
+                }
+                if item.get("asset_type") == "image" and values["zoom_frequency"] > 0:
+                    item["keyframes"] = [
+                        {"time": 0.0, "property": "scale", "value": 1.0},
+                        {
+                            "time": float(item["duration"]),
+                            "property": "scale",
+                            "value": 1.0 + min(0.12, float(values["zoom_frequency"]) * 0.12),
+                        },
+                    ]
+            for audio_track, item in _all_clips(timeline):
+                if audio_track.get("kind") == "audio" and item.get("role") == "music":
+                    item["volume"] = float(values["music_level"])
+            _reflow_visuals(timeline)
+            return True, f"Applied editing style {style_name}"
         if name == "set_fit_mode" and not args.get("clip_id"):
             mode = str(args.get("mode") or "")
             if mode not in FIT_MODES:
@@ -871,6 +937,13 @@ class TimelineService:
             )
         elif name == "set_volume":
             clip["volume"] = _number(args.get("volume"), "volume", maximum=2)
+        elif name == "normalize_audio":
+            if clip.get("asset_type") not in {"video", "audio", "voice"}:
+                raise ValueError("Audio normalization requires video or audio")
+            enabled = args.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be a boolean")
+            clip["normalize_audio"] = enabled
         elif name == "set_volume_range":
             if clip.get("asset_type") not in {"video", "audio", "voice"}:
                 raise ValueError("Volume ranges require a video or audio clip")
@@ -974,6 +1047,32 @@ class TimelineService:
             if duration >= float(clip["duration"]):
                 raise ValueError("Transition must be shorter than the clip")
             clip["transition_out"] = {"type": transition, "duration": duration}
+        elif name == "select_ranges":
+            ranges = args.get("ranges")
+            if not isinstance(ranges, list) or not ranges or len(ranges) > 20:
+                raise ValueError("select_ranges requires 1-20 timestamp ranges")
+            asset = assets.get(int(clip.get("asset_id") or 0))
+            if asset is None or not asset.duration:
+                raise ValueError("Clip source duration is unavailable")
+            selected: list[dict[str, Any]] = []
+            timeline_cursor = float(clip.get("start") or 0)
+            for index, item in enumerate(ranges):
+                if not isinstance(item, dict):
+                    raise ValueError("Selected range must be an object")
+                start = _number(item.get("start"), "range start")
+                end = _number(item.get("end"), "range end", minimum=start + 0.04)
+                if end > float(asset.duration) + 0.01:
+                    raise ValueError("Selected range exceeds source duration")
+                selected_clip = copy.deepcopy(clip)
+                selected_clip["id"] = clip_id if index == 0 else _identifier("clip")
+                selected_clip["source_start"] = start
+                selected_clip["duration"] = (end - start) / float(clip.get("speed") or 1)
+                selected_clip["start"] = timeline_cursor
+                selected_clip["volume_ranges"] = []
+                selected.append(selected_clip)
+                timeline_cursor += float(selected_clip["duration"])
+            position = track["clips"].index(clip)
+            track["clips"][position : position + 1] = selected
         elif name == "set_keyframes":
             keyframes = args.get("keyframes")
             if not isinstance(keyframes, list) or len(keyframes) > 50:
