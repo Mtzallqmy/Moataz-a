@@ -14,7 +14,6 @@ from app.services.download_backends.base import (
 )
 from app.services.media import probe_media_file
 
-_IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"RIFF", b"GIF87a", b"GIF89a")
 _PARTIAL_SUFFIXES = {".part", ".tmp", ".temp", ".download"}
 
 
@@ -49,7 +48,12 @@ class GalleryDlBackend(DownloadBackend):
         if path.stat().st_size > self.settings.max_file_size_bytes:
             return False
         head = path.read_bytes()[:16]
-        if any(head.startswith(magic) for magic in _IMAGE_MAGIC):
+        if (
+            head.startswith(b"\xff\xd8\xff")
+            or head.startswith(b"\x89PNG\r\n\x1a\n")
+            or head.startswith((b"GIF87a", b"GIF89a"))
+            or (head.startswith(b"RIFF") and head[8:12] == b"WEBP")
+        ):
             return True
         try:
             await probe_media_file(path)
@@ -68,7 +72,7 @@ class GalleryDlBackend(DownloadBackend):
             "--config-ignore",
             "--no-input",
             "--no-colors",
-            "--directory",
+            "--destination",
             str(request.output_dir.resolve()),
             "--restrict-filenames",
             "unix",
@@ -91,9 +95,11 @@ class GalleryDlBackend(DownloadBackend):
         wait_task = asyncio.create_task(process.communicate())
         cancel_task: asyncio.Task[None] | None = None
         if request.cancel_event is not None:
+
             async def watch_cancel() -> None:
                 while not request.cancel_event.is_set():
                     await asyncio.sleep(0.1)
+
             cancel_task = asyncio.create_task(watch_cancel())
         try:
             waiters = {wait_task}
