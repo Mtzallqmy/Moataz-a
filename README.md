@@ -20,7 +20,7 @@ OPENAI_API_TOKEN=
 
 `OPENAI_BASE_URL` يجب أن يكون جذر API المتوافق، مثل `https://provider.example/v1`. لا تضع API Token في رسائل Telegram أو داخل المستودع؛ مكانه الصحيح هو Railway Variables.
 
-يعمل البوت افتراضيًا عبر **Telegram Polling**، وتعمل المهام عبر **Inline Queue** داخل الخدمة نفسها. لا يحتاج Redis أو ARQ أو Webhook أو Worker منفصل أو Cookies.
+يعمل البوت افتراضيًا عبر **Telegram Polling**، وتعمل المهام عبر **Inline Queue** داخل الخدمة نفسها. لا يحتاج Redis أو ARQ أو Webhook أو Worker منفصل. Cookies ليست مطلوبة للروابط العامة عادةً، لكن بعض المنصات قد تطلبها أو تحظر عناوين مراكز البيانات.
 
 ```bash
 python -m app.main
@@ -43,6 +43,28 @@ Railway يمرر `PORT` تلقائيًا، والتطبيق يستخدمه مب�
 - cancellation فعلية للـyt-dlp وFFmpeg، retry محدود مع exponential backoff + jitter، startup reconciliation وcleanup.
 - Dashboard: Overview / Downloads / Jobs / Users / Workers / Errors / System، مع Analyze وDownload وDownload All وCancel، إضافة إلى قص حر/30ث/60ث مع FAST/PRECISE.
 - تبويب System يعرض `RAILWAY_GIT_COMMIT_SHA` وbranch وdeployment ID عندما يكون التشغيل من Railway، لتعرف أي Commit يعمل فعليًا.
+
+### مسارات تحميل احتياطية
+
+يستخدم التحميل العادي وMP3 والقص والتقسيم وروابط Media Studio الخدمة المركزية نفسها. عند خطأ مؤقت أو حظر anti-bot تنتقل الخدمة بالترتيب بين: yt-dlp المباشر، browser impersonation عبر `curl_cffi`، ثم Proxies المضبوطة، ثم خوادم Cobalt ذاتية الاستضافة أو المصرح باستخدامها. الفيديو الخاص أو الرابط الذي يحتاج تسجيل دخول لا يُعاد بلا فائدة.
+
+```env
+# Netscape cookies.txt: اختر ملفًا mounted أو محتوى Base64، وليس الاثنين.
+YTDLP_COOKIES_FILE=
+YTDLP_COOKIES_B64=
+
+# حتى أربعة مخارج مرتبة، مفصولة بفاصلة أو سطر جديد.
+YTDLP_PROXY_URLS=
+YTDLP_IMPERSONATE=true
+
+# حتى أربعة Cobalt API roots ذاتية/مصرح بها. لا تستخدم الخادم العام دون إذن.
+COBALT_API_URLS=
+COBALT_API_TOKEN=
+COBALT_AUTH_SCHEME=Api-Key
+COBALT_TIMEOUT_SECONDS=45
+```
+
+تُحفظ الأسرار في Railway Variables فقط وتُنقّح من السجلات. لا يتبع عميل Cobalt redirects غير المفحوصة، ولا يرسل مفتاح الـAPI إلى host خارجي، ويلتزم بحد الحجم والإلغاء والتنظيف. وجود أكثر من backend يزيد الاعتمادية لكنه لا يتجاوز DRM أو صلاحيات المحتوى الخاص، ولا يضمن تجاوز حظر المنصة إذا كانت كل المخارج محظورة.
 
 ## Media Studio MVP
 

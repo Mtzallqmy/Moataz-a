@@ -7,6 +7,7 @@ pytest.importorskip("yt_dlp")
 
 from app.config import Settings
 from app.errors import CancelledError, ErrorCode, FormatUnavailableError
+from app.services.download_relays import RelayProbe
 from app.services.downloader import DownloaderService
 
 
@@ -110,6 +111,37 @@ def test_playlist_expansion_deduplicates_and_enforces_limit():
         service().expand_playlist("https://example.com/list", limit=3)
 
 
+def test_playlist_expansion_uses_configured_proxy_after_antibot():
+    class PlaylistFailoverYDL(FakeYDL):
+        options_seen = []
+
+        def __init__(self, options):
+            super().__init__(options)
+            type(self).options_seen.append(options)
+
+        def extract_info(self, url, download=False):  # noqa: ARG002
+            if "proxy" not in self.options:
+                raise RuntimeError("Sign in to confirm you’re not a bot")
+            return {
+                "_type": "playlist",
+                "entries": [{"webpage_url": "https://example.com/one"}],
+            }
+
+    configured = DownloaderService(
+        Settings(
+            _env_file=None,
+            max_playlist_items=3,
+            ytdlp_proxy_urls="https://proxy.example:8443",
+        ),
+        ydl_factory=PlaylistFailoverYDL,
+        url_guard=lambda url: url,
+    )
+    entries = configured.expand_playlist("https://example.com/list")
+    assert [entry.url for entry in entries] == ["https://example.com/one"]
+    assert len(PlaylistFailoverYDL.options_seen) == 2
+    assert PlaylistFailoverYDL.options_seen[-1]["proxy"] == "https://proxy.example:8443"
+
+
 def test_requested_missing_resolution_fails_before_ytdlp_download(tmp_path):
     with pytest.raises(FormatUnavailableError):
         service().download(
@@ -194,3 +226,86 @@ def test_invalid_cookie_secret_fails_before_network(tmp_path):
     )
     with pytest.raises(ValueError, match="valid base64"):
         configured.probe("https://example.com/x")
+
+
+class FakeRelay:
+    enabled = True
+
+    def __init__(self) -> None:
+        self.probes = []
+        self.downloads = []
+
+    def probe(self, url):
+        self.probes.append(url)
+        return RelayProbe("Relay title", "youtube", 1)
+
+    def download(self, url, quality, job_dir, **kwargs):
+        self.downloads.append((url, quality))
+        output = job_dir / ("relay.mp3" if quality in {"audio", "mp3"} else "relay.mp4")
+        output.write_bytes(b"relay-media")
+        return output
+
+
+class AntiBotYDL(FakeYDL):
+    def extract_info(self, url, download=False):  # noqa: ARG002
+        raise RuntimeError("Sign in to confirm you’re not a bot")
+
+    def download(self, urls):  # noqa: ARG002
+        raise RuntimeError("Sign in to confirm you’re not a bot")
+
+
+def test_probe_falls_back_to_configured_relay_after_antibot():
+    relay = FakeRelay()
+    configured = DownloaderService(
+        Settings(_env_file=None),
+        ydl_factory=AntiBotYDL,
+        url_guard=lambda url: url,
+        relay=relay,  # type: ignore[arg-type]
+    )
+    info = configured.probe("https://youtube.com/watch?v=x")
+    assert info.title == "Relay title"
+    assert info.extractor == "cobalt-1"
+    assert info.qualities == []
+    assert relay.probes == ["https://youtube.com/watch?v=x"]
+
+
+def test_download_falls_back_to_relay_for_video_and_audio(tmp_path):
+    relay = FakeRelay()
+    configured = DownloaderService(
+        Settings(_env_file=None),
+        ydl_factory=AntiBotYDL,
+        url_guard=lambda url: url,
+        relay=relay,  # type: ignore[arg-type]
+    )
+    video = configured.download(
+        "https://youtube.com/watch?v=x", "best", tmp_path / "video", job_key="v"
+    )
+    audio = configured.download_audio(
+        "https://youtube.com/watch?v=x", tmp_path / "audio", job_key="a"
+    )
+    assert video.suffix == ".mp4"
+    assert audio.suffix == ".mp3"
+    assert relay.downloads == [
+        ("https://youtube.com/watch?v=x", "best"),
+        ("https://youtube.com/watch?v=x", "audio"),
+    ]
+
+
+def test_proxy_failover_profiles_are_ordered(monkeypatch):
+    monkeypatch.setitem(__import__("sys").modules, "curl_cffi", object())
+    configured = DownloaderService(
+        Settings(
+            _env_file=None,
+            ytdlp_proxy_urls="http://user:secret@proxy-one.example:8080,"
+            "socks5h://proxy-two.example:1080",
+        ),
+        url_guard=lambda url: url,
+    )
+    attempts = configured._attempts()
+    assert [attempt.name for attempt in attempts] == [
+        "direct",
+        "browser",
+        "proxy-1",
+        "proxy-2",
+    ]
+    assert attempts[2].options["proxy"].startswith("http://user:secret@")
