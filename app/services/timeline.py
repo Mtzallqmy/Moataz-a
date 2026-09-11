@@ -48,6 +48,10 @@ TOOL_NAMES = {
     "add_text",
     "add_overlay",
     "set_volume",
+    "set_volume_range",
+    "set_original_audio",
+    "replace_clip_audio",
+    "duck_background_music",
     "add_background_music",
     "set_audio_mode",
     "set_canvas",
@@ -187,6 +191,7 @@ def _asset_clip(asset: MediaAsset, *, role: str, position: int) -> tuple[str, di
         "duration": duration,
         "speed": 1.0,
         "volume": 1.0,
+        "volume_ranges": [],
         "fade_in": 0.0,
         "fade_out": 0.0,
         "fit_mode": "fit",
@@ -262,6 +267,34 @@ def _reflow_visuals(timeline: dict[str, Any]) -> None:
         cursor += float(clip.get("duration") or 0) - overlap
 
 
+def _slice_volume_ranges(
+    ranges: object,
+    *,
+    start: float,
+    duration: float,
+) -> list[dict[str, float]]:
+    """Keep a clip-relative volume envelope aligned after trim/split/duration edits."""
+
+    if not isinstance(ranges, list):
+        return []
+    end = start + duration
+    result: list[dict[str, float]] = []
+    for item in ranges:
+        if not isinstance(item, dict):
+            continue
+        item_start = max(start, float(item.get("start") or 0))
+        item_end = min(end, float(item.get("end") or 0))
+        if item_end - item_start >= 0.01:
+            result.append(
+                {
+                    "start": round(item_start - start, 6),
+                    "end": round(item_end - start, 6),
+                    "volume": float(item.get("volume") or 0),
+                }
+            )
+    return result
+
+
 def validate_timeline(timeline: dict[str, Any], *, max_clips: int = 200) -> None:
     if timeline.get("version") != 2:
         raise ValueError("Timeline version 2 is required")
@@ -303,6 +336,26 @@ def validate_timeline(timeline: dict[str, Any], *, max_clips: int = 200) -> None
             _number(clip.get("duration", 0), "clip duration", minimum=0.04)
             _number(clip.get("speed", 1), "clip speed", minimum=0.25, maximum=4)
             _number(clip.get("volume", 1), "clip volume", maximum=2)
+            if "original_audio_enabled" in clip and not isinstance(
+                clip["original_audio_enabled"], bool
+            ):
+                raise ValueError("original_audio_enabled must be a boolean")
+            volume_ranges = clip.get("volume_ranges") or []
+            if not isinstance(volume_ranges, list) or len(volume_ranges) > 50:
+                raise ValueError("Invalid volume ranges")
+            clip_duration = float(clip.get("duration") or 0)
+            for volume_range in volume_ranges:
+                if not isinstance(volume_range, dict):
+                    raise ValueError("Volume range must be an object")
+                start = _number(volume_range.get("start"), "volume range start")
+                end = _number(
+                    volume_range.get("end"),
+                    "volume range end",
+                    minimum=start + 0.01,
+                )
+                if end > clip_duration + 0.01:
+                    raise ValueError("Volume range exceeds clip duration")
+                _number(volume_range.get("volume"), "volume range volume", maximum=2)
             fit = clip.get("fit_mode", "fit")
             if fit not in FIT_MODES:
                 raise ValueError("Unknown clip fit mode")
@@ -378,6 +431,8 @@ class TimelineService:
                 raise LookupError("Project not found")
             if project.status == ProjectStatus.CANCELLED.value:
                 raise ValueError("Cancelled project cannot be edited")
+            if project.status == ProjectStatus.RENDERING.value:
+                raise ValueError("Wait for the active render or cancel it before editing")
             rows = list(
                 (
                     await session.execute(
@@ -454,6 +509,10 @@ class TimelineService:
             "set_duration": TRACK_KINDS,
             "set_speed": {"visual", "audio", "overlay"},
             "set_volume": {"audio", "visual"},
+            "set_volume_range": {"audio", "visual"},
+            "set_original_audio": {"visual"},
+            "replace_clip_audio": {"visual"},
+            "duck_background_music": {"audio"},
             "set_fades": TRACK_KINDS,
             "set_transform": {"visual", "overlay"},
             "add_transition": {"visual"},
@@ -757,6 +816,9 @@ class TimelineService:
                 raise ValueError("Trim exceeds source duration")
             clip["source_start"] = source_start
             clip["duration"] = (source_end - source_start) / float(clip.get("speed", 1))
+            clip["volume_ranges"] = _slice_volume_ranges(
+                clip.get("volume_ranges"), start=0, duration=float(clip["duration"])
+            )
         elif name == "split_clip":
             at = _number(args.get("at"), "at", minimum=0.04)
             duration = float(clip["duration"])
@@ -766,7 +828,13 @@ class TimelineService:
             second["id"] = _identifier("clip")
             second["source_start"] = float(clip.get("source_start", 0)) + at * float(clip.get("speed", 1))
             second["duration"] = duration - at
+            second["volume_ranges"] = _slice_volume_ranges(
+                clip.get("volume_ranges"), start=at, duration=duration - at
+            )
             clip["duration"] = at
+            clip["volume_ranges"] = _slice_volume_ranges(
+                clip.get("volume_ranges"), start=0, duration=at
+            )
             index = track["clips"].index(clip)
             track["clips"].insert(index + 1, second)
         elif name == "move_clip":
@@ -790,13 +858,114 @@ class TimelineService:
             if clip.get("asset_type") == "video" and duration * float(clip.get("speed", 1)) > available + 0.01:
                 raise ValueError("Duration exceeds source media")
             clip["duration"] = duration
+            clip["volume_ranges"] = _slice_volume_ranges(
+                clip.get("volume_ranges"), start=0, duration=duration
+            )
         elif name == "set_speed":
             speed = _number(args.get("speed"), "speed", minimum=0.25, maximum=4)
             old = float(clip.get("speed", 1))
             clip["speed"] = speed
             clip["duration"] = float(clip["duration"]) * old / speed
+            clip["volume_ranges"] = _slice_volume_ranges(
+                clip.get("volume_ranges"), start=0, duration=float(clip["duration"])
+            )
         elif name == "set_volume":
             clip["volume"] = _number(args.get("volume"), "volume", maximum=2)
+        elif name == "set_volume_range":
+            if clip.get("asset_type") not in {"video", "audio", "voice"}:
+                raise ValueError("Volume ranges require a video or audio clip")
+            start = _number(args.get("start"), "start")
+            end = _number(args.get("end"), "end", minimum=start + 0.01)
+            if end > float(clip["duration"]) + 0.01:
+                raise ValueError("Volume range exceeds clip duration")
+            volume_range = {
+                "start": start,
+                "end": end,
+                "volume": _number(args.get("volume"), "volume", maximum=2),
+            }
+            ranges = list(clip.get("volume_ranges") or [])
+            ranges.append(volume_range)
+            clip["volume_ranges"] = sorted(
+                ranges, key=lambda item: (float(item["start"]), float(item["end"]))
+            )
+        elif name == "set_original_audio":
+            if clip.get("asset_type") != "video":
+                raise ValueError("Original audio control requires a video clip")
+            enabled = args.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be a boolean")
+            clip["original_audio_enabled"] = enabled
+            if args.get("volume") is not None:
+                clip["volume"] = _number(args.get("volume"), "volume", maximum=2)
+        elif name == "replace_clip_audio":
+            if clip.get("asset_type") != "video":
+                raise ValueError("Audio replacement requires a video clip")
+            audio_asset_id = _integer(
+                args.get("audio_asset_id"),
+                "audio_asset_id",
+                minimum=1,
+                maximum=2**31 - 1,
+            )
+            audio_asset = assets.get(audio_asset_id)
+            if audio_asset is None or audio_asset.asset_type not in {"audio", "voice"}:
+                raise ValueError("Replacement audio must be attached to this project")
+            audio_track = _track(timeline, "audio")
+            replacement = next(
+                (
+                    item
+                    for item in audio_track["clips"]
+                    if int(item.get("asset_id") or 0) == audio_asset_id
+                ),
+                None,
+            )
+            if replacement is None:
+                _, replacement = _asset_clip(audio_asset, role="voice", position=9999)
+                replacement["id"] = _identifier("audio")
+                audio_track["clips"].append(replacement)
+            replacement["start"] = float(clip.get("start") or 0)
+            replacement["duration"] = min(
+                float(clip["duration"]), float(audio_asset.duration or clip["duration"])
+            )
+            replacement["volume"] = _number(
+                args.get("volume", 1), "volume", maximum=2
+            )
+            mix_original = args.get("mix_original", False)
+            if not isinstance(mix_original, bool):
+                raise ValueError("mix_original must be a boolean")
+            clip["original_audio_enabled"] = mix_original
+            timeline.setdefault("options", {})["audio_mode"] = "mix_audio"
+        elif name == "duck_background_music":
+            if track.get("kind") != "audio":
+                raise ValueError("Ducking requires an audio clip")
+            duck_volume = _number(args.get("volume", 0.2), "volume", maximum=2)
+            release = _number(args.get("release", 0.15), "release", maximum=2)
+            music_start = float(clip.get("start") or 0)
+            music_end = music_start + float(clip["duration"])
+            ranges = list(clip.get("volume_ranges") or [])
+            for other_track, other in _all_clips(timeline):
+                if other is clip or other_track.get("kind") != "audio":
+                    continue
+                if other.get("asset_type") != "voice" and other.get("role") != "voice":
+                    continue
+                overlap_start = max(music_start, float(other.get("start") or 0))
+                overlap_end = min(
+                    music_end,
+                    float(other.get("start") or 0) + float(other.get("duration") or 0),
+                )
+                if overlap_end - overlap_start < 0.01:
+                    continue
+                ranges.append(
+                    {
+                        "start": max(0.0, overlap_start - music_start - release),
+                        "end": min(float(clip["duration"]), overlap_end - music_start + release),
+                        "volume": duck_volume,
+                    }
+                )
+            if not ranges:
+                raise ValueError("No overlapping voice clip is available for ducking")
+            clip["volume_ranges"] = sorted(
+                ranges, key=lambda item: (float(item["start"]), float(item["end"]))
+            )
         elif name == "add_transition":
             transition = str(args.get("type") or "none")
             if transition not in TRANSITIONS:

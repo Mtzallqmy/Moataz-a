@@ -27,6 +27,13 @@ TEMPLATES = {"auto", "timeline", "audio_image", "slideshow", "merge_videos", "vi
 ROLES = {"main", "intro", "outro", "music", "voice", "logo", "background"}
 
 
+def _ensure_editable(project: MediaProject) -> None:
+    if project.status == ProjectStatus.CANCELLED.value:
+        raise ValueError("Cancelled project cannot be modified")
+    if project.status == ProjectStatus.RENDERING.value:
+        raise ValueError("Wait for the active render or cancel it before editing")
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectAssetItem:
     link: ProjectAsset
@@ -92,6 +99,47 @@ class ProjectService:
             for project in projects:
                 session.expunge(project)
             return projects
+
+    async def reopen_project(self, project_id: int, *, user_id: int) -> MediaProject:
+        """Return a finished project to an editable state without touching its outputs."""
+
+        async with project_mutation_lock(project_id):
+            async with SessionLocal() as session:
+                project = await session.scalar(
+                    select(MediaProject)
+                    .where(
+                        MediaProject.id == project_id,
+                        MediaProject.user_id == user_id,
+                    )
+                    .with_for_update()
+                )
+                if project is None:
+                    raise LookupError("Project not found")
+                if project.status == ProjectStatus.CANCELLED.value:
+                    raise ValueError("Cancelled project cannot be reopened")
+                if project.status == ProjectStatus.RENDERING.value:
+                    raise ValueError("Wait for the active render or cancel it before editing")
+                if project.status in {
+                    ProjectStatus.COMPLETED.value,
+                    ProjectStatus.FAILED.value,
+                }:
+                    asset_count = int(
+                        await session.scalar(
+                            select(func.count())
+                            .select_from(ProjectAsset)
+                            .where(ProjectAsset.project_id == project_id)
+                        )
+                        or 0
+                    )
+                    project.status = (
+                        ProjectStatus.READY.value
+                        if asset_count
+                        else ProjectStatus.DRAFT.value
+                    )
+                    await session.commit()
+                    await session.refresh(project)
+                session.expunge(project)
+                return project
 
     async def list_assets(self, project_id: int, *, user_id: int | None = None) -> list[ProjectAssetItem]:
         async with SessionLocal() as session:
@@ -206,8 +254,7 @@ class ProjectService:
                 )
                 if count >= self.settings.max_project_assets:
                     raise ValueError("Project asset limit reached")
-                if project.status == ProjectStatus.CANCELLED.value:
-                    raise ValueError("Cancelled project cannot be modified")
+                _ensure_editable(project)
                 if not asset.local_path:
                     raise ValueError("Asset storage path is missing")
                 max_position = await session.scalar(
@@ -236,8 +283,7 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 return False
-            if project.status == ProjectStatus.CANCELLED.value:
-                raise ValueError("Cancelled project cannot be modified")
+            _ensure_editable(project)
             link = await session.get(ProjectAsset, (project_id, asset_id))
             if link is None:
                 return False
@@ -256,8 +302,7 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 return False
-            if project.status == ProjectStatus.CANCELLED.value:
-                raise ValueError("Cancelled project cannot be modified")
+            _ensure_editable(project)
             links = list(await session.scalars(select(ProjectAsset).where(ProjectAsset.project_id == project_id).order_by(ProjectAsset.position, ProjectAsset.asset_id)))
             index = next((idx for idx, item in enumerate(links) if item.asset_id == asset_id), None)
             if index is None:
@@ -284,8 +329,7 @@ class ProjectService:
             link = await session.get(ProjectAsset, (project_id, asset_id))
             if project is None or link is None:
                 raise LookupError("Project asset not found")
-            if project.status == ProjectStatus.CANCELLED.value:
-                raise ValueError("Cancelled project cannot be modified")
+            _ensure_editable(project)
             asset = await session.get(MediaAsset, asset_id)
             if asset is None or asset.user_id != user_id:
                 raise LookupError("Project asset not found")
@@ -312,8 +356,7 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 raise LookupError("Project not found")
-            if project.status == ProjectStatus.CANCELLED.value:
-                raise ValueError("Cancelled project cannot be modified")
+            _ensure_editable(project)
             project.aspect_ratio = aspect_ratio
             project.width = width
             project.height = height
@@ -331,8 +374,7 @@ class ProjectService:
             project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
             if project is None:
                 raise LookupError("Project not found")
-            if project.status == ProjectStatus.CANCELLED.value:
-                raise ValueError("Cancelled project cannot be modified")
+            _ensure_editable(project)
             payload = _timeline_config(project)
             payload["template"] = template
             merged = dict(payload.get("options") or {})

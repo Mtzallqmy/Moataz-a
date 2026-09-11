@@ -26,6 +26,7 @@ from app.services.media import fit_media_for_upload, probe_media_file
 from app.services.projects import ProjectAssetItem, ProjectService, project_service
 from app.services.render_service import RenderService, render_service
 from app.services.studio_agent import StudioAgentService, studio_agent_service
+from app.services.timeline import timeline_service
 from app.services.urls import parse_bulk_urls
 from app.utils import seconds_to_hms
 
@@ -148,6 +149,14 @@ def _asset_icon(asset_type: str) -> str:
 
 async def _show_assets(message: Message, project_id: int, user_id: int) -> None:
     items = await project_service.list_assets(project_id, user_id=user_id)
+    timeline = await timeline_service.get(project_id, user_id=user_id)
+    clips = {
+        str(clip.get("id")): clip
+        for track in timeline.get("tracks") or []
+        if isinstance(track, dict)
+        for clip in track.get("clips") or []
+        if isinstance(clip, dict)
+    }
     lines = [f"📦 مواد Project #{project_id}"]
     rows: list[list[InlineKeyboardButton]] = []
     for index, item in enumerate(items, start=1):
@@ -162,10 +171,27 @@ async def _show_assets(message: Message, project_id: int, user_id: int) -> None:
                 InlineKeyboardButton(text="🗑", callback_data=f"studio:remove:{project_id}:{item.asset.id}"),
             ]
         )
+        if item.asset.asset_type == "video":
+            clip = clips.get(f"asset-{item.asset.id}")
+            enabled = True if clip is None else clip.get("original_audio_enabled", True)
+            action = "mute" if enabled else "unmute"
+            label = "🔇 إزالة الصوت الأصلي" if enabled else "🔊 استعادة الصوت الأصلي"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=label,
+                        callback_data=f"studio:audio:{project_id}:{item.asset.id}:{action}",
+                    )
+                ]
+            )
     if not items:
         lines.append("\nلا توجد مواد بعد.")
     rows.append([InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")])
-    await message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _safe_bound_edit(
+        message,
+        "\n".join(lines),
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
 def _timeline(project: object) -> dict:
@@ -522,13 +548,23 @@ async def open_project(callback: CallbackQuery, state: FSMContext) -> None:
     if owned is None or callback.message is None:
         return
     user, project = owned
-    if project.status != ProjectStatus.CANCELLED.value:
+    if project.status in {ProjectStatus.COMPLETED.value, ProjectStatus.FAILED.value}:
+        try:
+            project = await project_service.reopen_project(project_id, user_id=user.id)
+        except ValueError as exc:
+            await callback.answer(str(exc)[:180], show_alert=True)
+            return
+    if project.status not in {
+        ProjectStatus.CANCELLED.value,
+        ProjectStatus.RENDERING.value,
+    }:
         await state.set_state(StudioState.collecting)
         await state.update_data(studio_project_id=project_id)
     items = await project_service.list_assets(project_id, user_id=user.id)
-    await callback.message.edit_text(
+    await _safe_bound_edit(
+        callback.message,
         f"🎬 Project #{project_id} • {project.status}\nالمواد: {len(items)}\nAspect: {project.aspect_ratio}",
-        reply_markup=project_keyboard(project_id),
+        project_keyboard(project_id),
     )
     await callback.answer()
 
@@ -536,12 +572,53 @@ async def open_project(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("studio:add:"))
 async def add_more(callback: CallbackQuery, state: FSMContext) -> None:
     project_id = int(callback.data.rsplit(":", 1)[1])
-    if await _owned_project(callback, project_id) is None or callback.message is None:
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
         return
+    user, project = owned
+    if project.status == ProjectStatus.RENDERING.value:
+        await callback.answer("انتظر انتهاء الرندر الحالي أو ألغِه أولًا", show_alert=True)
+        return
+    if project.status in {ProjectStatus.COMPLETED.value, ProjectStatus.FAILED.value}:
+        await project_service.reopen_project(project_id, user_id=user.id)
     await state.set_state(StudioState.collecting)
     await state.update_data(studio_project_id=project_id)
-    await callback.message.edit_text(_project_text(project_id), reply_markup=project_keyboard(project_id))
+    await _safe_bound_edit(callback.message, _project_text(project_id), project_keyboard(project_id))
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:audio:"))
+async def set_video_original_audio(callback: CallbackQuery) -> None:
+    _, _, raw_project, raw_asset, action = callback.data.split(":")
+    project_id = int(raw_project)
+    asset_id = int(raw_asset)
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None or action not in {"mute", "unmute"}:
+        return
+    user, _ = owned
+    items = await project_service.list_assets(project_id, user_id=user.id)
+    if not any(item.asset.id == asset_id and item.asset.asset_type == "video" for item in items):
+        await callback.answer("ملف الفيديو غير موجود في هذا المشروع", show_alert=True)
+        return
+    try:
+        await timeline_service.apply(
+            project_id,
+            user_id=user.id,
+            calls=[
+                {
+                    "name": "set_original_audio",
+                    "arguments": {
+                        "clip_id": f"asset-{asset_id}",
+                        "enabled": action == "unmute",
+                    },
+                }
+            ],
+        )
+    except ValueError as exc:
+        await callback.answer(_safe_studio_error(exc, agent=True)[:180], show_alert=True)
+        return
+    await _show_assets(callback.message, project_id, user.id)
+    await callback.answer("تم تحديث صوت الفيديو")
 
 
 @router.callback_query(F.data.startswith("studio:agent:"))
@@ -1028,7 +1105,12 @@ async def my_projects(callback: CallbackQuery) -> None:
     for project in projects:
         count = len(await project_service.list_assets(project.id, user_id=user.id))
         lines.append(f"#{project.id} {project.status} — {project.name[:35]} — {count} assets")
-        rows.append([InlineKeyboardButton(text=f"فتح #{project.id}", callback_data=f"studio:open:{project.id}")])
+        label = (
+            f"♻️ إعادة مونتاج #{project.id}"
+            if project.status == ProjectStatus.COMPLETED.value
+            else f"فتح #{project.id}"
+        )
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"studio:open:{project.id}")])
     if not projects:
         lines.append("\nلا توجد مشاريع بعد.")
     rows.append([InlineKeyboardButton(text="⬅️ الاستوديو", callback_data="menu:studio")])
