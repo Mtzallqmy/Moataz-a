@@ -84,7 +84,7 @@ class TikTokBackend(DownloadBackend):
             ) as response:
                 if response.status in {401, 403}:
                     raise RuntimeError(
-                        f"TikTok sidecar HTTP {response.status}: authorization required"
+                        f"TikTok sidecar HTTP {response.status}: authentication required"
                     )
                 if response.status == 429:
                     raise RuntimeError("TikTok sidecar HTTP 429")
