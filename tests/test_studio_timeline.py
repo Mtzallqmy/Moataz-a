@@ -303,6 +303,60 @@ async def _database_project(tmp_path: Path) -> tuple[int, int, ProjectService, T
         return user.id, project.id, projects, timelines
 
 
+async def _audio_edit_project(tmp_path: Path) -> tuple[int, int, TimelineService, int, int, int]:
+    await init_db()
+    settings = Settings(project_dir=tmp_path / "projects", render_temp_dir=tmp_path / "renders")
+    service = TimelineService(settings)
+    async with SessionLocal() as session:
+        user = User(telegram_id=next(_TELEGRAM_IDS))
+        session.add(user)
+        await session.flush()
+        project = MediaProject(
+            user_id=user.id,
+            chat_id=user.telegram_id,
+            name="Audio editing",
+            width=320,
+            height=180,
+            fps=24,
+            timeline_json=json.dumps(new_timeline(320, 180, 24)),
+        )
+        session.add(project)
+        await session.flush()
+        definitions = [
+            ("video", "video.mp4", 8.0, "main"),
+            ("audio", "music.mp3", 8.0, "music"),
+            ("voice", "voice.ogg", 3.0, "voice"),
+        ]
+        assets: list[MediaAsset] = []
+        for position, (asset_type, filename, duration, role) in enumerate(definitions):
+            path = tmp_path / filename
+            path.write_bytes(b"fixture")
+            asset = MediaAsset(
+                user_id=user.id,
+                asset_type=asset_type,
+                source_type="local",
+                local_path=str(path),
+                mime_type="video/mp4" if asset_type == "video" else "audio/mpeg",
+                duration=duration,
+                width=320 if asset_type == "video" else None,
+                height=180 if asset_type == "video" else None,
+                file_size=path.stat().st_size,
+            )
+            session.add(asset)
+            await session.flush()
+            assets.append(asset)
+            session.add(
+                ProjectAsset(
+                    project_id=project.id,
+                    asset_id=asset.id,
+                    position=position,
+                    role=role,
+                )
+            )
+        await session.commit()
+        return user.id, project.id, service, assets[0].id, assets[1].id, assets[2].id
+
+
 @pytest.mark.asyncio
 async def test_timeline_tools_modify_same_project_and_support_undo_redo(tmp_path: Path) -> None:
     user_id, project_id, _, service = await _database_project(tmp_path)
@@ -397,6 +451,118 @@ async def test_timeline_tool_catalog_handles_multitrack_edits(tmp_path: Path) ->
             project_id,
             user_id=user_id,
             calls=[{"name": "add_clip", "arguments": {"asset_id": 99999}}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_timeline_audio_tools_mute_replace_and_duck_with_undo(tmp_path: Path) -> None:
+    user_id, project_id, service, video_id, music_id, voice_id = await _audio_edit_project(
+        tmp_path
+    )
+    timeline = await service.get(project_id, user_id=user_id)
+    video = next(
+        clip
+        for track in timeline["tracks"]
+        for clip in track["clips"]
+        if clip.get("asset_id") == video_id
+    )
+    music = next(
+        clip
+        for track in timeline["tracks"]
+        for clip in track["clips"]
+        if clip.get("asset_id") == music_id
+    )
+    edited = await service.apply(
+        project_id,
+        user_id=user_id,
+        calls=[
+            {
+                "name": "set_original_audio",
+                "arguments": {"clip_id": video["id"], "enabled": False},
+            },
+            {
+                "name": "set_volume_range",
+                "arguments": {
+                    "clip_id": music["id"],
+                    "start": 1,
+                    "end": 2,
+                    "volume": 0,
+                },
+            },
+            {
+                "name": "replace_clip_audio",
+                "arguments": {
+                    "clip_id": video["id"],
+                    "audio_asset_id": voice_id,
+                    "volume": 0.8,
+                },
+            },
+            {
+                "name": "duck_background_music",
+                "arguments": {"clip_id": music["id"], "volume": 0.15},
+            },
+        ],
+    )
+    edited_video = next(
+        clip
+        for track in edited.timeline["tracks"]
+        for clip in track["clips"]
+        if clip.get("id") == video["id"]
+    )
+    edited_music = next(
+        clip
+        for track in edited.timeline["tracks"]
+        for clip in track["clips"]
+        if clip.get("id") == music["id"]
+    )
+    replacement = next(
+        clip
+        for track in edited.timeline["tracks"]
+        for clip in track["clips"]
+        if clip.get("asset_id") == voice_id
+    )
+    assert edited_video["original_audio_enabled"] is False
+    assert replacement["volume"] == pytest.approx(0.8)
+    assert replacement["start"] == edited_video["start"]
+    assert any(item["volume"] == 0 for item in edited_music["volume_ranges"])
+    assert any(item["volume"] == pytest.approx(0.15) for item in edited_music["volume_ranges"])
+    assert edited.timeline["options"]["audio_mode"] == "mix_audio"
+
+    undone = await service.undo(project_id, user_id=user_id)
+    original_video = next(
+        clip
+        for track in undone.timeline["tracks"]
+        for clip in track["clips"]
+        if clip.get("asset_id") == video_id
+    )
+    assert "original_audio_enabled" not in original_video
+
+
+@pytest.mark.asyncio
+async def test_timeline_rejects_invalid_partial_mute_range(tmp_path: Path) -> None:
+    user_id, project_id, service, video_id, _, _ = await _audio_edit_project(tmp_path)
+    timeline = await service.get(project_id, user_id=user_id)
+    video = next(
+        clip
+        for track in timeline["tracks"]
+        for clip in track["clips"]
+        if clip.get("asset_id") == video_id
+    )
+    with pytest.raises(ValueError, match="exceeds clip duration"):
+        await service.apply(
+            project_id,
+            user_id=user_id,
+            calls=[
+                {
+                    "name": "set_volume_range",
+                    "arguments": {
+                        "clip_id": video["id"],
+                        "start": 2,
+                        "end": 20,
+                        "volume": 0,
+                    },
+                }
+            ],
         )
 
 

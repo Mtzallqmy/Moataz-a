@@ -151,6 +151,64 @@ async def test_safe_edit_retries_once_after_rate_limit(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_safe_bound_edit_treats_message_not_modified_as_success() -> None:
+    class Message:
+        async def edit_text(self, *args, **kwargs):
+            raise TelegramBadRequest(
+                method=SimpleNamespace(), message="message is not modified"
+            )
+
+    assert await studio._safe_bound_edit(Message(), "same") is True
+
+
+@pytest.mark.asyncio
+async def test_video_audio_button_applies_owned_timeline_mute(monkeypatch) -> None:
+    shown = []
+
+    class Callback:
+        data = "studio:audio:12:34:mute"
+        message = SimpleNamespace()
+
+        async def answer(self, text=None, **kwargs):
+            return None
+
+    async def owned(_callback, project_id):
+        assert project_id == 12
+        return SimpleNamespace(id=7), SimpleNamespace(id=12)
+
+    async def assets(project_id, *, user_id):
+        return [
+            SimpleNamespace(
+                asset=SimpleNamespace(id=34, asset_type="video"),
+                link=SimpleNamespace(role="main"),
+            )
+        ]
+
+    async def capture_apply(project_id, *, user_id, calls: list):
+        calls_copy = list(calls)
+        assert (project_id, user_id) == (12, 7)
+        captured.extend(calls_copy)
+        return SimpleNamespace()
+
+    async def show(message, project_id, user_id):
+        shown.append((project_id, user_id))
+
+    captured: list[dict] = []
+    monkeypatch.setattr(studio, "_owned_project", owned)
+    monkeypatch.setattr(studio.project_service, "list_assets", assets)
+    monkeypatch.setattr(studio.timeline_service, "apply", capture_apply)
+    monkeypatch.setattr(studio, "_show_assets", show)
+    await studio.set_video_original_audio(Callback())
+    assert captured == [
+        {
+            "name": "set_original_audio",
+            "arguments": {"clip_id": "asset-34", "enabled": False},
+        }
+    ]
+    assert shown == [(12, 7)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload_type", "filename", "mime", "declared"),
     [

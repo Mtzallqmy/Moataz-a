@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import array
 import asyncio
+import math
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from app.errors import CancelledError, FFmpegError
 from app.services.composer import RenderAsset, RenderPlan
 from app.services.media import probe_media_file
 from app.services.renderers.ffmpeg_renderer import FFmpegRenderer
+from app.services.timeline import new_timeline
 
 
 def _run(*args: str) -> None:
@@ -158,6 +162,159 @@ def _settings(tmp_path: Path) -> Settings:
         max_project_duration_seconds=300,
         max_render_duration_seconds=300,
     )
+
+
+def _audio_rms(path: Path, *, start: float = 0, duration: float = 0.2) -> float:
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            str(start),
+            "-i",
+            str(path),
+            "-t",
+            str(duration),
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    samples = array.array("h")
+    samples.frombytes(result.stdout)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return 0
+    return math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+
+
+def _timeline_audio_plan(
+    video: Path,
+    *,
+    duration: float,
+    original_audio_enabled: bool = True,
+    volume_ranges: list[dict[str, float]] | None = None,
+    replacement: Path | None = None,
+) -> RenderPlan:
+    timeline = new_timeline(320, 180, 24)
+    timeline["tracks"][0]["clips"] = [
+        {
+            "id": "video",
+            "asset_id": 1,
+            "asset_type": "video",
+            "start": 0,
+            "source_start": 0,
+            "duration": duration,
+            "speed": 1,
+            "volume": 1,
+            "volume_ranges": volume_ranges or [],
+            "original_audio_enabled": original_audio_enabled,
+            "fade_in": 0,
+            "fade_out": 0,
+            "fit_mode": "fit",
+            "position": 0,
+            "role": "main",
+            "keyframes": [],
+            "transition_out": {"type": "none", "duration": 0},
+        }
+    ]
+    assets = [_asset(1, video, "video", duration=duration)]
+    if replacement is not None:
+        timeline["tracks"][1]["clips"] = [
+            {
+                "id": "replacement",
+                "asset_id": 2,
+                "asset_type": "audio",
+                "start": 0,
+                "source_start": 0,
+                "duration": duration,
+                "speed": 1,
+                "volume": 0.7,
+                "volume_ranges": [],
+                "fade_in": 0,
+                "fade_out": 0,
+                "fit_mode": "fit",
+                "position": 0,
+                "role": "voice",
+                "keyframes": [],
+                "transition_out": {"type": "none", "duration": 0},
+            }
+        ]
+        assets.append(_asset(2, replacement, "audio", duration=duration, role="voice"))
+    return RenderPlan(
+        project_id=7100,
+        user_id=8100,
+        template="timeline",
+        width=320,
+        height=180,
+        fps=24,
+        aspect_ratio="16:9",
+        fit_mode="fit",
+        transition="none",
+        audio_mode="mix_audio",
+        logo_position="top-right",
+        assets=tuple(assets),
+        expected_duration=duration,
+        timeline=timeline,
+    )
+
+
+@pytest.mark.asyncio
+async def test_timeline_can_remove_original_audio_completely(tmp_path: Path) -> None:
+    video = _video(tmp_path / "mute-source.mp4", 1.2)
+    result = await FFmpegRenderer(_settings(tmp_path)).render(
+        _timeline_audio_plan(video, duration=1.2, original_audio_enabled=False),
+        render_job_id=910,
+    )
+    probe = await probe_media_file(result.output_path)
+    assert probe.has_video and probe.has_audio
+    assert _audio_rms(result.output_path, start=0.2, duration=0.5) < 10
+
+
+@pytest.mark.asyncio
+async def test_timeline_can_replace_video_audio(tmp_path: Path) -> None:
+    video = _video(tmp_path / "replace-source.mp4", 1.2)
+    replacement = _audio(tmp_path / "replacement.mp3", 1.2)
+    result = await FFmpegRenderer(_settings(tmp_path)).render(
+        _timeline_audio_plan(
+            video,
+            duration=1.2,
+            original_audio_enabled=False,
+            replacement=replacement,
+        ),
+        render_job_id=911,
+    )
+    probe = await probe_media_file(result.output_path)
+    assert probe.has_video and probe.has_audio
+    assert _audio_rms(result.output_path, start=0.2, duration=0.5) > 100
+
+
+@pytest.mark.asyncio
+async def test_timeline_partial_mute_is_applied_to_rendered_audio(tmp_path: Path) -> None:
+    video = _video(tmp_path / "partial-mute-source.mp4", 1.4)
+    result = await FFmpegRenderer(_settings(tmp_path)).render(
+        _timeline_audio_plan(
+            video,
+            duration=1.4,
+            volume_ranges=[{"start": 0.4, "end": 1.0, "volume": 0}],
+        ),
+        render_job_id=912,
+    )
+    audible = _audio_rms(result.output_path, start=0.1, duration=0.2)
+    muted = _audio_rms(result.output_path, start=0.55, duration=0.25)
+    assert audible > 100
+    assert muted < audible * 0.1
 
 
 @pytest.mark.asyncio
