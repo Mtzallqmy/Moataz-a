@@ -6,7 +6,12 @@ from pathlib import Path
 
 from app.config import Settings
 from app.errors import CancelledError
-from app.services.download_backends.base import BackendUnavailableError, DownloadBackend, DownloadRequest, NormalizedMediaResult
+from app.services.download_backends.base import (
+    BackendUnavailableError,
+    DownloadBackend,
+    DownloadRequest,
+    NormalizedMediaResult,
+)
 from app.services.media import probe_media_file
 
 _IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"RIFF", b"GIF87a", b"GIF89a")

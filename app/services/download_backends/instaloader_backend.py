@@ -8,11 +8,17 @@ from urllib.parse import urlsplit
 
 from app.config import Settings
 from app.errors import MediaError
-from app.services.download_backends.base import BackendUnavailableError, DownloadBackend, DownloadRequest, NormalizedMediaResult
+from app.services.download_backends.base import (
+    BackendUnavailableError,
+    DownloadBackend,
+    DownloadRequest,
+    NormalizedMediaResult,
+)
 
 
 class InstagramSessionRequiredError(MediaError):
     from app.errors import ErrorCode
+
     code = ErrorCode.AUTH_REQUIRED
 
 
@@ -87,6 +93,7 @@ class InstaloaderBackend(DownloadBackend):
                 duration=float(post.video_duration) if post.is_video and post.video_duration else None,
                 metadata={"media_id": str(post.mediaid), "shortcode": post.shortcode},
             )
+
         return await asyncio.to_thread(run)
 
     async def download(self, request: DownloadRequest) -> NormalizedMediaResult:
@@ -109,8 +116,6 @@ class InstaloaderBackend(DownloadBackend):
                     item = instaloader.StoryItem.from_mediaid(loader.context, int(media_match.group(1)))
                     loader.download_storyitem(item, request.output_dir)
                     return
-                # Highlight APIs require profile traversal; deliberately refuse ambiguous URLs
-                # instead of downloading a full profile/highlight collection accidentally.
                 raise BackendUnavailableError("Single Instagram Highlight item URLs are not safely resolvable by Instaloader")
             post = instaloader.Post.from_shortcode(loader.context, self._shortcode(request.url))
             loader.download_post(post, target=request.output_dir)
@@ -118,8 +123,11 @@ class InstaloaderBackend(DownloadBackend):
         try:
             await asyncio.to_thread(run)
             files = [
-                p for p in sorted(request.output_dir.rglob("*"))
-                if p.is_file() and p.resolve() not in before and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".mp4", ".webp"}
+                p
+                for p in sorted(request.output_dir.rglob("*"))
+                if p.is_file()
+                and p.resolve() not in before
+                and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".mp4", ".webp"}
             ]
             if not files:
                 raise RuntimeError("Instaloader produced no media files")
@@ -127,6 +135,7 @@ class InstaloaderBackend(DownloadBackend):
                 raise RuntimeError("Instaloader outputs exceed configured download limit")
             if request.cancel_event is not None and request.cancel_event.is_set():
                 from app.errors import CancelledError
+
                 raise CancelledError("Instaloader download cancelled")
             return NormalizedMediaResult(self.name, "instagram", request.media_type, files=files)
         except Exception:
