@@ -131,6 +131,38 @@ class DownloadManager:
     async def probe(self, url: str, media_type: str | None = None) -> NormalizedMediaResult:
         return await self._execute(url, media_type, None)
 
+    async def expand_playlist(self, url: str, *, limit: int | None = None) -> list[dict[str, object]]:
+        attempts: list[dict[str, str]] = []
+        last_error: BaseException | None = None
+        had_candidate = False
+        async for detected, backend in self._candidates(url, "playlist"):
+            had_candidate = True
+            try:
+                entries = await backend.expand_playlist(url, limit=limit)
+                self.router.health.success(backend.name, detected.platform)
+                attempts.append({"backend": backend.name, "result": "SUCCESS"})
+                self.last_attempts = tuple(attempts)
+                logger.info(
+                    "job=- platform=%s backend=%s result=SUCCESS fallback_count=%s",
+                    detected.platform,
+                    backend.name,
+                    len(attempts) - 1,
+                )
+                return entries
+            except Exception as exc:
+                last_error = exc
+                error = classify_error(exc)
+                attempts.append({"backend": backend.name, "result": error.code.value})
+                self.router.health.failure(backend.name, detected.platform, error)
+                if not self.router.allows_fallback(exc):
+                    break
+        self.last_attempts = tuple(attempts)
+        if last_error is not None:
+            raise last_error
+        if not had_candidate:
+            raise BackendUnavailableError("No configured download backend supports playlists for this URL")
+        raise BackendUnavailableError("All configured playlist backends failed")
+
     async def download(self, request: DownloadRequest) -> NormalizedMediaResult:
         return await self._execute(request.url, request.media_type, request)
 
@@ -143,6 +175,7 @@ class DownloadManager:
         attempts: list[dict[str, str]] = []
         last_error: BaseException | None = None
         had_candidate = False
+        job_key = request.job_key if request and request.job_key else "-"
         async for detected, backend in self._candidates(url, media_type):
             had_candidate = True
             try:
@@ -151,7 +184,8 @@ class DownloadManager:
                 attempts.append({"backend": backend.name, "result": "SUCCESS"})
                 self.last_attempts = tuple(attempts)
                 logger.info(
-                    "platform=%s backend=%s result=SUCCESS fallback_count=%s",
+                    "job=%s platform=%s backend=%s result=SUCCESS fallback_count=%s",
+                    job_key,
                     detected.platform,
                     backend.name,
                     len(attempts) - 1,
@@ -159,6 +193,8 @@ class DownloadManager:
                 result.provider = backend.name
                 result.platform = detected.platform
                 result.metadata.setdefault("attempted_backends", attempts.copy())
+                result.metadata.setdefault("successful_backend", backend.name)
+                result.metadata.setdefault("normalized_error", None)
                 result.metadata.setdefault("fallback_count", len(attempts) - 1)
                 return result
             except Exception as exc:
@@ -167,10 +203,12 @@ class DownloadManager:
                 attempts.append({"backend": backend.name, "result": error.code.value})
                 self.router.health.failure(backend.name, detected.platform, error)
                 logger.warning(
-                    "platform=%s backend=%s result=%s fallback=%s detail=%s",
+                    "job=%s platform=%s backend=%s result=%s fallback_count=%s fallback=%s detail=%s",
+                    job_key,
                     detected.platform,
                     backend.name,
                     error.code.value,
+                    len(attempts) - 1,
                     self.router.allows_fallback(exc),
                     redact_secrets(exc)[:1000],
                 )

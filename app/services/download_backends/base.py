@@ -25,6 +25,7 @@ class DownloadRequest:
     job_key: str = ""
     cancel_event: threading.Event | None = None
     progress_hook: ProgressHook | None = None
+    known_qualities: tuple[int, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -66,6 +67,9 @@ class DownloadBackend:
 
     async def list_formats(self, url: str) -> list[dict[str, Any]]:
         return (await self.probe(url)).formats
+
+    async def expand_playlist(self, url: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        raise BackendUnavailableError(f"{self.name} does not support playlists")
 
     async def download(self, request: DownloadRequest) -> NormalizedMediaResult:
         raise BackendUnavailableError(f"{self.name} does not support downloads")
