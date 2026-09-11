@@ -71,6 +71,11 @@ Status: **IMPLEMENTED — local acceptance gate passing; GitHub CI required befo
 - Provider-neutral Telegram editing agent using native tool calls or validated Structured JSON fallback.
 - Persistent per-project Agent conversation context and ownership validation.
 - Low-resolution bounded preview renders followed by continued editing or final export.
+- Guided Telegram project sessions with explicit collecting, instruction, analysis, planning, editing, preview, feedback, final-render and completed phases.
+- Batched media collection summaries, automatic media classification and explicit recent-asset references for follow-up instructions.
+- Dedicated cut/split, audio, captions and previous-project workflows on the same Timeline engine.
+- Provider-neutral optional Vision enrichment of cached scene thumbnails, with persisted descriptions/focus points and safe local-analysis fallback.
+- Deterministic expansion of scene splitting, 30/60-second splitting, silence removal, best-moment selection, audio replacement and ducking from validated analysis/context.
 - Optional renderer abstraction remains ready for a future Remotion sidecar; Node is not required.
 
 Status: **IMPLEMENTED — CI and a supervised real-Telegram smoke test required before merge**.
