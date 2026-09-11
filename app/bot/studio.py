@@ -18,6 +18,7 @@ from app.bot.access import ensure_user, is_allowed
 from app.bot.uploads import download_upload, upload_candidate
 from app.config import get_settings
 from app.db import MediaProject, ProjectStatus, RenderStatus, User
+from app.errors import classify_error, user_error_message
 from app.render_queue import cancel_render, enqueue_render
 from app.services.ai_registry import get_ai_provider_registry
 from app.services.assets import AssetService, asset_service
@@ -380,6 +381,9 @@ def _safe_studio_error(exc: Exception, *, agent: bool = False) -> str:
         return "مدة المادة أو التعديل تتجاوز الحدود المسموحة."
     if isinstance(exc, LookupError):
         return "المشروع أو المادة لم تعد متاحة."
+    download_error = classify_error(exc)
+    if download_error.code.value not in {"UNKNOWN", "DATABASE_ERROR", "STORAGE_ERROR"}:
+        return user_error_message(download_error)
     if agent:
         return "تعذر تطبيق التعليمات بأمان. حاول صياغتها بخطوة واحدة مع تحديد رقم المقطع."
     return "تعذر قبول الملف بسبب خطأ داخلي مؤقت. حاول إرساله مرة أخرى."
@@ -894,7 +898,7 @@ async def receive_project_url(message: Message, state: FSMContext) -> None:
             if asset is not None:
                 with suppress(Exception):
                     await asset_service.delete_unattached_asset(asset.id, user_id=user.id)
-            failures.append(str(exc)[:100])
+            failures.append(_safe_studio_error(exc))
     text = f"✅ تمت إضافة {added} رابط إلى Project #{project_id}."
     if failures:
         text += f"\nتعذر {len(failures)}: {failures[0]}"

@@ -14,7 +14,7 @@ from sqlalchemy import select
 from app.bot.client import create_bot
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User, WorkerNode
-from app.errors import CancelledError, ErrorCode, classify_error, retry_delay
+from app.errors import CancelledError, ErrorCode, classify_error, retry_delay, user_error_message
 from app.jobs import is_job_cancelled, record_job_event, set_job_status
 from app.progress import ProgressSnapshot
 from app.security import redact_secrets
@@ -354,7 +354,7 @@ async def process_download(job_id: int) -> None:
             )
             await _edit_status(
                 job_id,
-                f"Job #{job_id}\nStatus: FAILED ❌\nError: {info.code.value}",
+                f"Job #{job_id}\nStatus: FAILED ❌\n{user_error_message(info)}",
                 markup=_retry_markup(job_id),
             )
     finally:

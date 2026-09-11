@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     ytdlp_retries: int = 2
     ytdlp_fragment_retries: int = 3
     ytdlp_concurrent_fragments: int = 4
+    ytdlp_cookies_file: Path | None = None
+    ytdlp_cookies_b64: SecretStr | None = None
     job_max_retries: int = 2
     job_retry_base_seconds: float = 4.0
     job_retry_cap_seconds: float = 45.0

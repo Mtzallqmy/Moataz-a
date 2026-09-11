@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.db import DownloadJob, JobEvent, JobStatus, MediaMetadata, SessionLocal, User, WorkerNode
-from app.errors import classify_error
+from app.errors import classify_error, user_error_message
 from app.jobs import RUNNING_STATUSES, set_job_status
 from app.operations import readiness_snapshot
 from app.queue import cancel_download
@@ -219,7 +219,7 @@ async def analyze_media(payload: AnalyzeRequest, request: Request, _: str = Depe
             )
         except Exception as exc:
             info = classify_error(exc)
-            results.append({"url": url, "error": info.code.value})
+            results.append({"url": url, "error": info.code.value, "message": user_error_message(info)})
     return {"items": results, "duplicates": parsed.duplicates, "rejected": parsed.rejected}
 
 
@@ -284,7 +284,7 @@ async def dashboard_expand_playlist(job_id: int, payload: PlaylistRequest, reque
         entries = await asyncio.to_thread(downloader.expand_playlist, parent_url, limit=settings.max_playlist_items)
     except Exception as exc:
         info = classify_error(exc)
-        raise HTTPException(status_code=400, detail=info.code.value) from exc
+        raise HTTPException(status_code=400, detail=user_error_message(info)) from exc
     child_ids: list[int] = []
     for entry in entries:
         child, _child_info = await analyze_and_create_job(

@@ -12,7 +12,7 @@ from sqlalchemy import select
 from app.bot.access import ensure_user, is_allowed
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
-from app.errors import classify_error
+from app.errors import classify_error, user_error_message
 from app.i18n import tr
 from app.jobs import TERMINAL_STATUSES, record_job_event, set_job_status
 from app.queue import cancel_download
@@ -193,7 +193,7 @@ async def _analyze_one(message: Message, user: User, url: str) -> None:
         await _present_info(message, progress, job, info)
     except Exception as exc:
         error = classify_error(exc)
-        await progress.edit_text(tr(user.language, "failed", code=error.code.value))
+        await progress.edit_text(tr(user.language, "failed", message=user_error_message(error, user.language)))
 
 
 async def _owned_job(callback: CallbackQuery, job_id: int) -> tuple[DownloadJob, User] | None:
@@ -426,7 +426,7 @@ async def expand_playlist(callback: CallbackQuery) -> None:
     except Exception as exc:
         error = classify_error(exc)
         if callback.message:
-            await callback.message.edit_text(f"Playlist expansion failed: {error.code.value}")
+            await callback.message.edit_text(user_error_message(error, user.language))
         return
 
     queued_ids: list[int] = []
