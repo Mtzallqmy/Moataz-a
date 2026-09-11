@@ -51,10 +51,12 @@ class PlatformDetector:
             platform = "generic"
 
         kind = media_type or "video"
-        if platform == "instagram" and "/stories/" in path:
-            kind = "story"
-        elif platform == "instagram" and "/highlights/" in path:
+        if platform == "instagram" and (
+            "/stories/highlights/" in path or "/highlights/" in path
+        ):
             kind = "highlight"
+        elif platform == "instagram" and "/stories/" in path:
+            kind = "story"
         elif platform == "tiktok" and "/story/" in path:
             kind = "story"
         elif any(value in path for value in ("/p/", "/photo/", "/photos/", "/pin/")):
