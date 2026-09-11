@@ -32,6 +32,10 @@ _REQUIRED_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "set_duration": ("clip_id", "duration"),
     "set_speed": ("clip_id", "speed"),
     "set_volume": ("clip_id", "volume"),
+    "set_volume_range": ("clip_id", "start", "end", "volume"),
+    "set_original_audio": ("clip_id", "enabled"),
+    "replace_clip_audio": ("clip_id", "audio_asset_id"),
+    "duck_background_music": ("clip_id",),
     "set_fades": ("clip_id",),
     "set_transform": ("clip_id",),
     "add_transition": ("clip_id", "type"),
@@ -75,6 +79,10 @@ AGENT_TOOLS: list[dict[str, Any]] = [
     _tool("set_duration", "Set a clip duration.", {"clip_id": {"type": "string"}, "duration": {"type": "number"}}),
     _tool("set_speed", "Set playback speed from 0.25 to 4.", {"clip_id": {"type": "string"}, "speed": {"type": "number"}}),
     _tool("set_volume", "Set audio volume from 0 to 2.", {"clip_id": {"type": "string"}, "volume": {"type": "number"}}),
+    _tool("set_volume_range", "Set or mute a clip's audio only within a relative time range.", {"clip_id": {"type": "string"}, "start": {"type": "number"}, "end": {"type": "number"}, "volume": {"type": "number"}}),
+    _tool("set_original_audio", "Enable or completely remove a video clip's original audio.", {"clip_id": {"type": "string"}, "enabled": {"type": "boolean"}, "volume": {"type": "number"}}),
+    _tool("replace_clip_audio", "Replace one video clip's original audio with an attached audio or voice asset; optionally mix the original.", {"clip_id": {"type": "string"}, "audio_asset_id": {"type": "integer"}, "volume": {"type": "number"}, "mix_original": {"type": "boolean"}}),
+    _tool("duck_background_music", "Lower a music clip during overlapping voice clips.", {"clip_id": {"type": "string"}, "volume": {"type": "number"}, "release": {"type": "number"}}),
     _tool("set_fades", "Set media fade-in and fade-out seconds.", {"clip_id": {"type": "string"}, "fade_in": {"type": "number"}, "fade_out": {"type": "number"}}),
     _tool("set_transform", "Set crop, scale, and normalized position.", {"clip_id": {"type": "string"}, "scale": {"type": "number"}, "x": {"type": "number"}, "y": {"type": "number"}, "crop": {"type": "object"}}),
     _tool("add_transition", "Add fade, dissolve, slide, wipe, zoom, blur, push, or dip-to-black.", {"clip_id": {"type": "string"}, "type": {"type": "string"}, "duration": {"type": "number"}}),
@@ -288,6 +296,9 @@ class StudioAgentService:
             "a new project. You cannot run shell commands or FFmpeg. Use only the supplied deterministic "
             "tools. Asset IDs and clip IDs must come from the timeline. For every clip-targeting tool, "
             "copy a non-empty exact clip id from the timeline; never invent or omit it. Make conservative, reversible edits. "
+            "For full video mute use set_original_audio(enabled=false); for a timed mute use "
+            "set_volume_range(volume=0). Use replace_clip_audio for a specific video and attached "
+            "audio/voice asset. Use duck_background_music to lower music during overlapping voice. "
             "When the user asks to see the result, request render_preview; request render_final only when explicit. "
             f"Current renderer-neutral Timeline JSON: {compact}"
         )

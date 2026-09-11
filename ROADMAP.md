@@ -63,6 +63,8 @@ Status: **IMPLEMENTED — local acceptance gate passing; GitHub CI required befo
 ### Intelligent Media Studio — Timeline V2
 
 - Renderer-neutral, versioned multitrack Timeline JSON with visual, audio, overlay, text and subtitle tracks.
+- Per-clip original-audio removal, timed volume envelopes, safe audio replacement/mixing and voice-aware music ducking.
+- Reopen completed projects, extend their assets and render a new revision without mutating prior outputs.
 - Deterministic editing commands for trim, split, move, reorder, duration, speed, volume, fades, transforms, canvas, fit modes and extensible keyframes.
 - Fade, dissolve, slide, wipe, zoom, blur, push and dip-to-black transitions.
 - Project timeline revisions with atomic undo/redo.

@@ -151,3 +151,26 @@ async def test_concurrent_duplicate_asset_addition_is_idempotent(tmp_path: Path)
     items = await projects.list_assets(project.id, user_id=user.id)
     assert len(items) == 1
     assert items[0].link.position == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_project_can_be_reopened_and_extended_without_losing_timeline(
+    tmp_path: Path,
+) -> None:
+    user, image, audio = await _fixture_assets(tmp_path)
+    projects = ProjectService()
+    project = await projects.create_project(user_id=user.id, chat_id=791)
+    await projects.add_asset(project.id, image.id, user_id=user.id)
+    async with database.SessionLocal() as session:
+        stored = await session.get(database.MediaProject, project.id)
+        assert stored is not None
+        stored.status = database.ProjectStatus.COMPLETED.value
+        before = stored.timeline_json
+        await session.commit()
+
+    reopened = await projects.reopen_project(project.id, user_id=user.id)
+    assert reopened.status == database.ProjectStatus.READY.value
+    assert reopened.timeline_json == before
+    await projects.add_asset(project.id, audio.id, user_id=user.id)
+    items = await projects.list_assets(project.id, user_id=user.id)
+    assert [item.asset.id for item in items] == [image.id, audio.id]

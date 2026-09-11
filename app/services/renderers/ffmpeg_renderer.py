@@ -274,19 +274,23 @@ class FFmpegRenderer(BaseRenderer):
             for clip in track.get("clips") or []
             if isinstance(clip, dict) and str(clip.get("id")) in input_indexes
         ]
-        replace_original = plan.audio_mode == "replace_audio" and explicit_audio
         audio_sources = list(explicit_audio)
-        if not replace_original:
-            audio_sources.extend(
-                clip
-                for clip in visual_clips
-                if (
-                    (asset := assets.get(int(clip.get("asset_id") or 0))) is not None
-                    and asset.asset_type == "video"
-                    and probes.get(asset.asset_id) is not None
-                    and probes[asset.asset_id].has_audio
+        audio_sources.extend(
+            clip
+            for clip in visual_clips
+            if (
+                (asset := assets.get(int(clip.get("asset_id") or 0))) is not None
+                and asset.asset_type == "video"
+                and probes.get(asset.asset_id) is not None
+                and probes[asset.asset_id].has_audio
+                and clip.get("original_audio_enabled", True)
+                and not (
+                    plan.audio_mode == "replace_audio"
+                    and explicit_audio
+                    and "original_audio_enabled" not in clip
                 )
             )
+        )
         for index, clip in enumerate(audio_sources):
             input_index = input_indexes[str(clip["id"])]
             speed = float(clip.get("_render_speed") or clip.get("speed") or 1)
@@ -294,9 +298,25 @@ class FFmpegRenderer(BaseRenderer):
             volume = min(2.0, max(0.0, float(clip.get("volume") or 0)))
             delay = max(0, int(float(clip.get("start") or 0) * 1000))
             label = f"tla{index}"
+            source_start = max(0.0, float(clip.get("source_start") or 0))
+            source_end = source_start + duration * speed
+            volume_expression = f"{volume:.6f}"
+            for volume_range in clip.get("volume_ranges") or []:
+                range_start = max(0.0, float(volume_range.get("start") or 0))
+                range_end = min(duration, float(volume_range.get("end") or 0))
+                range_volume = min(
+                    2.0, max(0.0, float(volume_range.get("volume") or 0))
+                )
+                if range_end > range_start:
+                    volume_expression = (
+                        f"if(between(t,{range_start:.6f},{range_end:.6f}),"
+                        f"{range_volume:.6f},{volume_expression})"
+                    )
             chain = (
-                f"atrim=duration={duration * speed:.6f},asetpts=(PTS-STARTPTS)/{speed:.6f},"
-                f"aresample=48000,aformat=channel_layouts=stereo,volume={volume:.6f}"
+                f"atrim=start={source_start:.6f}:end={source_end:.6f},"
+                f"asetpts=(PTS-STARTPTS)/{speed:.6f},"
+                "aresample=48000,aformat=channel_layouts=stereo,"
+                f"volume='{volume_expression}':eval=frame"
             )
             fade_in = min(float(clip.get("fade_in") or 0), duration / 2)
             fade_out = min(float(clip.get("fade_out") or 0), duration / 2)

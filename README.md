@@ -62,11 +62,11 @@ Railway يمرر `PORT` تلقائيًا، والتطبيق يستخدمه مب�
 
 زر **🤖 مونتاج بالذكاء الاصطناعي** داخل المشروع يربط المشروع بأي نموذج نصي مفعّل في `AIProviderRegistry`. يمكن متابعة رفع الملفات والصور والصوت والـvoice والروابط في الوضع نفسه، ثم كتابة تعليمات طبيعية لتعديل المشروع الحالي بدل إنشاء نتيجة جديدة.
 
-مصدر الحقيقة هو Timeline JSON مستقل عن FFmpeg وTelegram. يدعم مسارات visual/audio/overlay/text/subtitle، وعمليات trim/split/move/reorder، السرعة والصوت وfade، crop/scale/position، canvas وfit modes، الانتقالات، النصوص والترجمة، Intro/Main/Outro، keyframes قابلة للتوسعة، ونسخ revisions كاملة مع undo/redo. كل مجموعة تعديلات من Agent تحفظ كعملية ذرية قابلة للمراجعة والتراجع.
+مصدر الحقيقة هو Timeline JSON مستقل عن FFmpeg وTelegram. يدعم مسارات visual/audio/overlay/text/subtitle، وعمليات trim/split/move/reorder، السرعة والصوت وfade، crop/scale/position، canvas وfit modes، الانتقالات، النصوص والترجمة، Intro/Main/Outro، keyframes قابلة للتوسعة، ونسخ revisions كاملة مع undo/redo. يمكن إزالة الصوت الأصلي من فيديو كامل، أو خفضه/كتمه ضمن نطاق زمني، واستبداله بملف Audio/Voice مع خيار المزج، وخفض الموسيقى تلقائيًا أثناء Voice متداخل. كل مجموعة تعديلات من Agent تحفظ كعملية ذرية قابلة للمراجعة والتراجع.
 
 الـAI لا يحصل على shell ولا يبني FFmpeg command. النموذج يستدعي catalog أدوات محددة، ثم يتحقق `TimelineService` من الأداة والملكية والأنواع والحدود قبل تعديل Timeline. النماذج التي تدعم native tool calling تستخدمه، والبقية تستخدم Structured JSON مع تحقق وإعادة محاولة محدودة. مفاتيح المزود تبقى في متغيرات البيئة ولا تُكتب في Timeline أو سجل المحادثة.
 
-يمكن طلب **معاينة** قصيرة منخفضة الدقة ثم متابعة المحادثة والتعديل، أو طلب **تصدير نهائي**. FFmpegRenderer يترجم Timeline إلى filter graph آمن ويدعم compositing للنصوص والشعارات والترجمة والمزج متعدد المسارات. Remotion ليس dependency؛ واجهة `BaseRenderer` تبقي إضافة renderer اختياري لاحقًا ممكنة.
+يمكن طلب **معاينة** قصيرة منخفضة الدقة ثم متابعة المحادثة والتعديل، أو طلب **تصدير نهائي**. ومن **مشاريعي** يمكن إعادة فتح مشروع مكتمل، إضافة مواد جديدة وإعادة ترتيبها ثم رندره مجددًا؛ يظل ملف الرندر السابق مستقلًا ولا تُعدّل الأصول الأصلية. FFmpegRenderer يترجم Timeline إلى filter graph آمن ويدعم compositing للنصوص والشعارات والترجمة والمزج متعدد المسارات. Remotion ليس dependency؛ واجهة `BaseRenderer` تبقي إضافة renderer اختياري لاحقًا ممكنة.
 
 اعتمد التصميم على فصل Timeline/commands الموجود في OpenChatCut وفكرة composition/op-log في MakeMyClip كمرجع معماري فقط. لم يُنسخ كود AGPL من OpenChatCut.
 
@@ -150,4 +150,4 @@ python -m compileall -q app tests
 pytest -q
 ```
 
-الاختبارات لا تعتمد على Telegram أو YouTube أو AI provider حي. وهي تغطي أيضًا fixtures مولدة بـFFmpeg لكل قوالب الاستوديو، Timeline متعدد المسارات، الانتقالات الثمانية، النصوص والترجمة والـoverlays، revisions وundo/redo، Agent tool validation وStructured JSON/native tools، preview، نسب العرض وfit modes، الفيديو الصامت واختلاف FPS/المقاسات، تقدم FFmpeg، الإلغاء والتنظيف، recovery بعد restart، ownership، Telegram uploads، URL ingestion، وفشل التسليم دون تحويل render ناجح إلى FAILED.
+الاختبارات لا تعتمد على Telegram أو YouTube أو AI provider حي. وهي تغطي أيضًا fixtures مولدة بـFFmpeg لكل قوالب الاستوديو، Timeline متعدد المسارات، الانتقالات الثمانية، النصوص والترجمة والـoverlays، كتم واستبدال الصوت والنطاقات الزمنية، revisions وundo/redo، إعادة فتح المشروع، Agent tool validation وStructured JSON/native tools، preview، نسب العرض وfit modes، الفيديو الصامت واختلاف FPS/المقاسات، تقدم FFmpeg، الإلغاء والتنظيف، recovery بعد restart، ownership، Telegram uploads، URL ingestion، وفشل التسليم دون تحويل render ناجح إلى FAILED.

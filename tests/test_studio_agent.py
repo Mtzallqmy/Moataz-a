@@ -186,6 +186,9 @@ def test_agent_tool_schemas_mark_clip_targets_as_required() -> None:
     assert "source_end" in schemas["trim_clip"]["required"]
     assert "clip_id" in schemas["add_transition"]["required"]
     assert "text" in schemas["add_text"]["required"]
+    assert schemas["set_original_audio"]["required"] == ["clip_id", "enabled"]
+    assert schemas["replace_clip_audio"]["required"] == ["clip_id", "audio_asset_id"]
+    assert schemas["set_volume_range"]["required"] == ["clip_id", "start", "end", "volume"]
 
 
 @pytest.mark.asyncio
@@ -221,6 +224,38 @@ async def test_agent_safely_resolves_missing_clip_id_when_only_one_clip_exists(
     visual = reply.timeline["tracks"][0]["clips"]
     assert visual[0]["source_start"] == 1
     assert visual[0]["duration"] == 7
+
+
+@pytest.mark.asyncio
+async def test_agent_natural_mute_command_uses_safe_timeline_tool(tmp_path) -> None:
+    user_id, project_id = await _project_with_video(tmp_path)
+
+    class NativeRegistry(StructuredRegistry):
+        async def chat_tools(self, provider_id, model, messages, tools):
+            return ToolChatReply(
+                text="حذفت الصوت الأصلي",
+                model=model,
+                tool_calls=(
+                    {
+                        "name": "set_original_audio",
+                        "arguments": {"enabled": False},
+                    },
+                ),
+            )
+
+    reply = await StudioAgentService(
+        registry=NativeRegistry([]), timelines=TimelineService()
+    ).handle(
+        project_id,
+        user_id=user_id,
+        instruction="احذف صوت الفيديو",
+        provider_id="any-provider",
+        model="tool-model",
+        native_tools=True,
+    )
+    visual = reply.timeline["tracks"][0]["clips"]
+    assert visual[0]["original_audio_enabled"] is False
+    assert reply.applied_tools == ("set_original_audio",)
 
 
 def test_agent_rejects_shell_and_unknown_tools_before_dispatch() -> None:
