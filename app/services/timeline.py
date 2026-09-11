@@ -186,10 +186,17 @@ def _text(value: object, name: str, *, maximum: int = 500) -> str:
 
 def _asset_clip(asset: MediaAsset, *, role: str, position: int) -> tuple[str, dict[str, Any]]:
     duration = float(asset.duration or 4.0)
+    try:
+        metadata = json.loads(asset.metadata_json or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
     base = {
         "id": f"asset-{asset.id}",
         "asset_id": asset.id,
         "asset_type": asset.asset_type,
+        "asset_name": str(
+            metadata.get("original_name") or metadata.get("title") or ""
+        )[:255],
         "start": 0.0,
         "source_start": 0.0,
         "duration": duration,

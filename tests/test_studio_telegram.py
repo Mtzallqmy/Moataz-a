@@ -62,6 +62,64 @@ def _video(path: Path) -> Path:
     return path
 
 
+def _callbacks(markup) -> set[str]:
+    return {
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+
+def test_studio_home_and_collection_expose_guided_workflows() -> None:
+    home = _callbacks(studio.studio_home_keyboard())
+    assert {
+        "studio:workflow:smart_edit",
+        "studio:workflow:cut",
+        "studio:workflow:audio",
+        "studio:workflow:captions",
+        "studio:reopen",
+        "studio:projects",
+    } <= home
+    collecting = _callbacks(studio.collecting_keyboard(17))
+    assert "studio:done:17" in collecting
+    assert "studio:summary:17" in collecting
+
+
+def test_cut_and_audio_workflows_expose_only_supported_operations() -> None:
+    cut = _callbacks(studio.workflow_instruction_keyboard(17, "cut"))
+    assert {
+        "studio:operation:17:trim",
+        "studio:operation:17:remove_range",
+        "studio:operation:17:split_30",
+        "studio:operation:17:split_60",
+        "studio:operation:17:split_scenes",
+        "studio:operation:17:remove_silence",
+        "studio:operation:17:best_moment",
+    } <= cut
+    audio = _callbacks(studio.workflow_instruction_keyboard(17, "audio"))
+    assert {
+        "studio:operation:17:mute_original",
+        "studio:operation:17:replace_audio",
+        "studio:operation:17:mix_audio",
+        "studio:operation:17:auto_duck",
+        "studio:operation:17:normalize",
+    } <= audio
+    assert not any("split" in value for value in audio)
+
+
+def test_feedback_controls_keep_project_context_and_revision_actions() -> None:
+    actions = _callbacks(studio.agent_keyboard(43))
+    assert {
+        "studio:agentrender:43:preview",
+        "studio:agentrender:43:final",
+        "studio:agentundo:43",
+        "studio:agentredo:43",
+        "studio:add:43",
+        "studio:summary:43",
+    } <= actions
+
+
 async def _user_project(settings: Settings) -> tuple[database.User, database.MediaProject]:
     await database.init_db()
     async with database.SessionLocal() as session:
@@ -87,12 +145,21 @@ async def _user_project(settings: Settings) -> tuple[database.User, database.Med
 class FakeState:
     def __init__(self, project_id: int) -> None:
         self.project_id = project_id
+        self.data = {
+            "studio_project_id": project_id,
+            "studio_phase": "COLLECTING_MEDIA",
+            "studio_workflow": "smart_edit",
+        }
 
     async def get_data(self):
-        return {"studio_project_id": self.project_id}
+        return dict(self.data)
+
+    async def update_data(self, **values):
+        self.data.update(values)
 
     async def clear(self):
         self.project_id = 0
+        self.data.clear()
 
 
 class DownloadBot:
@@ -250,11 +317,13 @@ async def test_telegram_upload_ingestion(
 
     monkeypatch.setattr(studio, "settings", settings)
     monkeypatch.setattr(studio, "_message_user", current_user)
+    monkeypatch.setattr(studio, "_schedule_project_summary", lambda *args, **kwargs: None)
     assets = AssetService(settings)
     projects = ProjectService(settings)
+    state = FakeState(project.id)
     await studio.ingest_upload_message(
         message,
-        FakeState(project.id),
+        state,
         assets=assets,
         projects=projects,
     )
@@ -262,6 +331,8 @@ async def test_telegram_upload_ingestion(
     assert len(linked) == 1
     assert linked[0].asset.asset_type == declared
     assert Path(linked[0].asset.local_path).is_file()
+    assert state.data["recent_asset_id"] == linked[0].asset.id
+    assert not any("تعذر قبول الملف" in answer for answer in message.answers)
     assert not list(settings.render_temp_dir.glob("telegram-upload-*"))
 
 

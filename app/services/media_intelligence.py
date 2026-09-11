@@ -315,6 +315,14 @@ class MediaIntelligenceService:
             "source_fingerprint": fingerprint,
             "asset_id": asset.id,
             "asset_type": asset.asset_type,
+            "identity": {
+                "name": str(
+                    source_metadata.get("original_name")
+                    or source_metadata.get("title")
+                    or source.name
+                )[:255],
+                "source_type": asset.source_type,
+            },
             "quality": {
                 "duration": duration,
                 "width": asset.width,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -191,6 +192,8 @@ class StudioAgentService:
         provider_id: str,
         model: str,
         native_tools: bool = False,
+        project_context: dict[str, Any] | None = None,
+        stage_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> StudioAgentReply:
         instruction = instruction.strip()
         if not instruction or len(instruction) > 8000:
@@ -198,7 +201,7 @@ class StudioAgentService:
         timeline = await self.timelines.get(project_id, user_id=user_id)
         history = await self._history(project_id, user_id=user_id)
         await self._store(project_id, "user", instruction, provider_id, model)
-        system = self._system_prompt(timeline)
+        system = self._system_prompt(timeline, project_context=project_context)
         messages: list[dict[str, object]] = [
             {"role": "system", "content": system},
             *history,
@@ -213,7 +216,11 @@ class StudioAgentService:
                 model=model,
                 timeline=timeline,
                 history=history,
+                project_context=project_context,
+                stage_callback=stage_callback,
             )
+        if stage_callback is not None:
+            await stage_callback("EDITING")
         calls: list[dict[str, Any]]
         response_text = ""
         response_model = model
@@ -263,13 +270,21 @@ class StudioAgentService:
         model: str,
         timeline: dict[str, Any],
         history: list[dict[str, object]],
+        project_context: dict[str, Any] | None,
+        stage_callback: Callable[[str], Awaitable[None]] | None,
     ) -> StudioAgentReply:
+        if stage_callback is not None:
+            await stage_callback("ANALYZING")
         intelligence = await self.intelligence.analyze_project(
             project_id, user_id=user_id
         )
+        if project_context:
+            intelligence = {**intelligence, "session_context": project_context}
         validation_feedback = ""
         calls: list[dict[str, Any]] = []
         plan = None
+        if stage_callback is not None:
+            await stage_callback("PLANNING")
         for attempt in range(2):
             plan = await self.planner.generate(
                 instruction,
@@ -294,6 +309,8 @@ class StudioAgentService:
         render_action = self._requested_render(instruction)
         if render_action:
             calls.append({"name": f"render_{render_action}", "arguments": {}})
+        if stage_callback is not None:
+            await stage_callback("EDITING")
         result = await self.timelines.apply(project_id, user_id=user_id, calls=calls)
         text = f"تم تطبيق خطة المونتاج: {plan.goal}"
         if plan.rationale:
@@ -404,8 +421,13 @@ class StudioAgentService:
             await session.commit()
 
     @staticmethod
-    def _system_prompt(timeline: dict[str, Any]) -> str:
+    def _system_prompt(
+        timeline: dict[str, Any], *, project_context: dict[str, Any] | None = None
+    ) -> str:
         compact = json.dumps(timeline, ensure_ascii=False, separators=(",", ":"))[:24_000]
+        context = json.dumps(
+            project_context or {}, ensure_ascii=False, separators=(",", ":")
+        )[:4000]
         return (
             "You are Moataz Media Studio's editing planner. Modify the existing project, never create "
             "a new project. You cannot run shell commands or FFmpeg. Use only the supplied deterministic "
@@ -414,8 +436,11 @@ class StudioAgentService:
             "For full video mute use set_original_audio(enabled=false); for a timed mute use "
             "set_volume_range(volume=0). Use replace_clip_audio for a specific video and attached "
             "audio/voice asset. Use duck_background_music to lower music during overlapping voice. "
+            "Resolve phrases such as 'this image', 'the latest audio', or 'the file I just sent' "
+            "only from session_context.recent_asset. If its ambiguous_type_count is greater than 1 "
+            "and the reference is not explicitly recent, ask the user to identify the asset instead of guessing. "
             "When the user asks to see the result, request render_preview; request render_final only when explicit. "
-            f"Current renderer-neutral Timeline JSON: {compact}"
+            f"Session context: {context}. Current renderer-neutral Timeline JSON: {compact}"
         )
 
 

@@ -94,6 +94,63 @@ def test_plan_rejects_unknown_assets_and_missing_transcription():
         compile_tool_calls(captions, _timeline(), {"assets": []})
 
 
+def test_plan_compiles_replace_and_ducking_audio_semantics():
+    timeline = _timeline()
+    timeline["tracks"][1]["clips"] = [
+        {
+            "id": "clip-voice",
+            "asset_id": 8,
+            "asset_type": "voice",
+            "role": "voice",
+            "start": 0,
+            "duration": 12,
+        },
+        {
+            "id": "clip-music",
+            "asset_id": 9,
+            "asset_type": "audio",
+            "role": "music",
+            "start": 0,
+            "duration": 12,
+        },
+    ]
+    intelligence = {
+        "assets": [
+            *_intelligence()["assets"],
+            {"asset_id": 8, "quality": {"duration": 12}},
+            {"asset_id": 9, "quality": {"duration": 12}},
+        ]
+    }
+    replace = EditPlan.from_payload(
+        _payload(
+            captions={"enabled": False},
+            selected_ranges=[],
+            audio={"mode": "replace", "voice_asset_id": 8},
+        )
+    )
+    replace_calls = compile_tool_calls(replace, timeline, intelligence)
+    replacement = next(
+        call for call in replace_calls if call["name"] == "replace_clip_audio"
+    )
+    assert replacement["arguments"]["audio_asset_id"] == 8
+    mix = EditPlan.from_payload(
+        _payload(
+            captions={"enabled": False},
+            selected_ranges=[],
+            audio={
+                "mode": "background_music",
+                "music_asset_id": 9,
+                "music_volume": 0.2,
+                "auto_duck": True,
+            },
+        )
+    )
+    names = [call["name"] for call in compile_tool_calls(mix, timeline, intelligence)]
+    assert "set_audio_mode" in names
+    assert "set_volume" in names
+    assert "duck_background_music" in names
+
+
 def test_style_and_caption_presets_return_isolated_copies():
     first = style("cinematic")
     first["music_level"] = 99

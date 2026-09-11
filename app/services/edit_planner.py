@@ -167,7 +167,8 @@ class AIEditPlanner:
             '"style_preset":"reels-fast","pacing":"fast","selected_ranges":'
             '[{"asset_id":1,"start":0,"end":3}],"removed_clip_ids":[],"transition":"slide",'
             '"captions":{"enabled":true,"preset":"reels-bold"},'
-            '"audio":{"mode":"keep","normalize":true,"auto_duck":false},'
+            '"audio":{"mode":"keep","voice_asset_id":null,"music_asset_id":null,'
+            '"original_volume":1.0,"music_volume":0.2,"normalize":true,"auto_duck":false},'
             '"texts":[],"overlays":[],"rationale":"..."}. '
             f"Allowed styles: {sorted(STYLE_PRESETS)}. "
             f"Media intelligence: {json.dumps(project_intelligence, ensure_ascii=False)[:24000]}. "
@@ -290,6 +291,81 @@ def compile_tool_calls(
             if clip.get("asset_type") == "video":
                 calls.append(
                     {"name": "set_original_audio", "arguments": {"clip_id": str(clip["id"]), "enabled": False}}
+                )
+    audio_clips = [
+        clip for clip in clips if clip.get("asset_type") in {"audio", "voice"}
+    ]
+    video_clips = [clip for clip in clips if clip.get("asset_type") == "video"]
+    voice_asset_id = int(plan.audio.get("voice_asset_id") or 0)
+    music_asset_id = int(plan.audio.get("music_asset_id") or 0)
+    attached_audio_ids = {int(clip.get("asset_id") or 0) for clip in audio_clips}
+    if voice_asset_id and voice_asset_id not in attached_audio_ids:
+        raise ValueError("Edit plan voice audio is not attached to the project")
+    if music_asset_id and music_asset_id not in attached_audio_ids:
+        raise ValueError("Edit plan music is not attached to the project")
+    if mode == "replace":
+        if not voice_asset_id:
+            raise ValueError("Replace audio requires voice_asset_id")
+        for clip in video_clips:
+            calls.append(
+                {
+                    "name": "replace_clip_audio",
+                    "arguments": {
+                        "clip_id": str(clip["id"]),
+                        "audio_asset_id": voice_asset_id,
+                        "volume": float(plan.audio.get("voice_volume") or 1.0),
+                        "mix_original": False,
+                    },
+                }
+            )
+    elif mode in {"mix", "background_music"}:
+        calls.append(
+            {
+                "name": "set_audio_mode",
+                "arguments": {
+                    "mode": "mix_audio" if mode == "mix" else "background_music"
+                },
+            }
+        )
+        original_volume = float(plan.audio.get("original_volume", 1.0))
+        for clip in video_clips:
+            calls.append(
+                {
+                    "name": "set_original_audio",
+                    "arguments": {
+                        "clip_id": str(clip["id"]),
+                        "enabled": original_volume > 0,
+                        "volume": original_volume,
+                    },
+                }
+            )
+        music = next(
+            (
+                clip
+                for clip in audio_clips
+                if int(clip.get("asset_id") or 0) == music_asset_id
+            ),
+            None,
+        )
+        if music_asset_id and music is not None:
+            calls.append(
+                {
+                    "name": "set_volume",
+                    "arguments": {
+                        "clip_id": str(music["id"]),
+                        "volume": float(plan.audio.get("music_volume", 0.2)),
+                    },
+                }
+            )
+            if plan.audio.get("auto_duck"):
+                calls.append(
+                    {
+                        "name": "duck_background_music",
+                        "arguments": {
+                            "clip_id": str(music["id"]),
+                            "volume": float(plan.audio.get("duck_volume", 0.16)),
+                        },
+                    }
                 )
     if plan.audio.get("normalize"):
         for clip in clips:
