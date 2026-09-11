@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select
 
 from app.bot.access import ensure_user, is_allowed
+from app.bot.safe_edit import safe_edit_message
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
 from app.errors import classify_error, user_error_message
@@ -273,7 +274,7 @@ async def jobs_command(message: Message) -> None:
 async def home(callback: CallbackQuery) -> None:
     user = await _callback_user(callback)
     if user and callback.message:
-        await callback.message.edit_text(tr(user.language, "welcome", name=settings.app_name), reply_markup=main_menu_keyboard(user.language))
+        await safe_edit_message(callback.message, tr(user.language, "welcome", name=settings.app_name), main_menu_keyboard(user.language))
     await callback.answer()
 
 
@@ -281,7 +282,7 @@ async def home(callback: CallbackQuery) -> None:
 async def prompt_link(callback: CallbackQuery) -> None:
     user = await _callback_user(callback)
     if user and callback.message:
-        await callback.message.edit_text(tr(user.language, "send_prompt"), reply_markup=main_menu_keyboard(user.language))
+        await safe_edit_message(callback.message, tr(user.language, "send_prompt"), main_menu_keyboard(user.language))
     await callback.answer()
 
 
@@ -289,7 +290,7 @@ async def prompt_link(callback: CallbackQuery) -> None:
 async def prompt_bulk(callback: CallbackQuery) -> None:
     user = await _callback_user(callback)
     if user and callback.message:
-        await callback.message.edit_text(tr(user.language, "bulk_prompt"), reply_markup=main_menu_keyboard(user.language))
+        await safe_edit_message(callback.message, tr(user.language, "bulk_prompt"), main_menu_keyboard(user.language))
     await callback.answer()
 
 
@@ -297,7 +298,7 @@ async def prompt_bulk(callback: CallbackQuery) -> None:
 async def menu_help(callback: CallbackQuery) -> None:
     user = await _callback_user(callback)
     if user and callback.message:
-        await callback.message.edit_text(tr(user.language, "help"), reply_markup=main_menu_keyboard(user.language))
+        await safe_edit_message(callback.message, tr(user.language, "help"), main_menu_keyboard(user.language))
     await callback.answer()
 
 
@@ -305,7 +306,7 @@ async def menu_help(callback: CallbackQuery) -> None:
 async def menu_lang(callback: CallbackQuery) -> None:
     user = await _callback_user(callback)
     if user and callback.message:
-        await callback.message.edit_text("🌐 Language / اللغة", reply_markup=language_keyboard())
+        await safe_edit_message(callback.message, "🌐 Language / اللغة", language_keyboard())
     await callback.answer()
 
 
@@ -324,7 +325,7 @@ async def set_language(callback: CallbackQuery) -> None:
             db_user.language = language
             await session.commit()
     if callback.message:
-        await callback.message.edit_text(tr(language, "welcome", name=settings.app_name), reply_markup=main_menu_keyboard(language))
+        await safe_edit_message(callback.message, tr(language, "welcome", name=settings.app_name), main_menu_keyboard(language))
     await callback.answer()
 
 
@@ -334,7 +335,7 @@ async def history_callback(callback: CallbackQuery) -> None:
     if user and callback.message:
         page = int(callback.data.split(":", 1)[1])
         text, markup = await _history(user, page)
-        await callback.message.edit_text(text, reply_markup=markup)
+        await safe_edit_message(callback.message, text, markup)
     await callback.answer()
 
 
@@ -352,7 +353,7 @@ async def choose_quality(callback: CallbackQuery) -> None:
         await callback.answer(str(exc), show_alert=True)
         return
     if callback.message:
-        await callback.message.edit_text(tr(user.language, "queued", job_id=job_id), reply_markup=cancel_keyboard(job_id))
+        await safe_edit_message(callback.message, tr(user.language, "queued", job_id=job_id), cancel_keyboard(job_id))
     await callback.answer()
 
 
@@ -370,7 +371,7 @@ async def choose_cut(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(CutState.waiting_range)
     await state.update_data(job_id=job_id, mode=mode)
     if callback.message:
-        await callback.message.edit_text(f"{tr(user.language, 'cut_prompt')}\nMode: {mode}")
+        await safe_edit_message(callback.message, f"{tr(user.language, 'cut_prompt')}\nMode: {mode}")
     await callback.answer()
 
 
@@ -426,7 +427,7 @@ async def expand_playlist(callback: CallbackQuery) -> None:
     except Exception as exc:
         error = classify_error(exc)
         if callback.message:
-            await callback.message.edit_text(user_error_message(error, user.language))
+            await safe_edit_message(callback.message, user_error_message(error, user.language))
         return
 
     queued_ids: list[int] = []
@@ -448,7 +449,7 @@ async def expand_playlist(callback: CallbackQuery) -> None:
         queued_ids.append(child.id)
     await set_job_status(parent_id, JobStatus.COMPLETED, progress=100.0, event_message=f"expanded children={queued_ids}")
     if callback.message:
-        await callback.message.edit_text(f"Playlist expanded into {len(queued_ids)} independent jobs: {', '.join(map(str, queued_ids))}")
+        await safe_edit_message(callback.message, f"Playlist expanded into {len(queued_ids)} independent jobs: {', '.join(map(str, queued_ids))}")
 
 
 @router.callback_query(F.data.startswith("cancel:"))
@@ -464,7 +465,7 @@ async def cancel_job(callback: CallbackQuery) -> None:
     await set_job_status(job_id, JobStatus.CANCELLED, error="CANCELLED", event_message="cancel requested")
     await cancel_download(job_id)
     if callback.message:
-        await callback.message.edit_text(f"Job #{job_id}\nStatus: CANCELLED")
+        await safe_edit_message(callback.message, f"Job #{job_id}\nStatus: CANCELLED")
     await callback.answer()
 
 
@@ -484,7 +485,7 @@ async def retry_job(callback: CallbackQuery) -> None:
         await callback.answer(str(exc), show_alert=True)
         return
     if callback.message:
-        await callback.message.edit_text(tr(user.language, "queued", job_id=job_id), reply_markup=cancel_keyboard(job_id))
+        await safe_edit_message(callback.message, tr(user.language, "queued", job_id=job_id), cancel_keyboard(job_id))
     await callback.answer()
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import uvicorn
 from aiogram import Bot
+from aiogram.types import BotCommand
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -179,6 +180,20 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 
     await mark_stale_workers_offline()
     bot = create_bot()
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="download", description="تحميل فيديو"),
+                BotCommand(command="mp3", description="تحميل MP3"),
+                BotCommand(command="cut", description="قص فيديو"),
+                BotCommand(command="split", description="تقسيم فيديو"),
+                BotCommand(command="jobs", description="تحميلاتي"),
+                BotCommand(command="ai", description="دردشة AI"),
+                BotCommand(command="help", description="المساعدة"),
+            ]
+        )
+    except Exception as exc:
+        logger.warning("Telegram command registration failed with %s", type(exc).__name__)
     polling_task = asyncio.create_task(_run_polling_forever(bot), name="telegram-polling")
     maintenance_task = asyncio.create_task(_maintenance_loop(), name="maintenance")
     ai_probe_task = asyncio.create_task(_probe_ai_providers(), name="ai-provider-probe")

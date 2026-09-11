@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import BaseFilter, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -69,6 +69,10 @@ def cut_menu_keyboard(job_id: int, mode: str = "PRECISE") -> InlineKeyboardMarku
             [InlineKeyboardButton(text="✂️ قص حر", callback_data=f"cutpick:{job_id}:free:{normalized_mode}")],
             [InlineKeyboardButton(text="📱 30 ثانية للقصص", callback_data=f"cutpick:{job_id}:30:{normalized_mode}")],
             [InlineKeyboardButton(text="🎞️ 60 ثانية", callback_data=f"cutpick:{job_id}:60:{normalized_mode}")],
+            [
+                InlineKeyboardButton(text="🧩 تقسيم 30ث", callback_data=f"advsplit:{job_id}:30"),
+                InlineKeyboardButton(text="🧩 تقسيم 60ث", callback_data=f"advsplit:{job_id}:60"),
+            ],
             [
                 InlineKeyboardButton(text=f"الوضع: {mode_label}", callback_data=f"cutmenu:{job_id}:{normalized_mode}"),
                 InlineKeyboardButton(text=other_label, callback_data=f"cutmenu:{job_id}:{other_mode}"),
@@ -238,7 +242,7 @@ async def _show_analysis(
         )
         return
 
-    if intent == "cut":
+    if intent in {"cut", "split"}:
         hint = (
             "Choose a cut type. PRECISE is frame-accurate; FAST is faster without re-encoding."
             if language == "en"
@@ -332,6 +336,51 @@ async def reset_and_start(message: Message, state: FSMContext) -> None:
     from app.bot.handlers import start
 
     await start(message)
+
+
+async def _slash_flow(message: Message, state: FSMContext, intent: str) -> None:
+    user = await _get_message_user(message)
+    if user is None:
+        return
+    if parse_bulk_urls(message.text or "", limit=settings.max_bulk_urls).urls:
+        await state.clear()
+        await _process_urls(message, intent=intent)
+        return
+    await state.set_state(FeatureState.waiting_url)
+    await state.update_data(intent=intent)
+    prompts = {
+        "video": "🎬 أرسل رابط الفيديو.",
+        "audio": "🎵 أرسل رابط الوسائط لتحويله إلى MP3.",
+        "cut": "✂️ أرسل رابط الفيديو ثم اختر نوع القص.",
+        "split": "🧩 أرسل رابط الفيديو ثم اختر التقسيم إلى 30 أو 60 ثانية.",
+        "bulk": "📥 أرسل الروابط، كل رابط في سطر.",
+    }
+    await message.answer(prompts[intent])
+
+
+@router.message(Command("download", "video"))
+async def download_command(message: Message, state: FSMContext) -> None:
+    await _slash_flow(message, state, "video")
+
+
+@router.message(Command("mp3", "audio"))
+async def mp3_command(message: Message, state: FSMContext) -> None:
+    await _slash_flow(message, state, "audio")
+
+
+@router.message(Command("cut"))
+async def cut_command(message: Message, state: FSMContext) -> None:
+    await _slash_flow(message, state, "cut")
+
+
+@router.message(Command("split"))
+async def split_command(message: Message, state: FSMContext) -> None:
+    await _slash_flow(message, state, "split")
+
+
+@router.message(Command("bulk"))
+async def bulk_command(message: Message, state: FSMContext) -> None:
+    await _slash_flow(message, state, "bulk")
 
 
 @router.callback_query(F.data == "menu:home")
