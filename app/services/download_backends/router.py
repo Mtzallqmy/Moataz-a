@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.errors import ErrorCode, classify_error
 from app.security import redact_secrets
 from app.services.download_backends.base import (
@@ -93,10 +93,11 @@ class ProviderRouter:
         *,
         health: BackendHealthRegistry | None = None,
         register_optional: bool = True,
+        optional_settings: Settings | None = None,
     ) -> None:
         self.backends = {backend.name: backend for backend in backends}
         if register_optional:
-            settings = get_settings()
+            settings = optional_settings or self._settings_from_backends() or get_settings()
             from app.services.download_backends.gallerydl_backend import GalleryDlBackend
             from app.services.download_backends.instaloader_backend import InstaloaderBackend
             from app.services.download_backends.pytubefix_backend import PytubefixBackend
@@ -110,6 +111,18 @@ class ProviderRouter:
             ):
                 self.backends.setdefault(backend.name, backend)
         self.health = health or BackendHealthRegistry()
+
+    def _settings_from_backends(self) -> Settings | None:
+        for backend in self.backends.values():
+            settings = getattr(backend, "settings", None)
+            if isinstance(settings, Settings):
+                return settings
+            for owner_name in ("engine", "relay"):
+                owner = getattr(backend, owner_name, None)
+                settings = getattr(owner, "settings", None)
+                if isinstance(settings, Settings):
+                    return settings
+        return None
 
     def order(self, detected: DetectedMedia) -> tuple[DownloadBackend, ...]:
         names = DEFAULT_ROUTES.get(
@@ -133,6 +146,34 @@ class DownloadManager:
         self.router = router
         self.detector = detector or PlatformDetector()
         self.last_attempts: tuple[dict[str, str], ...] = ()
+        self._attempts_by_job: dict[str, tuple[dict[str, str], ...]] = {}
+
+    def _record_attempts(self, job_key: str, attempts: list[dict[str, str]]) -> None:
+        frozen = tuple(dict(item) for item in attempts)
+        self.last_attempts = frozen
+        if job_key and job_key != "-":
+            self._attempts_by_job[job_key] = frozen
+
+    def route_telemetry(self, job_key: str, *, pop: bool = False) -> dict[str, object]:
+        attempts = (
+            self._attempts_by_job.pop(job_key, ())
+            if pop
+            else self._attempts_by_job.get(job_key, ())
+        )
+        attempted_backends = [item["backend"] for item in attempts]
+        successful_backend = next(
+            (item["backend"] for item in reversed(attempts) if item["result"] == "SUCCESS"),
+            None,
+        )
+        normalized_error = None
+        if attempts and successful_backend is None:
+            normalized_error = attempts[-1]["result"]
+        return {
+            "attempted_backends": attempted_backends,
+            "successful_backend": successful_backend,
+            "normalized_error": normalized_error,
+            "fallback_count": max(0, len(attempts) - 1),
+        }
 
     async def _candidates(self, url: str, media_type: str | None):
         detected = self.detector.detect(url, media_type)
@@ -157,7 +198,7 @@ class DownloadManager:
                 entries = await backend.expand_playlist(url, limit=limit)
                 self.router.health.success(backend.name, detected.platform)
                 attempts.append({"backend": backend.name, "result": "SUCCESS"})
-                self.last_attempts = tuple(attempts)
+                self._record_attempts("-", attempts)
                 logger.info(
                     "job=- platform=%s backend=%s result=SUCCESS fallback_count=%s",
                     detected.platform,
@@ -172,7 +213,7 @@ class DownloadManager:
                 self.router.health.failure(backend.name, detected.platform, error)
                 if not self.router.allows_fallback(exc):
                     break
-        self.last_attempts = tuple(attempts)
+        self._record_attempts("-", attempts)
         if last_error is not None:
             raise last_error
         if not had_candidate:
@@ -198,7 +239,7 @@ class DownloadManager:
                 result = await (backend.download(request) if request else backend.probe(url))
                 self.router.health.success(backend.name, detected.platform)
                 attempts.append({"backend": backend.name, "result": "SUCCESS"})
-                self.last_attempts = tuple(attempts)
+                self._record_attempts(job_key, attempts)
                 logger.info(
                     "job=%s platform=%s backend=%s result=SUCCESS fallback_count=%s",
                     job_key,
@@ -208,7 +249,7 @@ class DownloadManager:
                 )
                 result.provider = backend.name
                 result.platform = detected.platform
-                result.metadata.setdefault("attempted_backends", attempts.copy())
+                result.metadata.setdefault("attempted_backends", [dict(item) for item in attempts])
                 result.metadata.setdefault("successful_backend", backend.name)
                 result.metadata.setdefault("normalized_error", None)
                 result.metadata.setdefault("fallback_count", len(attempts) - 1)
@@ -217,6 +258,7 @@ class DownloadManager:
                 last_error = exc
                 error = classify_error(exc)
                 attempts.append({"backend": backend.name, "result": error.code.value})
+                self._record_attempts(job_key, attempts)
                 self.router.health.failure(backend.name, detected.platform, error)
                 logger.warning(
                     "job=%s platform=%s backend=%s result=%s fallback_count=%s fallback=%s detail=%s",
@@ -230,7 +272,7 @@ class DownloadManager:
                 )
                 if not self.router.allows_fallback(exc):
                     break
-        self.last_attempts = tuple(attempts)
+        self._record_attempts(job_key, attempts)
         if last_error is not None:
             raise last_error
         if not had_candidate:
