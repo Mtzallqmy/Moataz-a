@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.services.ai_registry import AIProviderRegistry, get_ai_provider_registry
@@ -51,7 +51,7 @@ class EditPlan:
         if pacing not in _PACING:
             raise ValueError("Edit plan has unsupported pacing")
         selected = payload.get("selected_ranges") or []
-        if not isinstance(selected, list) or len(selected) > 40:
+        if not isinstance(selected, list) or len(selected) > 120:
             raise ValueError("Edit plan selected ranges are invalid")
         cleaned_ranges: list[dict[str, Any]] = []
         for item in selected:
@@ -167,7 +167,8 @@ class AIEditPlanner:
             '"style_preset":"reels-fast","pacing":"fast","selected_ranges":'
             '[{"asset_id":1,"start":0,"end":3}],"removed_clip_ids":[],"transition":"slide",'
             '"captions":{"enabled":true,"preset":"reels-bold"},'
-            '"audio":{"mode":"keep","normalize":true,"auto_duck":false},'
+            '"audio":{"mode":"keep","voice_asset_id":null,"music_asset_id":null,'
+            '"original_volume":1.0,"music_volume":0.2,"normalize":true,"auto_duck":false},'
             '"texts":[],"overlays":[],"rationale":"..."}. '
             f"Allowed styles: {sorted(STYLE_PRESETS)}. "
             f"Media intelligence: {json.dumps(project_intelligence, ensure_ascii=False)[:24000]}. "
@@ -227,6 +228,134 @@ def _timeline_clips(timeline: dict[str, Any]) -> list[dict[str, Any]]:
         for clip in track.get("clips") or []
         if isinstance(clip, dict)
     ]
+
+
+def constrain_plan_for_operation(
+    plan: EditPlan,
+    project_intelligence: dict[str, Any],
+    project_context: dict[str, Any] | None,
+) -> EditPlan:
+    """Expand selected high-level workflow operations deterministically."""
+
+    context = project_context or {}
+    operation = str(context.get("selected_operation") or "")
+    if not operation:
+        return plan
+    assets = [
+        item
+        for item in project_intelligence.get("assets") or []
+        if isinstance(item, dict) and int(item.get("asset_id") or 0) > 0
+    ]
+    recent = context.get("recent_asset") or {}
+    recent_id = int(recent.get("asset_id") or 0) if isinstance(recent, dict) else 0
+
+    def primary(*kinds: str) -> dict[str, Any] | None:
+        candidates = [item for item in assets if item.get("asset_type") in kinds]
+        return next(
+            (item for item in candidates if int(item.get("asset_id") or 0) == recent_id),
+            candidates[0] if candidates else None,
+        )
+
+    if operation in {"split_30", "split_60"}:
+        selected = primary("video", "audio", "voice")
+        if selected is None:
+            raise ValueError("The selected split operation needs video or audio")
+        duration = float(selected.get("quality", {}).get("duration") or 0)
+        if duration <= 0:
+            raise ValueError("The selected asset duration is unavailable")
+        step = 30.0 if operation == "split_30" else 60.0
+        ranges = tuple(
+            {
+                "asset_id": int(selected["asset_id"]),
+                "start": cursor,
+                "end": min(duration, cursor + step),
+            }
+            for cursor in (index * step for index in range(120))
+            if cursor < duration
+        )
+        return replace(plan, selected_ranges=ranges)
+    if operation == "split_scenes":
+        selected = primary("video")
+        if selected is None:
+            raise ValueError("Scene splitting needs a video")
+        ranges = tuple(
+            {
+                "asset_id": int(selected["asset_id"]),
+                "start": float(scene.get("start") or 0),
+                "end": float(scene.get("end") or 0),
+            }
+            for scene in (selected.get("scenes") or [])[:120]
+            if float(scene.get("end") or 0) - float(scene.get("start") or 0) >= 0.04
+        )
+        if not ranges:
+            raise ValueError("No scene boundaries were detected for this video")
+        return replace(plan, selected_ranges=ranges)
+    if operation == "remove_silence":
+        candidates = [item for item in assets if item.get("asset_type") == "video"]
+        if not candidates:
+            candidate = primary("audio", "voice")
+            candidates = [candidate] if candidate else []
+        ranges = tuple(
+            {
+                "asset_id": int(item["asset_id"]),
+                "start": float(section.get("start") or 0),
+                "end": float(section.get("end") or 0),
+            }
+            for item in candidates
+            for section in (item.get("audio", {}).get("speech_or_sound") or [])
+            if float(section.get("end") or 0) - float(section.get("start") or 0) >= 0.04
+        )
+        if not ranges:
+            raise ValueError("No non-silent ranges were detected")
+        return replace(plan, selected_ranges=ranges[:120])
+    if operation == "best_moment":
+        selected = primary("video")
+        if selected is None:
+            raise ValueError("Best-moment extraction needs a video")
+        moments = sorted(
+            selected.get("important_moments") or [],
+            key=lambda item: (-float(item.get("score") or 0), float(item.get("start") or 0)),
+        )
+        target = float(plan.target_duration or 30)
+        chosen: list[dict[str, Any]] = []
+        remaining = target
+        for moment in moments:
+            start = float(moment.get("start") or 0)
+            end = float(moment.get("end") or 0)
+            if end - start < 0.04 or remaining <= 0.04:
+                continue
+            chosen.append(
+                {
+                    "asset_id": int(selected["asset_id"]),
+                    "start": start,
+                    "end": min(end, start + remaining),
+                }
+            )
+            remaining -= chosen[-1]["end"] - start
+        if not chosen:
+            raise ValueError("No important moments were detected")
+        return replace(plan, selected_ranges=tuple(chosen))
+    audio = dict(plan.audio)
+    if operation == "replace_audio":
+        if not int(audio.get("voice_asset_id") or 0):
+            if recent.get("asset_type") not in {"audio", "voice"}:
+                raise ValueError("Choose or upload the replacement audio first")
+            audio["voice_asset_id"] = recent_id
+        audio["mode"] = "replace"
+        return replace(plan, audio=audio)
+    if operation == "auto_duck":
+        if not int(audio.get("music_asset_id") or 0) and recent.get(
+            "asset_type"
+        ) in {"audio", "voice"}:
+            audio["music_asset_id"] = recent_id
+        if not int(audio.get("music_asset_id") or 0):
+            raise ValueError("Choose the background music before auto ducking")
+        audio.update({"mode": "background_music", "auto_duck": True})
+        return replace(plan, audio=audio)
+    if operation == "normalize":
+        audio["normalize"] = True
+        return replace(plan, audio=audio)
+    return plan
 
 
 def compile_tool_calls(
@@ -290,6 +419,81 @@ def compile_tool_calls(
             if clip.get("asset_type") == "video":
                 calls.append(
                     {"name": "set_original_audio", "arguments": {"clip_id": str(clip["id"]), "enabled": False}}
+                )
+    audio_clips = [
+        clip for clip in clips if clip.get("asset_type") in {"audio", "voice"}
+    ]
+    video_clips = [clip for clip in clips if clip.get("asset_type") == "video"]
+    voice_asset_id = int(plan.audio.get("voice_asset_id") or 0)
+    music_asset_id = int(plan.audio.get("music_asset_id") or 0)
+    attached_audio_ids = {int(clip.get("asset_id") or 0) for clip in audio_clips}
+    if voice_asset_id and voice_asset_id not in attached_audio_ids:
+        raise ValueError("Edit plan voice audio is not attached to the project")
+    if music_asset_id and music_asset_id not in attached_audio_ids:
+        raise ValueError("Edit plan music is not attached to the project")
+    if mode == "replace":
+        if not voice_asset_id:
+            raise ValueError("Replace audio requires voice_asset_id")
+        for clip in video_clips:
+            calls.append(
+                {
+                    "name": "replace_clip_audio",
+                    "arguments": {
+                        "clip_id": str(clip["id"]),
+                        "audio_asset_id": voice_asset_id,
+                        "volume": float(plan.audio.get("voice_volume") or 1.0),
+                        "mix_original": False,
+                    },
+                }
+            )
+    elif mode in {"mix", "background_music"}:
+        calls.append(
+            {
+                "name": "set_audio_mode",
+                "arguments": {
+                    "mode": "mix_audio" if mode == "mix" else "background_music"
+                },
+            }
+        )
+        original_volume = float(plan.audio.get("original_volume", 1.0))
+        for clip in video_clips:
+            calls.append(
+                {
+                    "name": "set_original_audio",
+                    "arguments": {
+                        "clip_id": str(clip["id"]),
+                        "enabled": original_volume > 0,
+                        "volume": original_volume,
+                    },
+                }
+            )
+        music = next(
+            (
+                clip
+                for clip in audio_clips
+                if int(clip.get("asset_id") or 0) == music_asset_id
+            ),
+            None,
+        )
+        if music_asset_id and music is not None:
+            calls.append(
+                {
+                    "name": "set_volume",
+                    "arguments": {
+                        "clip_id": str(music["id"]),
+                        "volume": float(plan.audio.get("music_volume", 0.2)),
+                    },
+                }
+            )
+            if plan.audio.get("auto_duck"):
+                calls.append(
+                    {
+                        "name": "duck_background_music",
+                        "arguments": {
+                            "clip_id": str(music["id"]),
+                            "volume": float(plan.audio.get("duck_volume", 0.16)),
+                        },
+                    }
                 )
     if plan.audio.get("normalize"):
         for clip in clips:

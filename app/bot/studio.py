@@ -29,6 +29,13 @@ from app.services.media_intelligence import MediaIntelligenceService
 from app.services.projects import ProjectAssetItem, ProjectService, project_service
 from app.services.render_service import RenderService, render_service
 from app.services.studio_agent import StudioAgentService, studio_agent_service
+from app.services.studio_session import (
+    StudioPhase,
+    StudioWorkflow,
+    project_summary_text,
+    recent_asset_context,
+    transition_phase,
+)
 from app.services.timeline import timeline_service
 from app.services.urls import parse_bulk_urls
 from app.utils import seconds_to_hms
@@ -38,21 +45,118 @@ router = Router(name="media-studio")
 logger = logging.getLogger("moataz.studio.telegram")
 _delivery_tasks: set[asyncio.Task] = set()
 _analysis_tasks: set[asyncio.Task] = set()
+_summary_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
 class StudioState(StatesGroup):
     collecting = State()
+    collecting_media = State()
+    waiting_instruction = State()
     agent = State()
+    awaiting_feedback = State()
 
 
 def studio_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎬 مشروع جديد", callback_data="studio:new")],
-            [InlineKeyboardButton(text="📋 مشاريعي", callback_data="studio:projects")],
+            [InlineKeyboardButton(text="🎬 مونتاج بالذكاء الاصطناعي", callback_data="studio:workflow:smart_edit")],
+            [InlineKeyboardButton(text="✂️ قص وتقسيم", callback_data="studio:workflow:cut")],
+            [InlineKeyboardButton(text="🎵 تعديل/استبدال الصوت", callback_data="studio:workflow:audio")],
+            [InlineKeyboardButton(text="📝 ترجمة وكابتشن", callback_data="studio:workflow:captions")],
+            [InlineKeyboardButton(text="🔄 تعديل فيديو سابق", callback_data="studio:reopen")],
+            [InlineKeyboardButton(text="📂 مشاريعي", callback_data="studio:projects")],
             [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="menu:home")],
         ]
     )
+
+
+def collecting_keyboard(project_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ انتهيت من رفع المواد", callback_data=f"studio:done:{project_id}")],
+            [
+                InlineKeyboardButton(text="📋 ملخص المشروع", callback_data=f"studio:summary:{project_id}"),
+                InlineKeyboardButton(text="📦 المواد", callback_data=f"studio:assets:{project_id}"),
+            ],
+            [InlineKeyboardButton(text="🗑 إلغاء المشروع", callback_data=f"studio:cancelproject:{project_id}")],
+        ]
+    )
+
+
+def instruction_keyboard(project_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⚡ Reels سريع", callback_data=f"studio:style:{project_id}:reels-fast"),
+                InlineKeyboardButton(text="🎬 سينمائي", callback_data=f"studio:style:{project_id}:cinematic"),
+            ],
+            [
+                InlineKeyboardButton(text="📢 إعلان", callback_data=f"studio:style:{project_id}:product-ad"),
+                InlineKeyboardButton(text="🎙 Podcast", callback_data=f"studio:style:{project_id}:podcast"),
+            ],
+            [InlineKeyboardButton(text="✨ تلقائي بالكامل", callback_data=f"studio:style:{project_id}:auto")],
+            [
+                InlineKeyboardButton(text="➕ إضافة مواد", callback_data=f"studio:add:{project_id}"),
+                InlineKeyboardButton(text="📋 ملخص المشروع", callback_data=f"studio:summary:{project_id}"),
+            ],
+        ]
+    )
+
+
+def cut_instruction_keyboard(project_id: int) -> InlineKeyboardMarkup:
+    actions = [
+        ("⏱ قص من وقت إلى وقت", "trim"),
+        ("🗑 حذف جزء", "remove_range"),
+        ("🧩 تقسيم كل 30 ثانية", "split_30"),
+        ("🧩 تقسيم كل 60 ثانية", "split_60"),
+        ("🎞 تقسيم حسب المشاهد", "split_scenes"),
+        ("🔇 حذف الصمت", "remove_silence"),
+        ("✨ استخراج أفضل جزء", "best_moment"),
+    ]
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=label, callback_data=f"studio:operation:{project_id}:{value}"
+            )
+        ]
+        for label, value in actions
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="📋 ملخص المشروع", callback_data=f"studio:summary:{project_id}")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def audio_instruction_keyboard(project_id: int) -> InlineKeyboardMarkup:
+    actions = [
+        ("🔇 إزالة الصوت الأصلي", "mute_original"),
+        ("🔁 استبدال الصوت", "replace_audio"),
+        ("🎚 خلط الصوت", "mix_audio"),
+        ("🗣 Voice Over + Ducking", "auto_duck"),
+        ("📏 Normalize", "normalize"),
+    ]
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=label, callback_data=f"studio:operation:{project_id}:{value}"
+            )
+        ]
+        for label, value in actions
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="📋 ملخص المشروع", callback_data=f"studio:summary:{project_id}")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def workflow_instruction_keyboard(
+    project_id: int, workflow: str
+) -> InlineKeyboardMarkup:
+    if workflow == StudioWorkflow.CUT.value:
+        return cut_instruction_keyboard(project_id)
+    if workflow == StudioWorkflow.AUDIO.value:
+        return audio_instruction_keyboard(project_id)
+    return instruction_keyboard(project_id)
 
 
 def project_keyboard(project_id: int) -> InlineKeyboardMarkup:
@@ -84,6 +188,11 @@ def agent_keyboard(project_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="↩️ تراجع", callback_data=f"studio:agentundo:{project_id}"),
                 InlineKeyboardButton(text="↪️ إعادة", callback_data=f"studio:agentredo:{project_id}"),
             ],
+            [
+                InlineKeyboardButton(text="📦 المواد", callback_data=f"studio:assets:{project_id}"),
+                InlineKeyboardButton(text="📋 ملخص المشروع", callback_data=f"studio:summary:{project_id}"),
+            ],
+            [InlineKeyboardButton(text="➕ إضافة ملف", callback_data=f"studio:add:{project_id}")],
             [InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")],
         ]
     )
@@ -131,6 +240,103 @@ def _project_text(project_id: int) -> str:
     )
 
 
+_WORKFLOW_PROMPTS = {
+    StudioWorkflow.SMART_EDIT: (
+        "أرسل الآن كل المواد التي تريد استخدامها في المونتاج.\n\n"
+        "🎥 فيديوهات  🖼 صور  🎵 موسيقى\n"
+        "🎙 أصوات  📄 ملفات وسائط  🔗 روابط\n\n"
+        "لن يبدأ المونتاج أثناء الرفع. بعد إرسال جميع المواد اضغط: "
+        "✅ انتهيت من رفع المواد"
+    ),
+    StudioWorkflow.CUT: (
+        "✂️ أرسل الفيديو أو رابطه أولًا. بعد الانتهاء ستكتب عملية القص، مثل: "
+        "«احذف أول 8 ثوان وآخر 4 ثوان» أو «قسمه حسب المشاهد»."
+    ),
+    StudioWorkflow.AUDIO: (
+        "🎵 أرسل الفيديو ثم الصوت أو الموسيقى المطلوبة. بعد الانتهاء اكتب هل تريد "
+        "الكتم أو الاستبدال أو الخلط أو Auto Ducking."
+    ),
+    StudioWorkflow.CAPTIONS: (
+        "📝 أرسل الفيديو أو الصوت وملف الترجمة إن وجد. بعد الانتهاء صف لغة وشكل الكابتشن."
+    ),
+    StudioWorkflow.REOPEN: (
+        "🔄 أرسل مواد جديدة للمشروع السابق، أو اضغط «انتهيت» للانتقال مباشرة إلى التعديلات."
+    ),
+}
+
+
+async def _set_phase(
+    state: FSMContext, target: StudioPhase, *, initial: bool = False
+) -> StudioPhase:
+    data = await state.get_data()
+    raw_current = data.get("studio_phase")
+    if initial or raw_current is None:
+        phase = target
+    else:
+        phase = transition_phase(str(raw_current), target)
+    await state.update_data(studio_phase=phase.value)
+    return phase
+
+
+async def _set_phase_if_session(
+    state: FSMContext | None, target: StudioPhase
+) -> None:
+    if state is None:
+        return
+    data = await state.get_data()
+    if not data.get("studio_phase"):
+        return
+    await _set_phase(state, target)
+
+
+async def _project_summary(
+    project_id: int,
+    *,
+    user_id: int,
+    phase: str | StudioPhase,
+) -> str:
+    project = await project_service.get_project(project_id, user_id=user_id)
+    if project is None:
+        raise LookupError("Project not found")
+    items = await project_service.list_assets(project_id, user_id=user_id)
+    timeline = await timeline_service.get(project_id, user_id=user_id)
+    return project_summary_text(project, items, timeline, phase=phase)
+
+
+def _schedule_project_summary(
+    message: Message,
+    *,
+    project_id: int,
+    user_id: int,
+    phase: StudioPhase = StudioPhase.COLLECTING_MEDIA,
+) -> None:
+    chat_id = int(getattr(getattr(message, "chat", None), "id", user_id))
+    key = (chat_id, project_id)
+    previous = _summary_tasks.pop(key, None)
+    if previous is not None and not previous.done():
+        previous.cancel()
+
+    async def publish() -> None:
+        try:
+            await asyncio.sleep(1.2)
+            text = await _project_summary(project_id, user_id=user_id, phase=phase)
+            await message.answer(text, reply_markup=collecting_keyboard(project_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "studio summary update failed project_id=%s error_type=%s",
+                project_id,
+                type(exc).__name__,
+            )
+        finally:
+            if _summary_tasks.get(key) is asyncio.current_task():
+                _summary_tasks.pop(key, None)
+
+    task = asyncio.create_task(publish(), name=f"studio-summary-{project_id}")
+    _summary_tasks[key] = task
+
+
 def _asset_name(item: ProjectAssetItem) -> str:
     with suppress(json.JSONDecodeError):
         metadata = json.loads(item.asset.metadata_json or "{}")
@@ -149,6 +355,21 @@ def _asset_icon(asset_type: str) -> str:
         "voice": "🎙",
         "subtitle": "💬",
     }.get(asset_type, "📄")
+
+
+def _automatic_role(asset_type: str, file_name: str) -> str:
+    normalized = file_name.casefold()
+    if asset_type == "voice":
+        return "voice"
+    if asset_type == "audio":
+        return "music" if any(
+            value in normalized for value in ("music", "song", "track", "موسيقى")
+        ) else "voice"
+    if asset_type in {"image", "logo"} and any(
+        value in normalized for value in ("logo", "شعار")
+    ):
+        return "logo"
+    return "main"
 
 
 async def _show_assets(message: Message, project_id: int, user_id: int) -> None:
@@ -272,7 +493,9 @@ async def _show_settings(message: Message, project_id: int, user_id: int) -> Non
         ],
         [InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")],
     ]
-    await message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _safe_bound_edit(
+        message, text, InlineKeyboardMarkup(inline_keyboard=rows)
+    )
 
 
 def _template_choices(project_id: int, items: list[ProjectAssetItem]) -> InlineKeyboardMarkup:
@@ -384,6 +607,7 @@ async def watch_render_and_deliver(
     render_job_id: int,
     user_id: int,
     service: RenderService = render_service,
+    state: FSMContext | None = None,
 ) -> None:
     started = time.monotonic()
     last_progress = -1.0
@@ -405,6 +629,8 @@ async def watch_render_and_deliver(
             continue
         if job.status == RenderStatus.CANCELLED.value:
             await _safe_edit(bot, chat_id, message_id, f"✖️ تم إلغاء Render #{job.id}")
+            with suppress(ValueError):
+                await _set_phase_if_session(state, StudioPhase.AWAITING_FEEDBACK)
             return
         if job.status == RenderStatus.FAILED.value:
             await _safe_edit(
@@ -416,6 +642,8 @@ async def watch_render_and_deliver(
                     inline_keyboard=[[InlineKeyboardButton(text="🔁 إعادة الرندر", callback_data=f"studio:start:{job.project_id}")]]
                 ),
             )
+            with suppress(ValueError):
+                await _set_phase_if_session(state, StudioPhase.AWAITING_FEEDBACK)
             return
         if job.status == RenderStatus.UPLOADING.value:
             await asyncio.sleep(max(1.2, settings.progress_update_seconds))
@@ -461,6 +689,19 @@ async def watch_render_and_deliver(
                     else f"✅ اكتمل Project #{job.project_id} وتم إرسال الفيديو."
                 ),
             )
+            with suppress(ValueError):
+                await _set_phase_if_session(
+                    state,
+                    StudioPhase.AWAITING_FEEDBACK
+                    if render_kind == "preview"
+                    else StudioPhase.COMPLETED,
+                )
+            if state is not None:
+                await state.set_state(
+                    StudioState.awaiting_feedback
+                    if render_kind == "preview"
+                    else None
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -506,7 +747,20 @@ def _schedule_asset_analysis(asset_id: int, *, user_id: int, project_id: int) ->
     task.add_done_callback(completed)
 
 
-async def _enqueue_agent_render(message: Message, project_id: int, user_id: int, kind: str) -> None:
+async def _enqueue_agent_render(
+    message: Message,
+    project_id: int,
+    user_id: int,
+    kind: str,
+    *,
+    state: FSMContext | None = None,
+) -> None:
+    await _set_phase_if_session(
+        state,
+        StudioPhase.PREVIEW_RENDERING
+        if kind == "preview"
+        else StudioPhase.FINAL_RENDERING,
+    )
     job = await render_service.create_render(
         project_id,
         user_id=user_id,
@@ -527,6 +781,7 @@ async def _enqueue_agent_render(message: Message, project_id: int, user_id: int,
                 message_id=progress.message_id,
                 render_job_id=job.id,
                 user_id=user_id,
+                state=state,
             ),
             name=f"studio-agent-delivery-{job.id}",
         )
@@ -540,20 +795,61 @@ async def studio_home(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     if callback.message:
-        await callback.message.edit_text("🎞 استوديو المونتاج", reply_markup=studio_home_keyboard())
+        await _safe_bound_edit(
+            callback.message,
+            "🎞 Media Studio\n\nاختر العملية التي تريد تنفيذها:",
+            studio_home_keyboard(),
+        )
     await callback.answer()
+
+
+async def _begin_workflow(
+    callback: CallbackQuery, state: FSMContext, workflow: StudioWorkflow
+) -> None:
+    user = await _callback_user(callback)
+    if user is None or callback.message is None:
+        return
+    project = await project_service.create_project(
+        user_id=user.id,
+        chat_id=callback.message.chat.id,
+        name={
+            StudioWorkflow.SMART_EDIT: "AI Edit",
+            StudioWorkflow.CUT: "Cut & Split",
+            StudioWorkflow.AUDIO: "Audio Edit",
+            StudioWorkflow.CAPTIONS: "Captions",
+            StudioWorkflow.REOPEN: "Re-edit",
+        }[workflow],
+    )
+    await state.set_state(StudioState.collecting_media)
+    await state.update_data(
+        studio_project_id=project.id,
+        studio_workflow=workflow.value,
+        studio_phase=StudioPhase.NEW.value,
+        recent_asset_id=None,
+    )
+    await _set_phase(state, StudioPhase.COLLECTING_MEDIA)
+    await _safe_bound_edit(
+        callback.message,
+        f"Project #{project.id}\n\n{_WORKFLOW_PROMPTS[workflow]}",
+        collecting_keyboard(project.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:workflow:"))
+async def begin_workflow(callback: CallbackQuery, state: FSMContext) -> None:
+    raw = callback.data.rsplit(":", 1)[1]
+    try:
+        workflow = StudioWorkflow(raw)
+    except ValueError:
+        await callback.answer("نوع العملية غير مدعوم", show_alert=True)
+        return
+    await _begin_workflow(callback, state, workflow)
 
 
 @router.callback_query(F.data == "studio:new")
 async def new_project(callback: CallbackQuery, state: FSMContext) -> None:
-    user = await _callback_user(callback)
-    if user is None or callback.message is None:
-        return
-    project = await project_service.create_project(user_id=user.id, chat_id=callback.message.chat.id)
-    await state.set_state(StudioState.collecting)
-    await state.update_data(studio_project_id=project.id)
-    await callback.message.edit_text(_project_text(project.id), reply_markup=project_keyboard(project.id))
-    await callback.answer()
+    await _begin_workflow(callback, state, StudioWorkflow.SMART_EDIT)
 
 
 @router.callback_query(F.data.startswith("studio:open:"))
@@ -573,8 +869,29 @@ async def open_project(callback: CallbackQuery, state: FSMContext) -> None:
         ProjectStatus.CANCELLED.value,
         ProjectStatus.RENDERING.value,
     }:
-        await state.set_state(StudioState.collecting)
-        await state.update_data(studio_project_id=project_id)
+        data = await state.get_data()
+        phase = str(data.get("studio_phase") or "")
+        if int(data.get("studio_project_id") or 0) != project_id:
+            phase = ""
+        if phase in {
+            StudioPhase.READY_FOR_INSTRUCTIONS.value,
+            StudioPhase.ANALYZING.value,
+            StudioPhase.PLANNING.value,
+            StudioPhase.EDITING.value,
+        }:
+            await state.set_state(StudioState.waiting_instruction)
+        elif phase in {
+            StudioPhase.AWAITING_FEEDBACK.value,
+            StudioPhase.PREVIEW_RENDERING.value,
+        }:
+            await state.set_state(StudioState.awaiting_feedback)
+        else:
+            await state.set_state(StudioState.collecting_media)
+            await state.update_data(
+                studio_project_id=project_id,
+                studio_workflow=StudioWorkflow.REOPEN.value,
+                studio_phase=StudioPhase.COLLECTING_MEDIA.value,
+            )
     items = await project_service.list_assets(project_id, user_id=user.id)
     await _safe_bound_edit(
         callback.message,
@@ -596,9 +913,25 @@ async def add_more(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if project.status in {ProjectStatus.COMPLETED.value, ProjectStatus.FAILED.value}:
         await project_service.reopen_project(project_id, user_id=user.id)
-    await state.set_state(StudioState.collecting)
+    data = await state.get_data()
+    current = data.get("studio_phase")
+    if current:
+        try:
+            await _set_phase(state, StudioPhase.COLLECTING_MEDIA)
+        except ValueError:
+            await callback.answer(
+                "لا يمكن إضافة مواد أثناء العملية الحالية", show_alert=True
+            )
+            return
+    else:
+        await state.update_data(studio_phase=StudioPhase.COLLECTING_MEDIA.value)
+    await state.set_state(StudioState.collecting_media)
     await state.update_data(studio_project_id=project_id)
-    await _safe_bound_edit(callback.message, _project_text(project_id), project_keyboard(project_id))
+    await _safe_bound_edit(
+        callback.message,
+        f"Project #{project_id}\n\n{_WORKFLOW_PROMPTS[StudioWorkflow.REOPEN]}",
+        collecting_keyboard(project_id),
+    )
     await callback.answer()
 
 
@@ -636,22 +969,21 @@ async def set_video_original_audio(callback: CallbackQuery) -> None:
     await callback.answer("تم تحديث صوت الفيديو")
 
 
-@router.callback_query(F.data.startswith("studio:agent:"))
-async def open_agent(callback: CallbackQuery, state: FSMContext) -> None:
-    project_id = int(callback.data.rsplit(":", 1)[1])
-    owned = await _owned_project(callback, project_id)
-    if owned is None or callback.message is None:
-        return
+async def _show_agent_models(
+    callback: CallbackQuery, state: FSMContext, project_id: int
+) -> bool:
+    if callback.message is None:
+        return False
     registry = get_ai_provider_registry()
     if not registry.enabled:
         await callback.answer("لا يوجد مزود AI مفعّل.", show_alert=True)
-        return
+        return False
     models, errors = await registry.models_for("text")
     models = models[:12]
     if not models:
         detail = next(iter(errors.values()), "لا توجد نماذج نصية متاحة")
         await callback.answer(detail[:180], show_alert=True)
-        return
+        return False
     await state.update_data(
         studio_project_id=project_id,
         studio_agent_models=[model.state_dict() for model in models],
@@ -665,13 +997,52 @@ async def open_agent(callback: CallbackQuery, state: FSMContext) -> None:
         ]
         for index, model in enumerate(models)
     ]
-    rows.append([InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")])
+    rows.append(
+        [InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")]
+    )
     await _safe_bound_edit(
         callback.message,
-        "🤖 اختر نموذج المونتاج. سيعدل النموذج نفس Timeline عبر أدوات آمنة فقط:",
+        f"✅ اكتمل جمع مواد Project #{project_id}.\n\n"
+        "اختر نموذج التخطيط. سيقرأ ملخص المواد والتحليل المحفوظ، ولن يشغّل FFmpeg أو shell مباشرة:",
         InlineKeyboardMarkup(inline_keyboard=rows),
     )
-    await callback.answer()
+    return True
+
+
+@router.callback_query(F.data.startswith("studio:done:"))
+async def finish_collecting(callback: CallbackQuery, state: FSMContext) -> None:
+    project_id = int(callback.data.rsplit(":", 1)[1])
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
+        return
+    user, _ = owned
+    items = await project_service.list_assets(project_id, user_id=user.id)
+    if not items:
+        await callback.answer("أرسل مادة واحدة على الأقل أولًا", show_alert=True)
+        return
+    try:
+        await _set_phase(state, StudioPhase.READY_FOR_INSTRUCTIONS)
+    except ValueError:
+        await state.update_data(studio_phase=StudioPhase.READY_FOR_INSTRUCTIONS.value)
+    await state.set_state(StudioState.waiting_instruction)
+    if await _show_agent_models(callback, state, project_id):
+        await callback.answer("تم حفظ المواد")
+
+
+@router.callback_query(F.data.startswith("studio:agent:"))
+async def open_agent(callback: CallbackQuery, state: FSMContext) -> None:
+    project_id = int(callback.data.rsplit(":", 1)[1])
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
+        return
+    data = await state.get_data()
+    if not data.get("studio_phase"):
+        await state.update_data(
+            studio_phase=StudioPhase.READY_FOR_INSTRUCTIONS.value,
+            studio_workflow=StudioWorkflow.SMART_EDIT.value,
+        )
+    if await _show_agent_models(callback, state, project_id):
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("studio:agentmodel:"))
@@ -686,25 +1057,77 @@ async def choose_agent_model(callback: CallbackQuery, state: FSMContext) -> None
         selected = models[int(raw_index)]
         provider_id = str(selected["provider_id"])
         model = str(selected["model_id"])
-        native_tools = "tools" in set(selected.get("capabilities") or [])
+        capabilities = set(selected.get("capabilities") or [])
+        input_modalities = set(selected.get("input_modalities") or [])
+        native_tools = "tools" in capabilities
+        vision = "vision" in capabilities or "image" in input_modalities
     except (IndexError, KeyError, TypeError, ValueError):
         await callback.answer("أعد فتح قائمة النماذج", show_alert=True)
         return
-    await state.set_state(StudioState.agent)
+    await state.set_state(StudioState.waiting_instruction)
     await state.update_data(
         studio_project_id=project_id,
         studio_agent_provider_id=provider_id,
         studio_agent_model=model,
         studio_agent_native_tools=native_tools,
+        studio_agent_vision=vision,
+    )
+    workflow = str(
+        data.get("studio_workflow") or StudioWorkflow.SMART_EDIT.value
+    )
+    workflow_prompt = {
+        StudioWorkflow.CUT.value: "اختر عملية القص أو اكتبها مباشرة مع التوقيت.",
+        StudioWorkflow.AUDIO.value: "اختر معالجة الصوت أو صفها مباشرة.",
+        StudioWorkflow.CAPTIONS.value: "صف لغة الكابتشن وتصميمه وتوقيته.",
+        StudioWorkflow.REOPEN.value: "صف التعديل المطلوب على Timeline السابق.",
+    }.get(
+        workflow,
+        "اكتب النتيجة التي تريدها بلغتك الطبيعية. مثال:\n"
+        "«حلل الفيديو الرئيسي، احذف الصمت، استخدم الصور في الأماكن المناسبة، "
+        "واصنع Reels سريعًا 30 ثانية مع كابتشن عربي.»",
     )
     await _safe_bound_edit(
         callback.message,
-        f"🤖 مونتاج بالذكاء الاصطناعي — Project #{project_id}\n\n"
-        "أرسل ملفات أو روابط، أو اكتب تعليماتك الطبيعية. كل تعديل يطبق على نفس Timeline "
-        "ويمكن التراجع عنه. استخدم المعاينة قبل التصدير النهائي.",
-        agent_keyboard(project_id),
+        f"🤖 Project #{project_id} جاهز للتعليمات\n\n{workflow_prompt}",
+        workflow_instruction_keyboard(project_id, workflow),
     )
     await callback.answer("تم اختيار النموذج")
+
+
+@router.callback_query(F.data.startswith("studio:operation:"))
+async def select_workflow_operation(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    _, _, raw_project, operation = callback.data.split(":", 3)
+    project_id = int(raw_project)
+    if await _owned_project(callback, project_id) is None or callback.message is None:
+        return
+    prompts = {
+        "trim": "اكتب وقت البداية والنهاية، مثل: «احتفظ من 00:08 إلى 00:42».",
+        "remove_range": "حدد الجزء المحذوف، مثل: «احذف من 00:08 إلى 00:12».",
+        "split_30": "اكتب «نفّذ» للتقسيم إلى مقاطع كل منها 30 ثانية.",
+        "split_60": "اكتب «نفّذ» للتقسيم إلى مقاطع كل منها 60 ثانية.",
+        "split_scenes": "اكتب «نفّذ» ليستخدم التحليل حدود المشاهد.",
+        "remove_silence": "اكتب «نفّذ» لحذف فترات الصمت المكتشفة.",
+        "best_moment": "حدد المدة المطلوبة لأفضل جزء، مثل: «أفضل 30 ثانية».",
+        "mute_original": "اكتب «نفّذ» لكتم أصوات الفيديوهات الأصلية.",
+        "replace_audio": "حدد الصوت المرفوع، مثل: «استبدله بالصوت الأخير».",
+        "mix_audio": "صف مستويات الخلط المطلوبة.",
+        "auto_duck": "اكتب «نفّذ» لخفض الموسيقى تلقائيًا أثناء الكلام.",
+        "normalize": "اكتب «نفّذ» لموازنة مستوى الصوت.",
+    }
+    if operation not in prompts:
+        await callback.answer("العملية غير مدعومة", show_alert=True)
+        return
+    await state.update_data(studio_operation=operation)
+    data = await state.get_data()
+    workflow = str(data.get("studio_workflow") or StudioWorkflow.SMART_EDIT.value)
+    await _safe_bound_edit(
+        callback.message,
+        f"Project #{project_id}\n\n{prompts[operation]}",
+        workflow_instruction_keyboard(project_id, workflow),
+    )
+    await callback.answer("تم اختيار العملية")
 
 
 @router.message(StudioState.agent, F.video | F.photo | F.audio | F.voice | F.document)
@@ -737,15 +1160,69 @@ async def handle_agent_instruction(
     if not provider_id or not model:
         await message.answer("أعد فتح وضع الذكاء الاصطناعي واختر نموذجًا.")
         return
-    thinking = await message.answer("🤖 أحلل Timeline وأطبق التعديلات…")
+    phase_before = str(
+        data.get("studio_phase") or StudioPhase.READY_FOR_INSTRUCTIONS.value
+    )
+    if phase_before in {
+        StudioPhase.PREVIEW_RENDERING.value,
+        StudioPhase.FINAL_RENDERING.value,
+    }:
+        await message.answer("الرندر جارٍ الآن. انتظر اكتماله أو ألغِه قبل تعديل Timeline.")
+        return
+    items = await project_service.list_assets(project_id, user_id=user.id)
+    recent = recent_asset_context(items, data.get("recent_asset_id"))
+    workflow = str(data.get("studio_workflow") or StudioWorkflow.SMART_EDIT.value)
+    selected_style = str(data.get("studio_style") or "")
+    operation = str(data.get("studio_operation") or "")
+    instruction = message.text
+    operation_directives = {
+        "trim": "نفّذ قصًا زمنيًا مطابقًا للتوقيت الذي يذكره المستخدم.",
+        "remove_range": "احذف النطاق الزمني الذي يحدده المستخدم.",
+        "split_30": "قسّم المادة بصريًا عند كل 30 ثانية.",
+        "split_60": "قسّم المادة بصريًا عند كل 60 ثانية.",
+        "split_scenes": "استخدم حدود المشاهد المحفوظة لتقسيم المقاطع.",
+        "remove_silence": "استخدم تحليل الصمت المحفوظ واحذف نطاقاته.",
+        "best_moment": "اختر أعلى اللحظات تقييمًا ضمن المدة المطلوبة.",
+        "mute_original": "عطّل الصوت الأصلي لكل مقاطع الفيديو.",
+        "replace_audio": "استبدل الصوت الأصلي بالصوت الذي يحدده المستخدم.",
+        "mix_audio": "اخلط المصادر الصوتية بالمستويات التي يحددها المستخدم.",
+        "auto_duck": "اخفض الموسيقى أثناء مقاطع الكلام أو Voice Over.",
+        "normalize": "طبّق loudness normalization على مصادر الصوت.",
+    }
+    if operation:
+        directive = operation_directives.get(operation)
+        if directive:
+            instruction = f"{directive} {instruction}"
+    if selected_style:
+        instruction = f"استخدم أسلوب {selected_style}. {instruction}"
+    thinking = await message.answer("🔎 أفهم المشروع والمواد…")
+
+    async def stage_changed(raw_phase: str) -> None:
+        phase = StudioPhase(raw_phase)
+        await _set_phase_if_session(state, phase)
+        labels = {
+            StudioPhase.ANALYZING: "🔎 أحلل محتوى المواد…",
+            StudioPhase.PLANNING: "🧠 أبني خطة المونتاج…",
+            StudioPhase.EDITING: "🛠 أطبق الخطة على Timeline…",
+        }
+        await _safe_bound_edit(thinking, labels[phase], agent_keyboard(project_id))
+
     try:
         reply = await agent.handle(
             project_id,
             user_id=user.id,
-            instruction=message.text,
+            instruction=instruction,
             provider_id=provider_id,
             model=model,
             native_tools=bool(data.get("studio_agent_native_tools")),
+            vision=bool(data.get("studio_agent_vision")),
+            project_context={
+                "workflow": workflow,
+                "selected_operation": operation or None,
+                "recent_asset": recent,
+                "project_asset_count": len(items),
+            },
+            stage_callback=stage_changed,
         )
         tools = "، ".join(reply.applied_tools)
         await _safe_bound_edit(
@@ -753,8 +1230,21 @@ async def handle_agent_instruction(
             f"✅ {reply.text[:1000]}\n\nالأدوات: {tools[:600]}",
             agent_keyboard(project_id),
         )
+        if operation:
+            await state.update_data(studio_operation=None)
         if reply.render_action:
-            await _enqueue_agent_render(message, project_id, user.id, reply.render_action)
+            await _enqueue_agent_render(
+                message, project_id, user.id, reply.render_action, state=state
+            )
+            await state.set_state(StudioState.awaiting_feedback)
+        elif phase_before == StudioPhase.READY_FOR_INSTRUCTIONS.value:
+            await _enqueue_agent_render(
+                message, project_id, user.id, "preview", state=state
+            )
+            await state.set_state(StudioState.awaiting_feedback)
+        else:
+            await _set_phase_if_session(state, StudioPhase.AWAITING_FEEDBACK)
+            await state.set_state(StudioState.awaiting_feedback)
     except Exception as exc:
         logger.exception(
             "studio agent request failed project_id=%s error_type=%s",
@@ -766,15 +1256,20 @@ async def handle_agent_instruction(
             f"تعذر تطبيق التعليمات بأمان: {_safe_studio_error(exc, agent=True)}",
             agent_keyboard(project_id),
         )
+        with suppress(ValueError):
+            await _set_phase_if_session(state, StudioPhase.AWAITING_FEEDBACK)
+        await state.set_state(StudioState.awaiting_feedback)
 
 
 @router.message(StudioState.agent, F.text)
+@router.message(StudioState.waiting_instruction, F.text)
+@router.message(StudioState.awaiting_feedback, F.text)
 async def receive_agent_instruction(message: Message, state: FSMContext) -> None:
     await handle_agent_instruction(message, state)
 
 
 @router.callback_query(F.data.startswith("studio:agentrender:"))
-async def agent_render(callback: CallbackQuery) -> None:
+async def agent_render(callback: CallbackQuery, state: FSMContext) -> None:
     _, _, raw_project, kind = callback.data.split(":")
     project_id = int(raw_project)
     owned = await _owned_project(callback, project_id)
@@ -782,7 +1277,10 @@ async def agent_render(callback: CallbackQuery) -> None:
         return
     user, _ = owned
     try:
-        await _enqueue_agent_render(callback.message, project_id, user.id, kind)
+        await _enqueue_agent_render(
+            callback.message, project_id, user.id, kind, state=state
+        )
+        await state.set_state(StudioState.awaiting_feedback)
     except Exception as exc:
         await callback.answer(str(exc)[:180], show_alert=True)
         return
@@ -853,12 +1351,27 @@ async def ingest_upload_message(
             telegram_file_id=candidate.file_id,
             metadata={"original_name": candidate.file_name},
         )
-        await projects.add_asset(project_id, asset.id, user_id=user.id)
-        _schedule_asset_analysis(asset.id, user_id=user.id, project_id=project_id)
-        await message.answer(
-            f"✅ أضيفت {_asset_icon(asset.asset_type)} {candidate.file_name[:60]}",
-            reply_markup=project_keyboard(project_id),
+        role = _automatic_role(asset.asset_type, candidate.file_name)
+        await projects.add_asset(
+            project_id, asset.id, user_id=user.id, role=role
         )
+        await state.update_data(
+            recent_asset_id=asset.id,
+            recent_asset_type=asset.asset_type,
+            recent_asset_name=candidate.file_name[:255],
+        )
+        _schedule_asset_analysis(asset.id, user_id=user.id, project_id=project_id)
+        phase = str(data.get("studio_phase") or StudioPhase.COLLECTING_MEDIA.value)
+        if phase == StudioPhase.COLLECTING_MEDIA.value:
+            _schedule_project_summary(
+                message, project_id=project_id, user_id=user.id
+            )
+        else:
+            await message.answer(
+                f"{_asset_icon(asset.asset_type)} تمت إضافة {candidate.file_name[:60]} إلى Project #{project_id}.\n"
+                "يمكنك الإشارة إليه الآن بقول: «الملف الذي أرسلته الآن».",
+                reply_markup=agent_keyboard(project_id),
+            )
     except Exception as exc:
         if asset is not None:
             with suppress(Exception):
@@ -878,11 +1391,24 @@ async def ingest_upload_message(
     StudioState.collecting,
     F.video | F.photo | F.audio | F.voice | F.document,
 )
+@router.message(
+    StudioState.collecting_media,
+    F.video | F.photo | F.audio | F.voice | F.document,
+)
+@router.message(
+    StudioState.waiting_instruction,
+    F.video | F.photo | F.audio | F.voice | F.document,
+)
+@router.message(
+    StudioState.awaiting_feedback,
+    F.video | F.photo | F.audio | F.voice | F.document,
+)
 async def receive_upload(message: Message, state: FSMContext) -> None:
     await ingest_upload_message(message, state)
 
 
 @router.message(StudioState.collecting, F.text)
+@router.message(StudioState.collecting_media, F.text)
 async def receive_project_url(message: Message, state: FSMContext) -> None:
     user = await _message_user(message)
     if user is None:
@@ -906,7 +1432,17 @@ async def receive_project_url(message: Message, state: FSMContext) -> None:
         asset = None
         try:
             asset = await asset_service.ingest_url(url, user_id=user.id, project_id=project_id)
-            await project_service.add_asset(project_id, asset.id, user_id=user.id)
+            await project_service.add_asset(
+                project_id,
+                asset.id,
+                user_id=user.id,
+                role=_automatic_role(asset.asset_type, ""),
+            )
+            await state.update_data(
+                recent_asset_id=asset.id,
+                recent_asset_type=asset.asset_type,
+                recent_asset_name=f"URL #{asset.id}",
+            )
             _schedule_asset_analysis(asset.id, user_id=user.id, project_id=project_id)
             added += 1
         except Exception as exc:
@@ -917,7 +1453,15 @@ async def receive_project_url(message: Message, state: FSMContext) -> None:
     text = f"✅ تمت إضافة {added} رابط إلى Project #{project_id}."
     if failures:
         text += f"\nتعذر {len(failures)}: {failures[0]}"
-    await progress.edit_text(text, reply_markup=project_keyboard(project_id))
+    phase = str(data.get("studio_phase") or StudioPhase.COLLECTING_MEDIA.value)
+    collecting = phase == StudioPhase.COLLECTING_MEDIA.value
+    await _safe_bound_edit(
+        progress,
+        text,
+        collecting_keyboard(project_id) if collecting else agent_keyboard(project_id),
+    )
+    if added and collecting:
+        _schedule_project_summary(message, project_id=project_id, user_id=user.id)
 
 
 @router.callback_query(F.data.startswith("studio:assets:"))
@@ -970,7 +1514,11 @@ async def role_menu(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text=role, callback_data=f"studio:role:{project_id}:{asset_id}:{role}")]
         for role in roles
     ]
-    await callback.message.edit_text("🏷 اختر دور المادة:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _safe_bound_edit(
+        callback.message,
+        "🏷 اختر دور المادة:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
     await callback.answer()
 
 
@@ -1040,7 +1588,7 @@ async def choose_template(callback: CallbackQuery) -> None:
     if len(markup.inline_keyboard) == 1:
         await callback.answer("تركيبة المواد غير مدعومة", show_alert=True)
         return
-    await callback.message.edit_text("🎬 اختر طريقة المونتاج:", reply_markup=markup)
+    await _safe_bound_edit(callback.message, "🎬 اختر طريقة المونتاج:", markup)
     await callback.answer()
 
 
@@ -1066,9 +1614,10 @@ async def start_render(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer(str(exc)[:180], show_alert=True)
         return
     await state.clear()
-    await callback.message.edit_text(
+    await _safe_bound_edit(
+        callback.message,
         _progress_text(project_id, 0.0, time.monotonic()),
-        reply_markup=render_cancel_keyboard(job.id),
+        render_cancel_keyboard(job.id),
     )
     _track(
         asyncio.create_task(
@@ -1109,8 +1658,106 @@ async def cancel_project(callback: CallbackQuery, state: FSMContext) -> None:
     await render_service.cancel_project_renders(project_id, user_id=user.id)
     await state.clear()
     if callback.message:
-        await callback.message.edit_text("🗑 تم إلغاء المشروع.", reply_markup=studio_home_keyboard())
+        await _safe_bound_edit(
+            callback.message, "🗑 تم إلغاء المشروع.", studio_home_keyboard()
+        )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:summary:"))
+async def show_project_summary(callback: CallbackQuery, state: FSMContext) -> None:
+    project_id = int(callback.data.rsplit(":", 1)[1])
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
+        return
+    user, _ = owned
+    data = await state.get_data()
+    phase = str(
+        data.get("studio_phase") or StudioPhase.READY_FOR_INSTRUCTIONS.value
+    )
+    text = await _project_summary(project_id, user_id=user.id, phase=phase)
+    markup = (
+        collecting_keyboard(project_id)
+        if phase == StudioPhase.COLLECTING_MEDIA.value
+        else agent_keyboard(project_id)
+    )
+    await _safe_bound_edit(callback.message, text, markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:style:"))
+async def select_instruction_style(callback: CallbackQuery, state: FSMContext) -> None:
+    _, _, raw_project, style = callback.data.split(":", 3)
+    project_id = int(raw_project)
+    if await _owned_project(callback, project_id) is None or callback.message is None:
+        return
+    allowed = {"reels-fast", "cinematic", "product-ad", "podcast", "auto"}
+    if style not in allowed:
+        await callback.answer("الأسلوب غير مدعوم", show_alert=True)
+        return
+    await state.update_data(studio_style="" if style == "auto" else style)
+    prompt = (
+        "✨ سيختار المخطط الأسلوب تلقائيًا. اكتب هدف الفيديو ومدته."
+        if style == "auto"
+        else f"✅ تم اختيار أسلوب {style}. اكتب الآن تفاصيل النتيجة المطلوبة."
+    )
+    await _safe_bound_edit(callback.message, prompt, instruction_keyboard(project_id))
+    await callback.answer("تم اختيار الأسلوب")
+
+
+@router.callback_query(F.data == "studio:reopen")
+async def choose_project_to_reopen(callback: CallbackQuery) -> None:
+    user = await _callback_user(callback)
+    if user is None or callback.message is None:
+        return
+    projects = [
+        project
+        for project in await project_service.list_projects(user.id, limit=10)
+        if project.status != ProjectStatus.CANCELLED.value
+    ]
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🔄 #{project.id} · {project.name[:35]}",
+                callback_data=f"studio:reopenproject:{project.id}",
+            )
+        ]
+        for project in projects
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ الاستوديو", callback_data="menu:studio")])
+    await _safe_bound_edit(
+        callback.message,
+        "🔄 اختر مشروعًا سابقًا. سنستخدم Timeline الأصلي وتعديلاته، وليس الفيديو النهائي المسطح:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("studio:reopenproject:"))
+async def reopen_previous_project(callback: CallbackQuery, state: FSMContext) -> None:
+    project_id = int(callback.data.rsplit(":", 1)[1])
+    owned = await _owned_project(callback, project_id)
+    if owned is None or callback.message is None:
+        return
+    user, _ = owned
+    try:
+        await project_service.reopen_project(project_id, user_id=user.id)
+    except ValueError as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+        return
+    await state.set_state(StudioState.collecting_media)
+    await state.update_data(
+        studio_project_id=project_id,
+        studio_workflow=StudioWorkflow.REOPEN.value,
+        studio_phase=StudioPhase.COLLECTING_MEDIA.value,
+        recent_asset_id=None,
+    )
+    await _safe_bound_edit(
+        callback.message,
+        f"Project #{project_id}\n\n{_WORKFLOW_PROMPTS[StudioWorkflow.REOPEN]}",
+        collecting_keyboard(project_id),
+    )
+    await callback.answer("تم فتح Timeline الأصلي")
 
 
 @router.callback_query(F.data == "studio:projects")
@@ -1133,7 +1780,11 @@ async def my_projects(callback: CallbackQuery) -> None:
     if not projects:
         lines.append("\nلا توجد مشاريع بعد.")
     rows.append([InlineKeyboardButton(text="⬅️ الاستوديو", callback_data="menu:studio")])
-    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _safe_bound_edit(
+        callback.message,
+        "\n".join(lines),
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
     await callback.answer()
 
 

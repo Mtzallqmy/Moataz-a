@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from app import db as database
 from app.bot import studio
 from app.config import Settings
+from app.services.ai_registry import CatalogModel
 from app.services.assets import AssetService
 from app.services.composer import ComposerService
 from app.services.downloader import MediaInfo
@@ -62,6 +63,64 @@ def _video(path: Path) -> Path:
     return path
 
 
+def _callbacks(markup) -> set[str]:
+    return {
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+
+def test_studio_home_and_collection_expose_guided_workflows() -> None:
+    home = _callbacks(studio.studio_home_keyboard())
+    assert {
+        "studio:workflow:smart_edit",
+        "studio:workflow:cut",
+        "studio:workflow:audio",
+        "studio:workflow:captions",
+        "studio:reopen",
+        "studio:projects",
+    } <= home
+    collecting = _callbacks(studio.collecting_keyboard(17))
+    assert "studio:done:17" in collecting
+    assert "studio:summary:17" in collecting
+
+
+def test_cut_and_audio_workflows_expose_only_supported_operations() -> None:
+    cut = _callbacks(studio.workflow_instruction_keyboard(17, "cut"))
+    assert {
+        "studio:operation:17:trim",
+        "studio:operation:17:remove_range",
+        "studio:operation:17:split_30",
+        "studio:operation:17:split_60",
+        "studio:operation:17:split_scenes",
+        "studio:operation:17:remove_silence",
+        "studio:operation:17:best_moment",
+    } <= cut
+    audio = _callbacks(studio.workflow_instruction_keyboard(17, "audio"))
+    assert {
+        "studio:operation:17:mute_original",
+        "studio:operation:17:replace_audio",
+        "studio:operation:17:mix_audio",
+        "studio:operation:17:auto_duck",
+        "studio:operation:17:normalize",
+    } <= audio
+    assert not any("split" in value for value in audio)
+
+
+def test_feedback_controls_keep_project_context_and_revision_actions() -> None:
+    actions = _callbacks(studio.agent_keyboard(43))
+    assert {
+        "studio:agentrender:43:preview",
+        "studio:agentrender:43:final",
+        "studio:agentundo:43",
+        "studio:agentredo:43",
+        "studio:add:43",
+        "studio:summary:43",
+    } <= actions
+
+
 async def _user_project(settings: Settings) -> tuple[database.User, database.MediaProject]:
     await database.init_db()
     async with database.SessionLocal() as session:
@@ -87,12 +146,25 @@ async def _user_project(settings: Settings) -> tuple[database.User, database.Med
 class FakeState:
     def __init__(self, project_id: int) -> None:
         self.project_id = project_id
+        self.current_state = None
+        self.data = {
+            "studio_project_id": project_id,
+            "studio_phase": "COLLECTING_MEDIA",
+            "studio_workflow": "smart_edit",
+        }
 
     async def get_data(self):
-        return {"studio_project_id": self.project_id}
+        return dict(self.data)
+
+    async def update_data(self, **values):
+        self.data.update(values)
 
     async def clear(self):
         self.project_id = 0
+        self.data.clear()
+
+    async def set_state(self, value):
+        self.current_state = value
 
 
 class DownloadBot:
@@ -250,11 +322,13 @@ async def test_telegram_upload_ingestion(
 
     monkeypatch.setattr(studio, "settings", settings)
     monkeypatch.setattr(studio, "_message_user", current_user)
+    monkeypatch.setattr(studio, "_schedule_project_summary", lambda *args, **kwargs: None)
     assets = AssetService(settings)
     projects = ProjectService(settings)
+    state = FakeState(project.id)
     await studio.ingest_upload_message(
         message,
-        FakeState(project.id),
+        state,
         assets=assets,
         projects=projects,
     )
@@ -262,7 +336,98 @@ async def test_telegram_upload_ingestion(
     assert len(linked) == 1
     assert linked[0].asset.asset_type == declared
     assert Path(linked[0].asset.local_path).is_file()
+    assert state.data["recent_asset_id"] == linked[0].asset.id
+    assert not any("تعذر قبول الملف" in answer for answer in message.answers)
     assert not list(settings.render_temp_dir.glob("telegram-upload-*"))
+
+
+@pytest.mark.asyncio
+async def test_upload_during_feedback_stays_in_same_project_and_sets_recent_asset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = Settings(
+        project_dir=tmp_path / "projects", render_temp_dir=tmp_path / "tmp"
+    )
+    user, project = await _user_project(settings)
+    source = _image(tmp_path / "latest.jpg")
+    payload = SimpleNamespace(
+        file_id="latest-photo",
+        file_name="latest.jpg",
+        mime_type="image/jpeg",
+        file_size=source.stat().st_size,
+    )
+    message = FakeMessage(DownloadBot({payload.file_id: source}), "photo", payload)
+
+    async def current_user(_message):
+        return user
+
+    monkeypatch.setattr(studio, "settings", settings)
+    monkeypatch.setattr(studio, "_message_user", current_user)
+    monkeypatch.setattr(studio, "_schedule_asset_analysis", lambda *args, **kwargs: None)
+    state = FakeState(project.id)
+    state.data["studio_phase"] = "AWAITING_FEEDBACK"
+    await studio.ingest_upload_message(
+        message,
+        state,
+        assets=AssetService(settings),
+        projects=ProjectService(settings),
+    )
+    linked = await ProjectService(settings).list_assets(
+        project.id, user_id=user.id
+    )
+    assert len(linked) == 1
+    assert state.data["studio_project_id"] == project.id
+    assert state.data["recent_asset_id"] == linked[0].asset.id
+    assert "الملف الذي أرسلته الآن" in message.answers[-1]
+
+
+@pytest.mark.asyncio
+async def test_finish_collection_moves_to_instruction_session(monkeypatch) -> None:
+    edits: list[str] = []
+    answers: list[str | None] = []
+
+    class BoundMessage:
+        async def edit_text(self, text, **kwargs):
+            edits.append(text)
+
+    class Callback:
+        data = "studio:done:17"
+        message = BoundMessage()
+
+        async def answer(self, text=None, **kwargs):
+            answers.append(text)
+
+    class Registry:
+        enabled = True
+
+        async def models_for(self, capability):
+            assert capability == "text"
+            return [
+                CatalogModel(
+                    provider_id="provider",
+                    provider_name="Provider",
+                    model_id="model",
+                    capabilities=("text",),
+                )
+            ], {}
+
+    async def owned(_callback, project_id):
+        assert project_id == 17
+        return SimpleNamespace(id=5), SimpleNamespace(id=17)
+
+    async def assets(project_id, *, user_id):
+        assert (project_id, user_id) == (17, 5)
+        return [SimpleNamespace(asset=SimpleNamespace(id=1))]
+
+    state = FakeState(17)
+    monkeypatch.setattr(studio, "_owned_project", owned)
+    monkeypatch.setattr(studio.project_service, "list_assets", assets)
+    monkeypatch.setattr(studio, "get_ai_provider_registry", lambda: Registry())
+    await studio.finish_collecting(Callback(), state)
+    assert state.data["studio_phase"] == "READY_FOR_INSTRUCTIONS"
+    assert state.current_state == studio.StudioState.waiting_instruction
+    assert any("اكتمل جمع مواد" in text for text in edits)
+    assert answers[-1] == "تم حفظ المواد"
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,10 +10,20 @@ from sqlalchemy import select
 
 from app.db import MediaProject, SessionLocal, StudioAgentMessage
 from app.services.ai_registry import AIProviderRegistry, get_ai_provider_registry
-from app.services.edit_planner import AIEditPlanner, compile_tool_calls
-from app.services.media_intelligence import MediaIntelligenceService, media_intelligence_service
+from app.services.edit_planner import (
+    AIEditPlanner,
+    compile_tool_calls,
+    constrain_plan_for_operation,
+)
+from app.services.media_intelligence import (
+    MediaIntelligenceService,
+    ProviderVisionAnalyzer,
+    media_intelligence_service,
+)
 from app.services.openai_compatible import AIProviderError
 from app.services.timeline import TOOL_NAMES, TimelineService, timeline_service
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +82,17 @@ _PLANNING_MARKERS = {
     "documentary",
 }
 
+_ANALYSIS_OPERATIONS = {
+    "split_30",
+    "split_60",
+    "split_scenes",
+    "remove_silence",
+    "best_moment",
+    "replace_audio",
+    "auto_duck",
+    "normalize",
+}
+
 
 def requires_edit_plan(instruction: str) -> bool:
     """Route semantic, multi-step requests through analysis before Timeline tools."""
@@ -79,6 +102,13 @@ def requires_edit_plan(instruction: str) -> bool:
         return True
     separators = normalized.count(" ثم ") + normalized.count("،") + normalized.count(",")
     return separators >= 2
+
+
+def requires_project_plan(
+    instruction: str, project_context: dict[str, Any] | None = None
+) -> bool:
+    operation = str((project_context or {}).get("selected_operation") or "")
+    return requires_edit_plan(instruction) or operation in _ANALYSIS_OPERATIONS
 
 
 def _tool(name: str, description: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -191,6 +221,9 @@ class StudioAgentService:
         provider_id: str,
         model: str,
         native_tools: bool = False,
+        vision: bool = False,
+        project_context: dict[str, Any] | None = None,
+        stage_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> StudioAgentReply:
         instruction = instruction.strip()
         if not instruction or len(instruction) > 8000:
@@ -198,13 +231,13 @@ class StudioAgentService:
         timeline = await self.timelines.get(project_id, user_id=user_id)
         history = await self._history(project_id, user_id=user_id)
         await self._store(project_id, "user", instruction, provider_id, model)
-        system = self._system_prompt(timeline)
+        system = self._system_prompt(timeline, project_context=project_context)
         messages: list[dict[str, object]] = [
             {"role": "system", "content": system},
             *history,
             {"role": "user", "content": instruction},
         ]
-        if requires_edit_plan(instruction):
+        if requires_project_plan(instruction, project_context):
             return await self._planned(
                 project_id,
                 user_id=user_id,
@@ -213,7 +246,12 @@ class StudioAgentService:
                 model=model,
                 timeline=timeline,
                 history=history,
+                project_context=project_context,
+                vision=vision,
+                stage_callback=stage_callback,
             )
+        if stage_callback is not None:
+            await stage_callback("EDITING")
         calls: list[dict[str, Any]]
         response_text = ""
         response_model = model
@@ -263,13 +301,43 @@ class StudioAgentService:
         model: str,
         timeline: dict[str, Any],
         history: list[dict[str, object]],
+        project_context: dict[str, Any] | None,
+        vision: bool,
+        stage_callback: Callable[[str], Awaitable[None]] | None,
     ) -> StudioAgentReply:
+        if stage_callback is not None:
+            await stage_callback("ANALYZING")
         intelligence = await self.intelligence.analyze_project(
             project_id, user_id=user_id
         )
+        if vision:
+            analyzer = ProviderVisionAnalyzer(
+                self.registry,
+                provider_id=provider_id,
+                model=model,
+                allowed_root=self.intelligence.settings.project_dir,
+            )
+            try:
+                intelligence = await self.intelligence.enrich_project_vision(
+                    project_id, user_id=user_id, vision=analyzer
+                )
+            except Exception as exc:
+                logger.warning(
+                    "studio vision enrichment skipped project_id=%s error_type=%s",
+                    project_id,
+                    type(exc).__name__,
+                )
+                intelligence = {
+                    **intelligence,
+                    "vision_warning": "Vision enrichment was unavailable; local analysis was used.",
+                }
+        if project_context:
+            intelligence = {**intelligence, "session_context": project_context}
         validation_feedback = ""
         calls: list[dict[str, Any]] = []
         plan = None
+        if stage_callback is not None:
+            await stage_callback("PLANNING")
         for attempt in range(2):
             plan = await self.planner.generate(
                 instruction,
@@ -279,6 +347,9 @@ class StudioAgentService:
                 model=model,
                 conversation_history=history,
                 validation_feedback=validation_feedback,
+            )
+            plan = constrain_plan_for_operation(
+                plan, intelligence, project_context
             )
             try:
                 calls = compile_tool_calls(plan, timeline, intelligence)
@@ -294,6 +365,8 @@ class StudioAgentService:
         render_action = self._requested_render(instruction)
         if render_action:
             calls.append({"name": f"render_{render_action}", "arguments": {}})
+        if stage_callback is not None:
+            await stage_callback("EDITING")
         result = await self.timelines.apply(project_id, user_id=user_id, calls=calls)
         text = f"تم تطبيق خطة المونتاج: {plan.goal}"
         if plan.rationale:
@@ -404,8 +477,13 @@ class StudioAgentService:
             await session.commit()
 
     @staticmethod
-    def _system_prompt(timeline: dict[str, Any]) -> str:
+    def _system_prompt(
+        timeline: dict[str, Any], *, project_context: dict[str, Any] | None = None
+    ) -> str:
         compact = json.dumps(timeline, ensure_ascii=False, separators=(",", ":"))[:24_000]
+        context = json.dumps(
+            project_context or {}, ensure_ascii=False, separators=(",", ":")
+        )[:4000]
         return (
             "You are Moataz Media Studio's editing planner. Modify the existing project, never create "
             "a new project. You cannot run shell commands or FFmpeg. Use only the supplied deterministic "
@@ -414,8 +492,11 @@ class StudioAgentService:
             "For full video mute use set_original_audio(enabled=false); for a timed mute use "
             "set_volume_range(volume=0). Use replace_clip_audio for a specific video and attached "
             "audio/voice asset. Use duck_background_music to lower music during overlapping voice. "
+            "Resolve phrases such as 'this image', 'the latest audio', or 'the file I just sent' "
+            "only from session_context.recent_asset. If its ambiguous_type_count is greater than 1 "
+            "and the reference is not explicitly recent, ask the user to identify the asset instead of guessing. "
             "When the user asks to see the result, request render_preview; request render_final only when explicit. "
-            f"Current renderer-neutral Timeline JSON: {compact}"
+            f"Session context: {context}. Current renderer-neutral Timeline JSON: {compact}"
         )
 
 

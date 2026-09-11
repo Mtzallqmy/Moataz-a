@@ -25,6 +25,7 @@ from app.services.studio_agent import (
     StudioAgentService,
     _parse_json_reply,
     requires_edit_plan,
+    requires_project_plan,
 )
 from app.services.timeline import TimelineService, new_timeline
 
@@ -303,6 +304,8 @@ async def test_mocked_telegram_agent_instruction_updates_timeline_and_starts_pre
             return Thinking()
 
     class State:
+        current = None
+
         async def get_data(self):
             return {
                 "studio_project_id": 77,
@@ -313,6 +316,9 @@ async def test_mocked_telegram_agent_instruction_updates_timeline_and_starts_pre
 
         async def clear(self):
             raise AssertionError("valid project must keep its agent state")
+
+        async def set_state(self, value):
+            self.current = value
 
     class Agent:
         async def handle(self, *args, **kwargs):
@@ -330,7 +336,7 @@ async def test_mocked_telegram_agent_instruction_updates_timeline_and_starts_pre
     async def project(project_id, *, user_id):
         return SimpleNamespace(id=project_id, user_id=user_id)
 
-    async def enqueue(_message, project_id, user_id, kind):
+    async def enqueue(_message, project_id, user_id, kind, **kwargs):
         renders.append((project_id, user_id, kind))
 
     monkeypatch.setattr(studio, "_message_user", user)
@@ -372,9 +378,98 @@ async def test_agent_mode_routes_url_only_message_to_existing_downloader_flow(mo
     assert routed == ["https://youtu.be/example"]
 
 
+@pytest.mark.asyncio
+async def test_telegram_agent_passes_recent_asset_context_without_guessing(monkeypatch) -> None:
+    captured = {}
+
+    class Message:
+        text = "ضع الصورة التي أرسلتها الآن بعد المشهد الثاني"
+        from_user = SimpleNamespace(id=123, username="agent")
+        chat = SimpleNamespace(id=456)
+        bot = SimpleNamespace()
+
+        async def answer(self, text, **kwargs):
+            return SimpleNamespace(edit_text=_noop_edit)
+
+    class State:
+        data = {
+            "studio_project_id": 90,
+            "studio_agent_provider_id": "router",
+            "studio_agent_model": "model",
+            "studio_phase": "AWAITING_FEEDBACK",
+            "studio_workflow": "smart_edit",
+            "recent_asset_id": 12,
+        }
+
+        async def get_data(self):
+            return dict(self.data)
+
+        async def update_data(self, **values):
+            self.data.update(values)
+
+        async def set_state(self, value):
+            return None
+
+        async def clear(self):
+            raise AssertionError
+
+    class Agent:
+        async def handle(self, *args, **kwargs):
+            captured.update(kwargs["project_context"])
+            return StudioAgentReply(
+                text="تمت إضافة الصورة",
+                model="model",
+                applied_tools=("add_overlay",),
+                render_action=None,
+                timeline={"version": 2},
+            )
+
+    item = SimpleNamespace(
+        link=SimpleNamespace(role="main"),
+        asset=SimpleNamespace(
+            id=12,
+            asset_type="image",
+            local_path="/safe/image.jpg",
+            metadata_json='{"original_name":"new-product.jpg"}',
+        ),
+    )
+
+    async def user(_message):
+        return SimpleNamespace(id=9)
+
+    async def project(project_id, *, user_id):
+        return SimpleNamespace(id=project_id, user_id=user_id)
+
+    async def assets(project_id, *, user_id):
+        return [item]
+
+    monkeypatch.setattr(studio, "_message_user", user)
+    monkeypatch.setattr(studio.project_service, "get_project", project)
+    monkeypatch.setattr(studio.project_service, "list_assets", assets)
+    await studio.handle_agent_instruction(Message(), State(), agent=Agent())
+    assert captured["recent_asset"] == {
+        "asset_id": 12,
+        "asset_type": "image",
+        "role": "main",
+        "name": "new-product.jpg",
+        "type_index": 1,
+        "ambiguous_type_count": 1,
+    }
+
+
+async def _noop_edit(*args, **kwargs):
+    return None
+
+
 def test_complex_semantic_requests_use_edit_planning_stage() -> None:
     assert requires_edit_plan("اختر أفضل اللقطات واحذف الصمت") is True
     assert requires_edit_plan("قص أول خمس ثوان") is False
+    assert requires_project_plan(
+        "نفّذ", {"selected_operation": "remove_silence"}
+    ) is True
+    assert requires_project_plan(
+        "نفّذ", {"selected_operation": "replace_audio"}
+    ) is True
 
 
 @pytest.mark.asyncio
