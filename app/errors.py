@@ -11,12 +11,17 @@ class ErrorCode(StrEnum):
     PRIVATE_MEDIA = "PRIVATE_MEDIA"
     AUTH_REQUIRED = "AUTH_REQUIRED"
     ANTI_BOT = "ANTI_BOT"
+    BOT_CHALLENGE = "ANTI_BOT"
     UNSUPPORTED_EXTRACTOR = "UNSUPPORTED_EXTRACTOR"
+    UNSUPPORTED_URL = "UNSUPPORTED_EXTRACTOR"
     FORMAT_UNAVAILABLE = "FORMAT_UNAVAILABLE"
     EXTRACTOR_ERROR = "EXTRACTOR_ERROR"
     NETWORK_TIMEOUT = "NETWORK_TIMEOUT"
+    HTTP_403 = "HTTP_403"
     HTTP_429 = "HTTP_429"
     UPSTREAM_5XX = "UPSTREAM_5XX"
+    UPSTREAM_ERROR = "UPSTREAM_5XX"
+    BACKEND_UNAVAILABLE = "BACKEND_UNAVAILABLE"
     TELEGRAM_NETWORK = "TELEGRAM_NETWORK"
     TELEGRAM_UPLOAD = "TELEGRAM_UPLOAD"
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
@@ -87,6 +92,8 @@ def classify_error(exc: BaseException) -> ErrorInfo:
         return ErrorInfo(ErrorCode.TELEGRAM_UPLOAD, False)
     if "429" in text or "too many requests" in text:
         return ErrorInfo(ErrorCode.HTTP_429, True)
+    if any(marker in text for marker in ("http error 403", "http 403", "status 403", "forbidden")):
+        return ErrorInfo(ErrorCode.HTTP_403, True)
     if any(marker in text for marker in ("500", "502", "503", "504", "service unavailable", "bad gateway")):
         return ErrorInfo(ErrorCode.UPSTREAM_5XX, True)
     if any(marker in text for marker in ("timeout", "timed out", "socket timeout")):
@@ -116,7 +123,9 @@ _USER_MESSAGES = {
         ErrorCode.EXTRACTOR_ERROR: "تعذر استخراج الرابط من المنصة، جرّب لاحقًا أو حدّث الرابط.",
         ErrorCode.NETWORK_TIMEOUT: "انتهت مهلة الاتصال بالمنصة. ستتم المحاولة لاحقًا.",
         ErrorCode.HTTP_429: "المنصة حدّت عدد الطلبات مؤقتًا. حاول بعد قليل.",
+        ErrorCode.HTTP_403: "رفضت المنصة مسار الاتصال الحالي. تمت تجربة البدائل المتاحة.",
         ErrorCode.UPSTREAM_5XX: "المنصة تواجه عطلًا مؤقتًا. حاول لاحقًا.",
+        ErrorCode.BACKEND_UNAVAILABLE: "لا يتوفر حاليًا محرك تحميل مناسب لهذا الرابط.",
     },
     "en": {
         ErrorCode.INVALID_URL: "The URL is invalid or blocked for security reasons.",
@@ -129,7 +138,9 @@ _USER_MESSAGES = {
         ErrorCode.EXTRACTOR_ERROR: "The platform could not be parsed. Try later or use an updated URL.",
         ErrorCode.NETWORK_TIMEOUT: "The platform connection timed out. Please try later.",
         ErrorCode.HTTP_429: "The platform is temporarily rate-limiting requests. Try again later.",
+        ErrorCode.HTTP_403: "The platform rejected the current route. Available fallbacks were tried.",
         ErrorCode.UPSTREAM_5XX: "The platform is temporarily unavailable. Try again later.",
+        ErrorCode.BACKEND_UNAVAILABLE: "No suitable download backend is currently available.",
     },
 }
 
