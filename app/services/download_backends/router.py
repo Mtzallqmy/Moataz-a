@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from app.config import get_settings
 from app.errors import ErrorCode, classify_error
 from app.security import redact_secrets
 from app.services.download_backends.base import (
@@ -91,8 +92,23 @@ class ProviderRouter:
         backends: Iterable[DownloadBackend],
         *,
         health: BackendHealthRegistry | None = None,
+        register_optional: bool = True,
     ) -> None:
         self.backends = {backend.name: backend for backend in backends}
+        if register_optional:
+            settings = get_settings()
+            from app.services.download_backends.gallerydl_backend import GalleryDlBackend
+            from app.services.download_backends.instaloader_backend import InstaloaderBackend
+            from app.services.download_backends.pytubefix_backend import PytubefixBackend
+            from app.services.download_backends.tiktok_backend import TikTokBackend
+
+            for backend in (
+                GalleryDlBackend(settings),
+                InstaloaderBackend(settings),
+                PytubefixBackend(settings),
+                TikTokBackend(settings),
+            ):
+                self.backends.setdefault(backend.name, backend)
         self.health = health or BackendHealthRegistry()
 
     def order(self, detected: DetectedMedia) -> tuple[DownloadBackend, ...]:
