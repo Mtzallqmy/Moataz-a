@@ -24,6 +24,7 @@ from app.services.ai_registry import get_ai_provider_registry
 from app.services.assets import AssetService, asset_service
 from app.services.composer import composer_service
 from app.services.media import fit_media_for_upload, probe_media_file
+from app.services.media_intelligence import MediaIntelligenceService
 from app.services.projects import ProjectAssetItem, ProjectService, project_service
 from app.services.render_service import RenderService, render_service
 from app.services.studio_agent import StudioAgentService, studio_agent_service
@@ -35,6 +36,7 @@ settings = get_settings()
 router = Router(name="media-studio")
 logger = logging.getLogger("moataz.studio.telegram")
 _delivery_tasks: set[asyncio.Task] = set()
+_analysis_tasks: set[asyncio.Task] = set()
 
 
 class StudioState(StatesGroup):
@@ -495,6 +497,30 @@ def _track(task: asyncio.Task) -> None:
     task.add_done_callback(_delivery_tasks.discard)
 
 
+def _schedule_asset_analysis(asset_id: int, *, user_id: int, project_id: int) -> None:
+    """Analyze newly attached media without holding the Telegram update open."""
+
+    service = MediaIntelligenceService(settings)
+    task = asyncio.create_task(
+        service.analyze_asset(asset_id, user_id=user_id, project_id=project_id),
+        name=f"studio-analysis-{asset_id}",
+    )
+    _analysis_tasks.add(task)
+
+    def completed(done: asyncio.Task) -> None:
+        _analysis_tasks.discard(done)
+        if done.cancelled():
+            return
+        if exc := done.exception():
+            logger.warning(
+                "studio media analysis failed asset_id=%s error_type=%s",
+                asset_id,
+                type(exc).__name__,
+            )
+
+    task.add_done_callback(completed)
+
+
 async def _enqueue_agent_render(message: Message, project_id: int, user_id: int, kind: str) -> None:
     job = await render_service.create_render(
         project_id,
@@ -841,6 +867,7 @@ async def ingest_upload_message(
             metadata={"original_name": candidate.file_name},
         )
         await projects.add_asset(project_id, asset.id, user_id=user.id)
+        _schedule_asset_analysis(asset.id, user_id=user.id, project_id=project_id)
         await message.answer(
             f"✅ أضيفت {_asset_icon(asset.asset_type)} {candidate.file_name[:60]}",
             reply_markup=project_keyboard(project_id),
@@ -893,6 +920,7 @@ async def receive_project_url(message: Message, state: FSMContext) -> None:
         try:
             asset = await asset_service.ingest_url(url, user_id=user.id, project_id=project_id)
             await project_service.add_asset(project_id, asset.id, user_id=user.id)
+            _schedule_asset_analysis(asset.id, user_id=user.id, project_id=project_id)
             added += 1
         except Exception as exc:
             if asset is not None:
