@@ -15,6 +15,7 @@ from app.db import (
     SessionLocal,
     TimelineRevision,
 )
+from app.services.project_locks import project_mutation_lock
 from app.services.timeline import TRANSITIONS, new_timeline, parse_timeline, sync_assets
 
 PRESETS: dict[str, tuple[str, int, int]] = {
@@ -174,31 +175,61 @@ class ProjectService:
     async def add_asset(self, project_id: int, asset_id: int, *, user_id: int, role: str = "main") -> ProjectAsset:
         if role not in ROLES:
             raise ValueError("Unknown asset role")
-        async with SessionLocal() as session:
-            project = await session.scalar(select(MediaProject).where(MediaProject.id == project_id, MediaProject.user_id == user_id))
-            asset = await session.scalar(select(MediaAsset).where(MediaAsset.id == asset_id, MediaAsset.user_id == user_id))
-            if project is None or asset is None:
-                raise LookupError("Project or asset not found")
-            existing = await session.get(ProjectAsset, (project_id, asset_id))
-            if existing is not None:
-                session.expunge(existing)
-                return existing
-            count = int(await session.scalar(select(func.count()).select_from(ProjectAsset).where(ProjectAsset.project_id == project_id)) or 0)
-            if count >= self.settings.max_project_assets:
-                raise ValueError("Project asset limit reached")
-            if project.status == ProjectStatus.CANCELLED.value:
-                raise ValueError("Cancelled project cannot be modified")
-            if not asset.local_path:
-                raise ValueError("Asset storage path is missing")
-            max_position = await session.scalar(select(func.max(ProjectAsset.position)).where(ProjectAsset.project_id == project_id))
-            link = ProjectAsset(project_id=project_id, asset_id=asset_id, position=(int(max_position) + 1) if max_position is not None else 0, role=role)
-            session.add(link)
-            await session.flush()
-            await self._write_timeline(session, project)
-            await session.commit()
-            await session.refresh(link)
-            session.expunge(link)
-            return link
+        async with project_mutation_lock(project_id):
+            async with SessionLocal() as session:
+                project = await session.scalar(
+                    select(MediaProject)
+                    .where(
+                        MediaProject.id == project_id,
+                        MediaProject.user_id == user_id,
+                    )
+                    .with_for_update()
+                )
+                asset = await session.scalar(
+                    select(MediaAsset).where(
+                        MediaAsset.id == asset_id, MediaAsset.user_id == user_id
+                    )
+                )
+                if project is None or asset is None:
+                    raise LookupError("Project or asset not found")
+                existing = await session.get(ProjectAsset, (project_id, asset_id))
+                if existing is not None:
+                    session.expunge(existing)
+                    return existing
+                count = int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ProjectAsset)
+                        .where(ProjectAsset.project_id == project_id)
+                    )
+                    or 0
+                )
+                if count >= self.settings.max_project_assets:
+                    raise ValueError("Project asset limit reached")
+                if project.status == ProjectStatus.CANCELLED.value:
+                    raise ValueError("Cancelled project cannot be modified")
+                if not asset.local_path:
+                    raise ValueError("Asset storage path is missing")
+                max_position = await session.scalar(
+                    select(func.max(ProjectAsset.position)).where(
+                        ProjectAsset.project_id == project_id
+                    )
+                )
+                link = ProjectAsset(
+                    project_id=project_id,
+                    asset_id=asset_id,
+                    position=(int(max_position) + 1)
+                    if max_position is not None
+                    else 0,
+                    role=role,
+                )
+                session.add(link)
+                await session.flush()
+                await self._write_timeline(session, project)
+                await session.commit()
+                await session.refresh(link)
+                session.expunge(link)
+                return link
 
     async def remove_asset(self, project_id: int, asset_id: int, *, user_id: int) -> bool:
         async with SessionLocal() as session:

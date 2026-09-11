@@ -21,17 +21,44 @@ class StudioAgentReply:
     timeline: dict[str, Any]
 
 
+_REQUIRED_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "inspect_asset": ("asset_id",),
+    "add_clip": ("asset_id",),
+    "remove_clip": ("clip_id",),
+    "trim_clip": ("clip_id", "source_end"),
+    "split_clip": ("clip_id", "at"),
+    "move_clip": ("clip_id", "start"),
+    "reorder_clips": ("clip_id", "order"),
+    "set_duration": ("clip_id", "duration"),
+    "set_speed": ("clip_id", "speed"),
+    "set_volume": ("clip_id", "volume"),
+    "set_fades": ("clip_id",),
+    "set_transform": ("clip_id",),
+    "add_transition": ("clip_id", "type"),
+    "add_text": ("text",),
+    "add_overlay": ("asset_id",),
+    "add_background_music": ("asset_id",),
+    "set_audio_mode": ("mode",),
+    "set_keyframes": ("clip_id", "keyframes"),
+    "add_subtitles": ("cues",),
+}
+
+
 def _tool(name: str, description: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": properties or {},
+        "additionalProperties": False,
+    }
+    required = _REQUIRED_ARGUMENTS.get(name)
+    if required:
+        parameters["required"] = list(required)
     return {
         "type": "function",
         "function": {
             "name": name,
             "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties or {},
-                "additionalProperties": False,
-            },
+            "parameters": parameters,
         },
     }
 
@@ -172,12 +199,24 @@ class StudioAgentService:
         model: str,
         messages: list[dict[str, object]],
     ) -> tuple[str, list[dict[str, Any]], str]:
+        contracts = [
+            {
+                "name": item["function"]["name"],
+                "description": item["function"]["description"],
+                "required": item["function"]["parameters"].get("required", []),
+                "properties": item["function"]["parameters"].get("properties", {}),
+            }
+            for item in AGENT_TOOLS
+        ]
         schema_instruction = {
             "role": "system",
             "content": (
                 "Native tools are unavailable. Return JSON only: "
                 '{"message":"short Arabic summary","tool_calls":[{"name":"tool","arguments":{}}]}. '
-                f"Allowed tools: {', '.join(sorted(TOOL_NAMES))}. Never return shell or FFmpeg commands."
+                "Arguments listed as required must never be omitted or empty. For clip-targeting tools, "
+                "copy an exact clip_id from the current timeline. Never return shell or FFmpeg commands. "
+                "Tool contracts: "
+                + json.dumps(contracts, ensure_ascii=False, separators=(",", ":"))
             ),
         }
         last_error = ""
@@ -247,7 +286,8 @@ class StudioAgentService:
         return (
             "You are Moataz Media Studio's editing planner. Modify the existing project, never create "
             "a new project. You cannot run shell commands or FFmpeg. Use only the supplied deterministic "
-            "tools. Asset IDs and clip IDs must come from the timeline. Make conservative, reversible edits. "
+            "tools. Asset IDs and clip IDs must come from the timeline. For every clip-targeting tool, "
+            "copy a non-empty exact clip id from the timeline; never invent or omit it. Make conservative, reversible edits. "
             "When the user asks to see the result, request render_preview; request render_final only when explicit. "
             f"Current renderer-neutral Timeline JSON: {compact}"
         )

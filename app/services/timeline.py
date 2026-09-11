@@ -17,6 +17,7 @@ from app.db import (
     SessionLocal,
     TimelineRevision,
 )
+from app.services.project_locks import project_mutation_lock
 
 TRANSITIONS = {
     "none",
@@ -353,11 +354,25 @@ class TimelineService:
     ) -> TimelineToolResult:
         if not calls or len(calls) > 20:
             raise ValueError("Agent must provide between 1 and 20 tool calls")
+        async with project_mutation_lock(project_id):
+            return await self._apply_locked(
+                project_id, user_id=user_id, calls=calls
+            )
+
+    async def _apply_locked(
+        self,
+        project_id: int,
+        *,
+        user_id: int,
+        calls: list[dict[str, Any]],
+    ) -> TimelineToolResult:
         async with SessionLocal() as session:
             project = await session.scalar(
-                select(MediaProject).where(
+                select(MediaProject)
+                .where(
                     MediaProject.id == project_id, MediaProject.user_id == user_id
                 )
+                .with_for_update()
             )
             if project is None:
                 raise LookupError("Project not found")
@@ -392,9 +407,10 @@ class TimelineService:
                 if not isinstance(raw_call, dict):
                     raise ValueError("Each tool call must be an object")
                 name = str(raw_call.get("name") or "")
-                args = raw_call.get("arguments") or {}
-                if name not in TOOL_NAMES or not isinstance(args, dict):
+                raw_args = raw_call.get("arguments") or {}
+                if name not in TOOL_NAMES or not isinstance(raw_args, dict):
                     raise ValueError(f"Unknown or invalid agent tool: {name}")
+                args = dict(raw_args)
                 if name == "undo":
                     if len(calls) != 1:
                         raise ValueError("undo must be the only tool call")
@@ -407,6 +423,7 @@ class TimelineService:
                     render_action = "preview" if name == "render_preview" else "final"
                     messages.append("Preview requested" if render_action == "preview" else "Final render requested")
                 else:
+                    self._resolve_clip_reference(timeline, name, args)
                     changed, message = self._execute(timeline, name, args, assets)
                     mutated = mutated or changed
                     messages.append(message)
@@ -423,6 +440,62 @@ class TimelineService:
                 project.status = ProjectStatus.READY.value
                 await session.commit()
             return TimelineToolResult(timeline, tuple(messages), render_action)
+
+    @staticmethod
+    def _resolve_clip_reference(
+        timeline: dict[str, Any], name: str, args: dict[str, Any]
+    ) -> None:
+        target_kinds = {
+            "remove_clip": TRACK_KINDS,
+            "trim_clip": {"visual", "audio", "overlay"},
+            "split_clip": {"visual", "audio", "overlay"},
+            "move_clip": TRACK_KINDS,
+            "reorder_clips": TRACK_KINDS,
+            "set_duration": TRACK_KINDS,
+            "set_speed": {"visual", "audio", "overlay"},
+            "set_volume": {"audio", "visual"},
+            "set_fades": TRACK_KINDS,
+            "set_transform": {"visual", "overlay"},
+            "add_transition": {"visual"},
+            "set_keyframes": TRACK_KINDS,
+            "set_fit_mode": {"visual", "overlay"},
+        }.get(name)
+        if target_kinds is None or args.get("clip_id"):
+            return
+        if name == "set_fit_mode" and args.get("apply_to_all"):
+            return
+
+        candidates = [
+            clip
+            for track, clip in _all_clips(timeline)
+            if track.get("kind") in target_kinds
+        ]
+        if args.get("asset_id") is not None:
+            asset_id = _integer(
+                args.get("asset_id"), "asset_id", minimum=1, maximum=2**31 - 1
+            )
+            candidates = [clip for clip in candidates if clip.get("asset_id") == asset_id]
+        if args.get("clip_index") is not None:
+            index = _integer(
+                args.get("clip_index"),
+                "clip_index",
+                minimum=1,
+                maximum=max(1, len(candidates)),
+            )
+            if index > len(candidates):
+                raise ValueError("clip_index does not exist in the current timeline")
+            candidates = [candidates[index - 1]]
+        if len(candidates) == 1:
+            args["clip_id"] = str(candidates[0]["id"])
+            return
+
+        available = ", ".join(str(clip.get("id")) for clip in candidates[:12])
+        if not candidates:
+            raise ValueError(f"{name} requires a media clip, but none is available")
+        raise ValueError(
+            f"{name} requires clip_id, asset_id, or 1-based clip_index; "
+            f"available clip IDs: {available}"
+        )
 
     async def undo(self, project_id: int, *, user_id: int) -> TimelineToolResult:
         return await self.apply(project_id, user_id=user_id, calls=[{"name": "undo"}])
