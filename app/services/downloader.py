@@ -4,17 +4,21 @@ import base64
 import binascii
 import logging
 import os
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from app.config import Settings, get_settings
-from app.errors import CancelledError, ErrorInfo, FormatUnavailableError, classify_error
+from app.errors import CancelledError, ErrorCode, ErrorInfo, FormatUnavailableError, classify_error
 from app.security import assert_public_dns, canonicalize_url, redact_secrets
+from app.services.download_relays import CobaltRelayClient
 from app.services.providers import available_qualities, format_selector, normalize_platform
 
 ProgressHook = Callable[[dict[str, Any]], None]
@@ -77,6 +81,12 @@ class PlaylistEntry:
     index: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DownloadAttempt:
+    name: str
+    options: dict[str, Any]
+
+
 class DownloaderService:
     """Generic, testable yt-dlp engine used by Telegram and the dashboard."""
 
@@ -86,10 +96,12 @@ class DownloaderService:
         *,
         ydl_factory: Callable[[dict[str, Any]], Any] = yt_dlp.YoutubeDL,
         url_guard: UrlGuard = assert_public_dns,
+        relay: CobaltRelayClient | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.ydl_factory = ydl_factory
         self.url_guard = url_guard
+        self.relay = relay or CobaltRelayClient(self.settings, url_guard=url_guard)
         self._cancel_events: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
@@ -148,7 +160,64 @@ class DownloaderService:
             os.chmod(destination, 0o600)
         return destination
 
-    def _log_failure(self, operation: str, url: str, exc: BaseException) -> None:
+    def _proxy_urls(self) -> tuple[str, ...]:
+        secret = self.settings.ytdlp_proxy_urls
+        raw = secret.get_secret_value().strip() if secret is not None else ""
+        result: list[str] = []
+        for candidate in re.split(r"[,\n]", raw):
+            value = candidate.strip()
+            if not value or value in result:
+                continue
+            parsed = urlsplit(value)
+            if parsed.scheme not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname:
+                raise ValueError("YTDLP_PROXY_URLS contains an invalid proxy URL")
+            result.append(value)
+        if len(result) > 4:
+            raise ValueError("At most four yt-dlp proxy URLs may be configured")
+        return tuple(result)
+
+    def _attempts(self) -> tuple[DownloadAttempt, ...]:
+        attempts = [DownloadAttempt("direct", {})]
+        browser_options: dict[str, Any] = {}
+        if self.ydl_factory is yt_dlp.YoutubeDL:
+            try:
+                import curl_cffi  # noqa: F401
+            except ImportError:
+                pass
+            else:
+                browser_options = (
+                    {"impersonate": ImpersonateTarget(client="chrome")}
+                    if self.settings.ytdlp_impersonate
+                    else {}
+                )
+                if browser_options:
+                    attempts.append(DownloadAttempt("browser", browser_options))
+        for index, proxy in enumerate(self._proxy_urls(), start=1):
+            options: dict[str, Any] = {"proxy": proxy}
+            options.update(browser_options)
+            attempts.append(DownloadAttempt(f"proxy-{index}", options))
+        return tuple(attempts)
+
+    @staticmethod
+    def _can_try_next(exc: BaseException) -> bool:
+        return classify_error(exc).code in {
+            ErrorCode.ANTI_BOT,
+            ErrorCode.HTTP_429,
+            ErrorCode.UPSTREAM_5XX,
+            ErrorCode.NETWORK_TIMEOUT,
+            ErrorCode.EXTRACTOR_ERROR,
+        }
+
+    @staticmethod
+    def _can_try_relay(exc: BaseException) -> bool:
+        return (
+            DownloaderService._can_try_next(exc)
+            or classify_error(exc).code is ErrorCode.UNSUPPORTED_EXTRACTOR
+        )
+
+    def _log_failure(
+        self, operation: str, url: str, exc: BaseException, *, backend: str = "direct"
+    ) -> None:
         error = classify_error(exc)
         host = canonicalize_url(url).split("/", 3)[2] if "://" in url else "unknown"
         safe = redact_secrets(
@@ -156,9 +225,11 @@ class DownloaderService:
             bot_token=self.settings.bot_token,
             database_url=self.settings.database_url,
         )[:4000]
+        for proxy in self._proxy_urls():
+            safe = safe.replace(proxy, "[REDACTED_PROXY]")
         logger.warning(
             "yt-dlp %s failed host=%s code=%s retryable=%s error_type=%s detail=%s",
-            operation,
+            f"{operation}/{backend}",
             host,
             error.code.value,
             error.retryable,
@@ -207,14 +278,45 @@ class DownloaderService:
 
     def probe(self, url: str) -> MediaInfo:
         guarded = self._guard(url)
-        opts = self._base_options()
-        opts.update({"skip_download": True, "noplaylist": False, "extract_flat": "in_playlist", "playlistend": self.settings.max_playlist_items + 1})
-        try:
-            with self._safe_ydl(opts) as ydl:
-                info = ydl.extract_info(guarded, download=False)
-        except Exception as exc:
-            self._log_failure("probe", guarded, exc)
-            raise
+        info = None
+        last_error: Exception | None = None
+        for attempt in self._attempts():
+            opts = self._base_options()
+            opts.update(attempt.options)
+            opts.update(
+                {
+                    "skip_download": True,
+                    "noplaylist": False,
+                    "extract_flat": "in_playlist",
+                    "playlistend": self.settings.max_playlist_items + 1,
+                }
+            )
+            try:
+                with self._safe_ydl(opts) as ydl:
+                    info = ydl.extract_info(guarded, download=False)
+                break
+            except Exception as exc:
+                last_error = exc
+                self._log_failure("probe", guarded, exc, backend=attempt.name)
+                if not self._can_try_next(exc):
+                    break
+        if info is None and last_error is not None and self.relay.enabled and self._can_try_relay(last_error):
+            try:
+                fallback = self.relay.probe(guarded)
+                return MediaInfo(
+                    title=fallback.title,
+                    thumbnail=None,
+                    duration=None,
+                    uploader=None,
+                    platform=fallback.platform,
+                    qualities=[],
+                    webpage_url=guarded,
+                    extractor=f"cobalt-{fallback.endpoint_index}",
+                )
+            except Exception as exc:
+                self._log_failure("probe", guarded, exc, backend="cobalt")
+        if info is None and last_error is not None:
+            raise last_error
         if not info:
             raise RuntimeError("yt-dlp returned no media metadata")
 
@@ -282,14 +384,30 @@ class DownloaderService:
     def expand_playlist(self, url: str, *, limit: int | None = None) -> list[PlaylistEntry]:
         guarded = self._guard(url)
         max_items = self.settings.max_playlist_items if limit is None else min(limit, self.settings.max_playlist_items)
-        opts = self._base_options()
-        opts.update({"skip_download": True, "extract_flat": True, "noplaylist": False, "playlistend": max_items + 1})
-        try:
-            with self._safe_ydl(opts) as ydl:
-                info = ydl.extract_info(guarded, download=False)
-        except Exception as exc:
-            self._log_failure("playlist probe", guarded, exc)
-            raise
+        info = None
+        last_error: Exception | None = None
+        for attempt in self._attempts():
+            opts = self._base_options()
+            opts.update(attempt.options)
+            opts.update(
+                {
+                    "skip_download": True,
+                    "extract_flat": True,
+                    "noplaylist": False,
+                    "playlistend": max_items + 1,
+                }
+            )
+            try:
+                with self._safe_ydl(opts) as ydl:
+                    info = ydl.extract_info(guarded, download=False)
+                break
+            except Exception as exc:
+                last_error = exc
+                self._log_failure("playlist probe", guarded, exc, backend=attempt.name)
+                if not self._can_try_next(exc):
+                    break
+        if info is None and last_error is not None:
+            raise last_error
         if not info or info.get("_type") not in {"playlist", "multi_video"}:
             return [PlaylistEntry(url=guarded, title=info.get("title") if info else None, index=1)]
         entries = [entry for entry in info.get("entries") or [] if entry]
@@ -328,21 +446,6 @@ class DownloaderService:
 
         event = self._event(job_key)
         job_dir.mkdir(parents=True, exist_ok=True)
-        opts = self._base_options()
-        opts.update(
-            {
-                "noplaylist": True,
-                "format": format_selector(value),
-                "outtmpl": str(job_dir / "%(id)s-%(title).80B.%(ext)s"),
-                "merge_output_format": "mp4",
-                "prefer_ffmpeg": True,
-                "continuedl": True,
-                "overwrites": False,
-                "nopart": False,
-                "keepvideo": False,
-                "max_filesize": self.settings.max_file_size_bytes,
-            }
-        )
 
         def guarded_progress(payload: dict[str, Any]) -> None:
             if event.is_set():
@@ -350,34 +453,80 @@ class DownloaderService:
             if progress_hook:
                 progress_hook(payload)
 
-        opts["progress_hooks"] = [guarded_progress]
-        if value in {"audio", "mp3"}:
-            opts["postprocessors"] = [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-            ]
-
         try:
-            with self._safe_ydl(opts) as ydl:
-                ydl.download([guarded])
-            if event.is_set():
-                raise CancelledError("Download cancelled")
-            suffixes = {".mp3"} if value in {"audio", "mp3"} else {".mp4", ".mkv", ".webm"}
-            candidates = [
-                path
-                for path in job_dir.iterdir()
-                if path.is_file()
-                and path.suffix.lower() in suffixes
-                and not path.name.endswith((".part", ".ytdl"))
-            ]
-            if not candidates:
-                raise RuntimeError("yt-dlp finished without a valid output file")
-            output = max(candidates, key=lambda path: path.stat().st_size)
-            if output.stat().st_size <= 0:
-                raise RuntimeError("yt-dlp produced an empty output file")
-            return output
-        except Exception as exc:
-            self._log_failure("download", guarded, exc)
-            raise
+            last_error: Exception | None = None
+            for attempt in self._attempts():
+                opts = self._base_options()
+                opts.update(attempt.options)
+                opts.update(
+                    {
+                        "noplaylist": True,
+                        "format": format_selector(value),
+                        "outtmpl": str(job_dir / "%(id)s-%(title).80B.%(ext)s"),
+                        "merge_output_format": "mp4",
+                        "prefer_ffmpeg": True,
+                        "continuedl": True,
+                        "overwrites": False,
+                        "nopart": False,
+                        "keepvideo": False,
+                        "max_filesize": self.settings.max_file_size_bytes,
+                        "progress_hooks": [guarded_progress],
+                    }
+                )
+                if value in {"audio", "mp3"}:
+                    opts["postprocessors"] = [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ]
+                try:
+                    with self._safe_ydl(opts) as ydl:
+                        ydl.download([guarded])
+                    if event.is_set():
+                        raise CancelledError("Download cancelled")
+                    suffixes = (
+                        {".mp3"}
+                        if value in {"audio", "mp3"}
+                        else {".mp4", ".mkv", ".webm"}
+                    )
+                    candidates = [
+                        path
+                        for path in job_dir.iterdir()
+                        if path.is_file()
+                        and path.suffix.lower() in suffixes
+                        and not path.name.endswith((".part", ".ytdl"))
+                    ]
+                    if not candidates:
+                        raise RuntimeError("yt-dlp finished without a valid output file")
+                    output = max(candidates, key=lambda path: path.stat().st_size)
+                    if output.stat().st_size <= 0:
+                        raise RuntimeError("yt-dlp produced an empty output file")
+                    return output
+                except Exception as exc:
+                    last_error = exc
+                    self._log_failure("download", guarded, exc, backend=attempt.name)
+                    if isinstance(exc, CancelledError) or not self._can_try_next(exc):
+                        break
+            if (
+                last_error is not None
+                and self.relay.enabled
+                and self._can_try_relay(last_error)
+            ):
+                try:
+                    return self.relay.download(
+                        guarded,
+                        value,
+                        job_dir,
+                        cancel_event=event,
+                        progress_hook=guarded_progress,
+                    )
+                except Exception as exc:
+                    self._log_failure("download", guarded, exc, backend="cobalt")
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("All download backends failed")
         finally:
             self._release(job_key)
 

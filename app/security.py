@@ -114,6 +114,11 @@ def redact_secrets(
             text = text.replace(secret, "[REDACTED]")
     text = re.sub(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b", "[REDACTED_TELEGRAM_TOKEN]", text)
     text = re.sub(r"(?i)(postgres(?:ql)?(?:\+asyncpg)?://)[^\s@]+@", r"\1[REDACTED]@", text)
+    text = re.sub(
+        r"(?i)((?:https?|socks5h?)://)[^\s/@:]+:[^\s/@]+@",
+        r"\1[REDACTED]@",
+        text,
+    )
     text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
     text = re.sub(r"(?i)(cookie(?:s)?\s*[:=]\s*)[^\s,;]+", r"\1[REDACTED]", text)
     text = re.sub(r"(?i)([?&](?:token|key|api_key|auth|signature)=)[^&#\s]+", r"\1[REDACTED]", text)

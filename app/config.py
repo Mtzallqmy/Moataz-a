@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     ytdlp_concurrent_fragments: int = 4
     ytdlp_cookies_file: Path | None = None
     ytdlp_cookies_b64: SecretStr | None = None
+    ytdlp_proxy_urls: SecretStr | None = None
+    ytdlp_impersonate: bool = True
+    cobalt_api_urls: SecretStr | None = None
+    cobalt_api_token: SecretStr | None = None
+    cobalt_auth_scheme: str = "Api-Key"
+    cobalt_timeout_seconds: int = 45
     job_max_retries: int = 2
     job_retry_base_seconds: float = 4.0
     job_retry_cap_seconds: float = 45.0
@@ -175,6 +181,19 @@ class Settings(BaseSettings):
     @classmethod
     def validate_fragments(cls, value: int) -> int:
         return max(1, min(int(value), 16))
+
+    @field_validator("cobalt_auth_scheme")
+    @classmethod
+    def validate_cobalt_auth_scheme(cls, value: str) -> str:
+        normalized = str(value or "Api-Key").strip()
+        if normalized not in {"Api-Key", "Bearer"}:
+            raise ValueError("COBALT_AUTH_SCHEME must be Api-Key or Bearer")
+        return normalized
+
+    @field_validator("cobalt_timeout_seconds")
+    @classmethod
+    def validate_cobalt_timeout(cls, value: int) -> int:
+        return max(10, min(int(value), 300))
 
     @field_validator("job_retry_base_seconds")
     @classmethod

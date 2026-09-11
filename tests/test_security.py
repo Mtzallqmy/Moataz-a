@@ -79,7 +79,13 @@ def test_malformed_port_is_invalid_not_an_unhandled_value_error():
 def test_secret_redaction_covers_configured_and_pattern_secrets():
     token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
     db = "postgresql+asyncpg://alice:secret@db.example/app"
-    text = redact_secrets(f"token={token} db={db}", bot_token=token, database_url=db)
+    proxy = "socks5h://proxy-user:proxy-password@proxy.example:1080"
+    text = redact_secrets(
+        f"token={token} db={db} proxy={proxy}",
+        bot_token=token,
+        database_url=db,
+    )
     assert token not in text
     assert "alice:secret" not in text
+    assert "proxy-user:proxy-password" not in text
     assert "REDACTED" in text

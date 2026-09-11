@@ -13,6 +13,23 @@ def test_settings_require_no_redis_or_webhook_fields_and_cookies_are_optional():
     assert not hasattr(settings, "webhook_secret")
     assert settings.ytdlp_cookies_file is None
     assert settings.ytdlp_cookies_b64 is None
+    assert settings.ytdlp_proxy_urls is None
+    assert settings.ytdlp_impersonate is True
+    assert settings.cobalt_api_urls is None
+    assert settings.cobalt_api_token is None
+
+
+def test_download_fallback_settings_are_validated_and_bounded():
+    settings = Settings(
+        _env_file=None,
+        cobalt_auth_scheme="Bearer",
+        cobalt_timeout_seconds=2,
+    )
+    assert settings.cobalt_auth_scheme == "Bearer"
+    assert settings.cobalt_timeout_seconds == 10
+    assert Settings(_env_file=None, cobalt_timeout_seconds=999).cobalt_timeout_seconds == 300
+    with pytest.raises(ValueError, match="COBALT_AUTH_SCHEME"):
+        Settings(_env_file=None, cobalt_auth_scheme="Basic")
 
 
 def test_database_url_normalization():
