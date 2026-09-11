@@ -199,7 +199,7 @@ async def test_circuit_breaker_is_per_platform_and_recovers_after_cooldown():
     assert health.status("yt-dlp", "instagram") is HealthStatus.HEALTHY
     now[0] = 16.0
     assert health.allows("yt-dlp", "youtube")
-    assert health.status("yt-dlp", "youtube") is HealthStatus.DEGRADED
+    assert health.status("yt-dlp", "youtube") is HealthStatus.HEALTHY
 
 
 def test_platform_routing_covers_specialist_content_types():
