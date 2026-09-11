@@ -18,7 +18,7 @@ import app.worker as worker_module
 from app.bot.access import ensure_user, is_allowed
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
-from app.errors import CancelledError, ErrorCode, classify_error
+from app.errors import CancelledError, ErrorCode, classify_error, user_error_message
 from app.jobs import record_job_event, set_job_status
 from app.progress import ProgressSnapshot
 from app.security import canonicalize_url, redact_secrets
@@ -717,7 +717,7 @@ async def _process_split_download(job_id: int, segment_seconds: int) -> None:
             )
             await worker_module._edit_status(
                 job_id,
-                f"Job #{job_id}\nStatus: FAILED ❌\nError: {info.code.value}",
+                f"Job #{job_id}\nStatus: FAILED ❌\n{user_error_message(info)}",
                 markup=worker_module._retry_markup(job_id),
             )
     finally:

@@ -11,7 +11,7 @@ from sqlalchemy import select
 from app.bot.access import ensure_user, is_allowed
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
-from app.errors import classify_error
+from app.errors import classify_error, user_error_message
 from app.i18n import tr
 from app.jobs import set_job_status
 from app.rate_limit import telegram_analyze_limiter
@@ -299,7 +299,7 @@ async def _analyze_one(message: Message, user: User, url: str, intent: str = "ge
         await _show_analysis(message, progress, job, info, intent, user.language)
     except Exception as exc:
         error = classify_error(exc)
-        await progress.edit_text(tr(user.language, "failed", code=error.code.value))
+        await progress.edit_text(tr(user.language, "failed", message=user_error_message(error, user.language)))
 
 
 async def _process_urls(message: Message, *, intent: str = "general") -> None:

@@ -1,6 +1,6 @@
 import pytest
 
-from app.errors import ErrorCode, classify_error, retry_delay
+from app.errors import ErrorCode, classify_error, retry_delay, user_error_message
 from app.progress import ProgressSnapshot
 
 
@@ -20,6 +20,9 @@ def test_progress_calculation_and_rendering():
         ("invalid URL", ErrorCode.INVALID_URL, False),
         ("Private video", ErrorCode.PRIVATE_MEDIA, False),
         ("Login required", ErrorCode.AUTH_REQUIRED, False),
+        ("Sign in to confirm you’re not a bot. Use --cookies", ErrorCode.ANTI_BOT, False),
+        ("Unsupported URL: https://unknown.example/a", ErrorCode.UNSUPPORTED_EXTRACTOR, False),
+        ("Cannot parse data; please report this issue", ErrorCode.EXTRACTOR_ERROR, True),
         ("Requested format is not available", ErrorCode.FORMAT_UNAVAILABLE, False),
         ("request timed out", ErrorCode.NETWORK_TIMEOUT, True),
         ("HTTP Error 429", ErrorCode.HTTP_429, True),
@@ -39,3 +42,11 @@ def test_exponential_backoff_has_cap_and_deterministic_jitter():
     assert retry_delay(0, base=4, cap=45, jitter_ratio=0, random_value=0.5) == 4
     assert retry_delay(3, base=4, cap=45, jitter_ratio=0, random_value=0.5) == 32
     assert retry_delay(10, base=4, cap=45, jitter_ratio=0, random_value=0.5) == 45
+
+
+def test_downloader_errors_have_actionable_arabic_messages():
+    auth = classify_error(RuntimeError("Login required; use --cookies"))
+    extractor = classify_error(RuntimeError("Cannot parse data"))
+    assert "تسجيل دخول" in user_error_message(auth)
+    assert "استخراج الرابط" in user_error_message(extractor)
+    assert "AUTH_REQUIRED" not in user_error_message(auth)

@@ -6,12 +6,13 @@ from app.jobs import can_transition
 from app.operations import reconcile_stale_jobs
 
 
-def test_settings_require_no_redis_webhook_or_cookie_fields():
+def test_settings_require_no_redis_or_webhook_fields_and_cookies_are_optional():
     settings = Settings(_env_file=None)
     assert not hasattr(settings, "redis_url")
     assert not hasattr(settings, "queue_backend")
     assert not hasattr(settings, "webhook_secret")
-    assert not hasattr(settings, "ytdlp_cookies_file")
+    assert settings.ytdlp_cookies_file is None
+    assert settings.ytdlp_cookies_b64 is None
 
 
 def test_database_url_normalization():

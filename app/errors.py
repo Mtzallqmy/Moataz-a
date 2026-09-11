@@ -10,6 +10,8 @@ class ErrorCode(StrEnum):
     MEDIA_UNAVAILABLE = "MEDIA_UNAVAILABLE"
     PRIVATE_MEDIA = "PRIVATE_MEDIA"
     AUTH_REQUIRED = "AUTH_REQUIRED"
+    ANTI_BOT = "ANTI_BOT"
+    UNSUPPORTED_EXTRACTOR = "UNSUPPORTED_EXTRACTOR"
     FORMAT_UNAVAILABLE = "FORMAT_UNAVAILABLE"
     EXTRACTOR_ERROR = "EXTRACTOR_ERROR"
     NETWORK_TIMEOUT = "NETWORK_TIMEOUT"
@@ -63,11 +65,15 @@ def classify_error(exc: BaseException) -> ErrorInfo:
         return ErrorInfo(ErrorCode.CANCELLED, False)
     if "requested format" in text or "format is not available" in text:
         return ErrorInfo(ErrorCode.FORMAT_UNAVAILABLE, False)
-    if "private" in text:
+    if any(marker in text for marker in ("confirm you're not a bot", "confirm you’re not a bot", "captcha", "unusual traffic", "bot challenge")):
+        return ErrorInfo(ErrorCode.ANTI_BOT, False)
+    if "private" in text or "members-only" in text:
         return ErrorInfo(ErrorCode.PRIVATE_MEDIA, False)
-    if any(marker in text for marker in ("login required", "sign in", "authentication", "cookies")):
+    if any(marker in text for marker in ("login required", "sign in to view", "authentication required", "cookies required", "use --cookies")):
         return ErrorInfo(ErrorCode.AUTH_REQUIRED, False)
-    if any(marker in text for marker in ("unsupported url", "invalid url", "unsafe url", "ssrf")):
+    if any(marker in text for marker in ("unsupported url", "no suitable extractor", "is not a valid url")):
+        return ErrorInfo(ErrorCode.UNSUPPORTED_EXTRACTOR, False)
+    if any(marker in text for marker in ("invalid url", "unsafe url", "ssrf")):
         return ErrorInfo(ErrorCode.INVALID_URL, False)
     if any(marker in text for marker in ("video unavailable", "media unavailable", "has been removed", "not available")):
         return ErrorInfo(ErrorCode.MEDIA_UNAVAILABLE, False)
@@ -87,6 +93,8 @@ def classify_error(exc: BaseException) -> ErrorInfo:
         return ErrorInfo(ErrorCode.NETWORK_TIMEOUT, True)
     if any(marker in text for marker in ("connection reset", "connection refused", "temporary failure", "server disconnected")):
         return ErrorInfo(ErrorCode.NETWORK_TIMEOUT, True)
+    if any(marker in text for marker in ("cannot parse data", "unable to extract", "temporary extractor")):
+        return ErrorInfo(ErrorCode.EXTRACTOR_ERROR, True)
     if "downloaderror" in name or "extractor" in text:
         return ErrorInfo(ErrorCode.EXTRACTOR_ERROR, False)
     if any(marker in text for marker in ("database", "sqlalchemy", "asyncpg")):
@@ -94,6 +102,47 @@ def classify_error(exc: BaseException) -> ErrorInfo:
     if any(marker in text for marker in ("no space left", "permission denied", "read-only file system")):
         return ErrorInfo(ErrorCode.STORAGE_ERROR, False)
     return ErrorInfo(ErrorCode.UNKNOWN, False)
+
+
+_USER_MESSAGES = {
+    "ar": {
+        ErrorCode.INVALID_URL: "الرابط غير صالح أو محظور لأسباب أمنية.",
+        ErrorCode.MEDIA_UNAVAILABLE: "الفيديو غير متاح أو تمت إزالته من المنصة.",
+        ErrorCode.PRIVATE_MEDIA: "الفيديو خاص أو لا يملك الحساب صلاحية الوصول إليه.",
+        ErrorCode.AUTH_REQUIRED: "هذا الرابط يحتاج تسجيل دخول أو Cookies صالحة.",
+        ErrorCode.ANTI_BOT: "المنصة طلبت تحققًا ضد الروبوتات. أضف Cookies صالحة أو جرّب لاحقًا.",
+        ErrorCode.UNSUPPORTED_EXTRACTOR: "هذه المنصة أو صيغة الرابط غير مدعومة حاليًا.",
+        ErrorCode.FORMAT_UNAVAILABLE: "الجودة المطلوبة غير متاحة لهذا الفيديو.",
+        ErrorCode.EXTRACTOR_ERROR: "تعذر استخراج الرابط من المنصة، جرّب لاحقًا أو حدّث الرابط.",
+        ErrorCode.NETWORK_TIMEOUT: "انتهت مهلة الاتصال بالمنصة. ستتم المحاولة لاحقًا.",
+        ErrorCode.HTTP_429: "المنصة حدّت عدد الطلبات مؤقتًا. حاول بعد قليل.",
+        ErrorCode.UPSTREAM_5XX: "المنصة تواجه عطلًا مؤقتًا. حاول لاحقًا.",
+    },
+    "en": {
+        ErrorCode.INVALID_URL: "The URL is invalid or blocked for security reasons.",
+        ErrorCode.MEDIA_UNAVAILABLE: "The media is unavailable or was removed.",
+        ErrorCode.PRIVATE_MEDIA: "The media is private or the account cannot access it.",
+        ErrorCode.AUTH_REQUIRED: "This URL requires login or valid cookies.",
+        ErrorCode.ANTI_BOT: "The platform requested an anti-bot check. Configure valid cookies or try later.",
+        ErrorCode.UNSUPPORTED_EXTRACTOR: "This platform or URL format is not currently supported.",
+        ErrorCode.FORMAT_UNAVAILABLE: "The requested quality is unavailable for this media.",
+        ErrorCode.EXTRACTOR_ERROR: "The platform could not be parsed. Try later or use an updated URL.",
+        ErrorCode.NETWORK_TIMEOUT: "The platform connection timed out. Please try later.",
+        ErrorCode.HTTP_429: "The platform is temporarily rate-limiting requests. Try again later.",
+        ErrorCode.UPSTREAM_5XX: "The platform is temporarily unavailable. Try again later.",
+    },
+}
+
+
+def user_error_message(error: ErrorInfo | ErrorCode, language: str = "ar") -> str:
+    code = error.code if isinstance(error, ErrorInfo) else error
+    table = _USER_MESSAGES.get(language, _USER_MESSAGES["ar"])
+    fallback = (
+        "تعذر تنفيذ الطلب بسبب خطأ غير متوقع. حاول مرة أخرى."
+        if language != "en"
+        else "The request failed unexpectedly. Please try again."
+    )
+    return table.get(code, fallback)
 
 
 def retry_delay(

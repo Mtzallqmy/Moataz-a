@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import logging
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -10,11 +14,35 @@ import yt_dlp
 
 from app.config import Settings, get_settings
 from app.errors import CancelledError, ErrorInfo, FormatUnavailableError, classify_error
-from app.security import assert_public_dns, canonicalize_url
+from app.security import assert_public_dns, canonicalize_url, redact_secrets
 from app.services.providers import available_qualities, format_selector, normalize_platform
 
 ProgressHook = Callable[[dict[str, Any]], None]
 UrlGuard = Callable[[str], str]
+logger = logging.getLogger("moataz.downloader")
+
+
+class _SanitizedYTDLPLogger:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def _safe(self, message: object) -> str:
+        return redact_secrets(
+            message,
+            bot_token=self.settings.bot_token,
+            database_url=self.settings.database_url,
+        )[:4000]
+
+    def debug(self, message: object) -> None:
+        text = self._safe(message)
+        if text.startswith("[debug]"):
+            logger.debug("yt-dlp: %s", text)
+
+    def warning(self, message: object) -> None:
+        logger.warning("yt-dlp: %s", self._safe(message))
+
+    def error(self, message: object) -> None:
+        logger.error("yt-dlp: %s", self._safe(message))
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,9 +94,10 @@ class DownloaderService:
         self._lock = threading.Lock()
 
     def _base_options(self) -> dict[str, Any]:
-        return {
+        options: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
+            "logger": _SanitizedYTDLPLogger(self.settings),
             "socket_timeout": self.settings.ytdlp_socket_timeout_seconds,
             "retries": self.settings.ytdlp_retries,
             "fragment_retries": self.settings.ytdlp_fragment_retries,
@@ -78,7 +107,63 @@ class DownloaderService:
             "geo_bypass": False,
             "nocheckcertificate": False,
             "restrictfilenames": True,
+            "ignoreerrors": False,
+            "http_headers": {
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         }
+        cookie_file = self._cookie_file()
+        if cookie_file is not None:
+            options["cookiefile"] = str(cookie_file)
+        return options
+
+    def _cookie_file(self) -> Path | None:
+        configured = self.settings.ytdlp_cookies_file
+        if configured is not None:
+            path = configured.expanduser().resolve()
+            if not path.is_file():
+                raise ValueError("Configured yt-dlp cookies file does not exist")
+            return path
+
+        encoded = self.settings.ytdlp_cookies_b64
+        if encoded is None or not encoded.get_secret_value().strip():
+            return None
+        try:
+            payload = base64.b64decode(encoded.get_secret_value().strip(), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("YTDLP_COOKIES_B64 is not valid base64") from exc
+        if len(payload) > 2 * 1024 * 1024:
+            raise ValueError("YTDLP_COOKIES_B64 exceeds the 2 MiB safety limit")
+        if b"Netscape HTTP Cookie File" not in payload[:256]:
+            raise ValueError("YTDLP_COOKIES_B64 must contain a Netscape cookies.txt file")
+        credential_dir = (self.settings.render_temp_dir / "credentials").resolve()
+        credential_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(credential_dir, 0o700)
+        destination = credential_dir / "yt-dlp-cookies.txt"
+        temporary = credential_dir / "yt-dlp-cookies.tmp"
+        temporary.write_bytes(payload)
+        os.chmod(temporary, 0o600)
+        temporary.replace(destination)
+        os.chmod(destination, 0o600)
+        return destination
+
+    def _log_failure(self, operation: str, url: str, exc: BaseException) -> None:
+        error = classify_error(exc)
+        host = canonicalize_url(url).split("/", 3)[2] if "://" in url else "unknown"
+        safe = redact_secrets(
+            exc,
+            bot_token=self.settings.bot_token,
+            database_url=self.settings.database_url,
+        )[:4000]
+        logger.warning(
+            "yt-dlp %s failed host=%s code=%s retryable=%s error_type=%s detail=%s",
+            operation,
+            host,
+            error.code.value,
+            error.retryable,
+            type(exc).__name__,
+            safe,
+        )
 
     def _guard(self, url: str) -> str:
         return self.url_guard(url)
@@ -123,8 +208,12 @@ class DownloaderService:
         guarded = self._guard(url)
         opts = self._base_options()
         opts.update({"skip_download": True, "noplaylist": False, "extract_flat": "in_playlist", "playlistend": self.settings.max_playlist_items + 1})
-        with self._safe_ydl(opts) as ydl:
-            info = ydl.extract_info(guarded, download=False)
+        try:
+            with self._safe_ydl(opts) as ydl:
+                info = ydl.extract_info(guarded, download=False)
+        except Exception as exc:
+            self._log_failure("probe", guarded, exc)
+            raise
         if not info:
             raise RuntimeError("yt-dlp returned no media metadata")
 
@@ -194,8 +283,12 @@ class DownloaderService:
         max_items = self.settings.max_playlist_items if limit is None else min(limit, self.settings.max_playlist_items)
         opts = self._base_options()
         opts.update({"skip_download": True, "extract_flat": True, "noplaylist": False, "playlistend": max_items + 1})
-        with self._safe_ydl(opts) as ydl:
-            info = ydl.extract_info(guarded, download=False)
+        try:
+            with self._safe_ydl(opts) as ydl:
+                info = ydl.extract_info(guarded, download=False)
+        except Exception as exc:
+            self._log_failure("playlist probe", guarded, exc)
+            raise
         if not info or info.get("_type") not in {"playlist", "multi_video"}:
             return [PlaylistEntry(url=guarded, title=info.get("title") if info else None, index=1)]
         entries = [entry for entry in info.get("entries") or [] if entry]
@@ -281,6 +374,9 @@ class DownloaderService:
             if output.stat().st_size <= 0:
                 raise RuntimeError("yt-dlp produced an empty output file")
             return output
+        except Exception as exc:
+            self._log_failure("download", guarded, exc)
+            raise
         finally:
             self._release(job_key)
 

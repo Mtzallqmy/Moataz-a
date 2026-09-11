@@ -1,3 +1,6 @@
+import base64
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("yt_dlp")
@@ -151,3 +154,43 @@ def test_downloader_error_classifier_uses_unified_codes():
     info = service().classify_error(RuntimeError("HTTP Error 503 Service Unavailable"))
     assert info.code is ErrorCode.UPSTREAM_5XX
     assert info.retryable is True
+
+
+def test_probe_passes_optional_cookie_file_to_ytdlp(tmp_path):
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    FakeYDL.info = {"id": "x", "title": "x", "formats": []}
+    configured = DownloaderService(
+        Settings(_env_file=None, ytdlp_cookies_file=cookies),
+        ydl_factory=FakeYDL,
+        url_guard=lambda url: url,
+    )
+    configured.probe("https://example.com/x")
+    assert FakeYDL.last_options["cookiefile"] == str(cookies.resolve())
+
+
+def test_base64_cookies_are_materialized_privately(tmp_path):
+    content = b"# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t0\tsid\tsecret\n"
+    configured = DownloaderService(
+        Settings(
+            _env_file=None,
+            render_temp_dir=tmp_path,
+            ytdlp_cookies_b64=base64.b64encode(content).decode(),
+        ),
+        ydl_factory=FakeYDL,
+        url_guard=lambda url: url,
+    )
+    options = configured._base_options()
+    cookiefile = Path(options["cookiefile"])
+    assert cookiefile.read_bytes() == content
+    assert cookiefile.stat().st_mode & 0o077 == 0
+
+
+def test_invalid_cookie_secret_fails_before_network(tmp_path):
+    configured = DownloaderService(
+        Settings(_env_file=None, render_temp_dir=tmp_path, ytdlp_cookies_b64="not-base64"),
+        ydl_factory=FakeYDL,
+        url_guard=lambda url: url,
+    )
+    with pytest.raises(ValueError, match="valid base64"):
+        configured.probe("https://example.com/x")
