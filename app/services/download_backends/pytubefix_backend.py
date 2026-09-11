@@ -107,6 +107,7 @@ class PytubefixBackend(DownloadBackend):
         if not await self.available():
             raise BackendUnavailableError("pytubefix optional dependency is unavailable")
         request.output_dir.mkdir(parents=True, exist_ok=True)
+        before = {path.resolve() for path in request.output_dir.iterdir() if path.is_file()}
         cancel_event = request.cancel_event
 
         def interrupted() -> bool:
@@ -142,9 +143,9 @@ class PytubefixBackend(DownloadBackend):
             )
             if requested != "best":
                 progressive = [
-                    s
-                    for s in progressive
-                    if str(getattr(s, "resolution", "")).removesuffix("p") == requested
+                    stream
+                    for stream in progressive
+                    if str(getattr(stream, "resolution", "")).removesuffix("p") == requested
                 ]
             if progressive:
                 path = Path(
@@ -165,9 +166,9 @@ class PytubefixBackend(DownloadBackend):
             )
             if requested != "best":
                 adaptive = [
-                    s
-                    for s in adaptive
-                    if str(getattr(s, "resolution", "")).removesuffix("p") == requested
+                    stream
+                    for stream in adaptive
+                    if str(getattr(stream, "resolution", "")).removesuffix("p") == requested
                 ]
             audio = sorted(
                 yt.streams.filter(only_audio=True), key=self._audio_key, reverse=True
@@ -196,59 +197,66 @@ class PytubefixBackend(DownloadBackend):
             )
             return video_path, audio_path
 
-        video_or_audio, secondary = await asyncio.to_thread(download_streams)
-        if interrupted():
-            raise CancelledError("pytubefix download cancelled")
-        if secondary is not None:
-            output = request.output_dir / "pytubefix-merged.mp4"
-            await _run_process(
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(video_or_audio),
-                "-i",
-                str(secondary),
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart",
-                str(output),
-                timeout=self.settings.ffmpeg_timeout_seconds,
-                cancel_event=cancel_event,
-            )
-            video_or_audio.unlink(missing_ok=True)
-            secondary.unlink(missing_ok=True)
-            final = output
-        elif request.media_type == "audio":
-            output = request.output_dir / "pytubefix-audio.mp3"
-            await _run_process(
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(video_or_audio),
-                "-vn",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "192k",
-                str(output),
-                timeout=self.settings.ffmpeg_timeout_seconds,
-                cancel_event=cancel_event,
-            )
-            video_or_audio.unlink(missing_ok=True)
-            final = output
-        else:
-            final = video_or_audio
-        if final.stat().st_size > self.settings.max_file_size_bytes:
-            final.unlink(missing_ok=True)
-            raise RuntimeError("pytubefix output exceeds configured download limit")
-        await probe_media_file(final)
-        return NormalizedMediaResult(self.name, "youtube", request.media_type, files=[final])
+        try:
+            video_or_audio, secondary = await asyncio.to_thread(download_streams)
+            if interrupted():
+                raise CancelledError("pytubefix download cancelled")
+            if secondary is not None:
+                output = request.output_dir / "pytubefix-merged.mp4"
+                await _run_process(
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(video_or_audio),
+                    "-i",
+                    str(secondary),
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    str(output),
+                    timeout=self.settings.ffmpeg_timeout_seconds,
+                    cancel_event=cancel_event,
+                )
+                video_or_audio.unlink(missing_ok=True)
+                secondary.unlink(missing_ok=True)
+                final = output
+            elif request.media_type == "audio":
+                output = request.output_dir / "pytubefix-audio.mp3"
+                await _run_process(
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(video_or_audio),
+                    "-vn",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "192k",
+                    str(output),
+                    timeout=self.settings.ffmpeg_timeout_seconds,
+                    cancel_event=cancel_event,
+                )
+                video_or_audio.unlink(missing_ok=True)
+                final = output
+            else:
+                final = video_or_audio
+            if final.stat().st_size <= 0:
+                raise RuntimeError("pytubefix produced an empty output")
+            if final.stat().st_size > self.settings.max_file_size_bytes:
+                raise RuntimeError("pytubefix output exceeds configured download limit")
+            await probe_media_file(final)
+            return NormalizedMediaResult(self.name, "youtube", request.media_type, files=[final])
+        except Exception:
+            for path in request.output_dir.iterdir():
+                if path.is_file() and path.resolve() not in before:
+                    path.unlink(missing_ok=True)
+            raise
