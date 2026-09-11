@@ -218,9 +218,14 @@ class Settings(BaseSettings):
             raise ValueError("COBALT_AUTH_SCHEME must be Api-Key or Bearer")
         return normalized
 
-    @field_validator("cobalt_timeout_seconds", "gallerydl_timeout_seconds", "tiktok_backend_timeout_seconds")
+    @field_validator("cobalt_timeout_seconds")
     @classmethod
-    def validate_backend_timeout(cls, value: int) -> int:
+    def validate_cobalt_timeout(cls, value: int) -> int:
+        return max(10, min(int(value), 300))
+
+    @field_validator("gallerydl_timeout_seconds", "tiktok_backend_timeout_seconds")
+    @classmethod
+    def validate_optional_backend_timeout(cls, value: int) -> int:
         return max(10, min(int(value), 600))
 
     @field_validator("download_backend_failure_threshold")
