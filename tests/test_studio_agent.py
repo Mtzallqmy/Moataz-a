@@ -8,9 +8,22 @@ import pytest
 from sqlalchemy import func, select
 
 from app.bot import studio
-from app.db import MediaProject, SessionLocal, StudioAgentMessage, User, init_db
+from app.db import (
+    MediaAsset,
+    MediaProject,
+    ProjectAsset,
+    SessionLocal,
+    StudioAgentMessage,
+    User,
+    init_db,
+)
 from app.services.openai_compatible import AIProviderError, ChatReply, ToolChatReply
-from app.services.studio_agent import StudioAgentReply, StudioAgentService, _parse_json_reply
+from app.services.studio_agent import (
+    AGENT_TOOLS,
+    StudioAgentReply,
+    StudioAgentService,
+    _parse_json_reply,
+)
 from app.services.timeline import TimelineService, new_timeline
 
 _IDS = itertools.count(9_200_000)
@@ -35,13 +48,57 @@ async def _project() -> tuple[int, int]:
         return user.id, project.id
 
 
+async def _project_with_video(tmp_path) -> tuple[int, int]:
+    await init_db()
+    media = tmp_path / "agent-video.mp4"
+    media.write_bytes(b"fixture")
+    async with SessionLocal() as session:
+        user = User(telegram_id=next(_IDS))
+        session.add(user)
+        await session.flush()
+        project = MediaProject(
+            user_id=user.id,
+            chat_id=user.telegram_id,
+            width=360,
+            height=640,
+            fps=24,
+            timeline_json=json.dumps(new_timeline(360, 640, 24)),
+        )
+        asset = MediaAsset(
+            user_id=user.id,
+            asset_type="video",
+            source_type="local",
+            local_path=str(media),
+            mime_type="video/mp4",
+            duration=10,
+            width=360,
+            height=640,
+            file_size=media.stat().st_size,
+            metadata_json='{"has_video":true}',
+        )
+        session.add_all([project, asset])
+        await session.flush()
+        session.add(
+            ProjectAsset(
+                project_id=project.id,
+                asset_id=asset.id,
+                position=0,
+                role="main",
+            )
+        )
+        await session.commit()
+        return user.id, project.id
+
+
 class StructuredRegistry:
     def __init__(self, replies: list[str]) -> None:
         self.replies = iter(replies)
         self.calls = 0
+        self.messages = []
 
     async def chat(self, provider_id, model, messages, *, max_reply_chars=None):
         self.calls += 1
+        self.messages.append(messages)
         return ChatReply(text=next(self.replies), model=model)
 
 
@@ -65,6 +122,9 @@ async def test_agent_structured_json_modifies_same_project_and_persists_context(
     )
     assert reply.applied_tools == ("add_text", "set_canvas")
     assert reply.timeline["tracks"][3]["clips"][0]["text"] == "أهلاً"
+    contract_prompt = registry.messages[0][-1]["content"]
+    assert "Tool contracts" in contract_prompt
+    assert '"required":["clip_id","source_end"]' in contract_prompt
     async with SessionLocal() as session:
         count = await session.scalar(
             select(func.count()).select_from(StudioAgentMessage).where(
@@ -118,6 +178,49 @@ async def test_agent_native_tools_use_same_validated_command_layer() -> None:
         native_tools=True,
     )
     assert reply.timeline["options"]["audio_mode"] == "background_music"
+
+
+def test_agent_tool_schemas_mark_clip_targets_as_required() -> None:
+    schemas = {item["function"]["name"]: item["function"]["parameters"] for item in AGENT_TOOLS}
+    assert "clip_id" in schemas["trim_clip"]["required"]
+    assert "source_end" in schemas["trim_clip"]["required"]
+    assert "clip_id" in schemas["add_transition"]["required"]
+    assert "text" in schemas["add_text"]["required"]
+
+
+@pytest.mark.asyncio
+async def test_agent_safely_resolves_missing_clip_id_when_only_one_clip_exists(
+    tmp_path,
+) -> None:
+    user_id, project_id = await _project_with_video(tmp_path)
+
+    class NativeRegistry(StructuredRegistry):
+        async def chat_tools(self, provider_id, model, messages, tools):
+            return ToolChatReply(
+                text="قصصت البداية",
+                model=model,
+                tool_calls=(
+                    {
+                        "name": "trim_clip",
+                        "arguments": {"source_start": 1, "source_end": 8},
+                    },
+                ),
+            )
+
+    reply = await StudioAgentService(
+        registry=NativeRegistry([]), timelines=TimelineService()
+    ).handle(
+        project_id,
+        user_id=user_id,
+        instruction="قص ثانية من البداية",
+        provider_id="native",
+        model="tool-model",
+        native_tools=True,
+    )
+
+    visual = reply.timeline["tracks"][0]["clips"]
+    assert visual[0]["source_start"] == 1
+    assert visual[0]["duration"] == 7
 
 
 def test_agent_rejects_shell_and_unknown_tools_before_dispatch() -> None:

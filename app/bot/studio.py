@@ -315,6 +315,50 @@ async def _safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, markup=
     return False
 
 
+async def _safe_bound_edit(message: Message, text: str, markup=None) -> bool:
+    """Edit a received/sent message without letting Telegram UI errors break work."""
+
+    try:
+        await message.edit_text(text, reply_markup=markup)
+        return True
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(min(float(exc.retry_after), 5.0))
+        try:
+            await message.edit_text(text, reply_markup=markup)
+            return True
+        except TelegramBadRequest as retry_exc:
+            return "message is not modified" in str(retry_exc).lower()
+        except (TelegramRetryAfter, TelegramNetworkError):
+            return False
+    except TelegramBadRequest as exc:
+        return "message is not modified" in str(exc).lower()
+    except TelegramNetworkError:
+        return False
+
+
+def _safe_studio_error(exc: Exception, *, agent: bool = False) -> str:
+    """Return an actionable message without exposing SQL, paths, or credentials."""
+
+    detail = str(exc).lower()
+    if agent and ("clip_id" in detail or "clip_index" in detail):
+        return "لم أستطع تحديد المقطع المقصود. اذكر رقمه، مثل: «قص المقطع الأول»."
+    if agent and "requires a media clip" in detail:
+        return "لا توجد مادة مناسبة لهذا التعديل. أرسل فيديوًا أو صوتًا إلى المشروع أولًا."
+    if "project asset limit" in detail:
+        return "وصل المشروع إلى الحد الأقصى المسموح من المواد."
+    if "unsupported" in detail or "not valid for" in detail:
+        return "نوع الملف أو العملية غير مدعوم في هذا المشروع."
+    if "file size" in detail or "too large" in detail:
+        return "حجم الملف يتجاوز الحد المسموح."
+    if "duration" in detail and isinstance(exc, ValueError):
+        return "مدة المادة أو التعديل تتجاوز الحدود المسموحة."
+    if isinstance(exc, LookupError):
+        return "المشروع أو المادة لم تعد متاحة."
+    if agent:
+        return "تعذر تطبيق التعليمات بأمان. حاول صياغتها بخطوة واحدة مع تحديد رقم المقطع."
+    return "تعذر قبول الملف بسبب خطأ داخلي مؤقت. حاول إرساله مرة أخرى."
+
+
 async def watch_render_and_deliver(
     bot: Bot,
     *,
@@ -610,21 +654,23 @@ async def handle_agent_instruction(
             native_tools=bool(data.get("studio_agent_native_tools")),
         )
         tools = "، ".join(reply.applied_tools)
-        await thinking.edit_text(
+        await _safe_bound_edit(
+            thinking,
             f"✅ {reply.text[:1000]}\n\nالأدوات: {tools[:600]}",
-            reply_markup=agent_keyboard(project_id),
+            agent_keyboard(project_id),
         )
         if reply.render_action:
             await _enqueue_agent_render(message, project_id, user.id, reply.render_action)
     except Exception as exc:
-        logger.warning(
-            "studio agent request failed project_id=%s error=%s",
+        logger.exception(
+            "studio agent request failed project_id=%s error_type=%s",
             project_id,
             type(exc).__name__,
         )
-        await thinking.edit_text(
-            f"تعذر تطبيق التعليمات بأمان: {str(exc)[:700]}",
-            reply_markup=agent_keyboard(project_id),
+        await _safe_bound_edit(
+            thinking,
+            f"تعذر تطبيق التعليمات بأمان: {_safe_studio_error(exc, agent=True)}",
+            agent_keyboard(project_id),
         )
 
 
@@ -722,7 +768,12 @@ async def ingest_upload_message(
         if asset is not None:
             with suppress(Exception):
                 await assets.delete_unattached_asset(asset.id, user_id=user.id)
-        await message.answer(f"تعذر قبول الملف: {str(exc)[:300]}")
+        logger.exception(
+            "studio upload ingestion failed project_id=%s error_type=%s",
+            project_id,
+            type(exc).__name__,
+        )
+        await message.answer(f"تعذر قبول الملف: {_safe_studio_error(exc)}")
     finally:
         if temporary is not None:
             shutil.rmtree(temporary.parent, ignore_errors=True)

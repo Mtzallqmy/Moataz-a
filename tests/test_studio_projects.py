@@ -1,6 +1,7 @@
 # ruff: noqa: I001
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 from pathlib import Path
@@ -116,3 +117,37 @@ async def test_project_reorder_roles_and_presets_are_persistent(tmp_path: Path) 
             )
         )
         assert len(revisions) >= 6
+
+
+@pytest.mark.asyncio
+async def test_concurrent_asset_additions_allocate_unique_positions(tmp_path: Path) -> None:
+    user, image, audio = await _fixture_assets(tmp_path)
+    projects = ProjectService()
+    project = await projects.create_project(user_id=user.id, chat_id=789)
+
+    first, second = await asyncio.gather(
+        projects.add_asset(project.id, image.id, user_id=user.id),
+        projects.add_asset(project.id, audio.id, user_id=user.id),
+    )
+
+    assert {first.position, second.position} == {0, 1}
+    items = await projects.list_assets(project.id, user_id=user.id)
+    assert [item.link.position for item in items] == [0, 1]
+    assert {item.asset.id for item in items} == {image.id, audio.id}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_asset_addition_is_idempotent(tmp_path: Path) -> None:
+    user, image, _ = await _fixture_assets(tmp_path)
+    projects = ProjectService()
+    project = await projects.create_project(user_id=user.id, chat_id=790)
+
+    first, second = await asyncio.gather(
+        projects.add_asset(project.id, image.id, user_id=user.id),
+        projects.add_asset(project.id, image.id, user_id=user.id),
+    )
+
+    assert first.asset_id == second.asset_id == image.id
+    items = await projects.list_assets(project.id, user_id=user.id)
+    assert len(items) == 1
+    assert items[0].link.position == 0
