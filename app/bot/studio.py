@@ -15,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.bot.access import ensure_user, is_allowed
+from app.bot.safe_edit import safe_edit_message
 from app.bot.uploads import download_upload, upload_candidate
 from app.config import get_settings
 from app.db import MediaProject, ProjectStatus, RenderStatus, User
@@ -24,6 +25,7 @@ from app.services.ai_registry import get_ai_provider_registry
 from app.services.assets import AssetService, asset_service
 from app.services.composer import composer_service
 from app.services.media import fit_media_for_upload, probe_media_file
+from app.services.media_intelligence import MediaIntelligenceService
 from app.services.projects import ProjectAssetItem, ProjectService, project_service
 from app.services.render_service import RenderService, render_service
 from app.services.studio_agent import StudioAgentService, studio_agent_service
@@ -35,6 +37,7 @@ settings = get_settings()
 router = Router(name="media-studio")
 logger = logging.getLogger("moataz.studio.telegram")
 _delivery_tasks: set[asyncio.Task] = set()
+_analysis_tasks: set[asyncio.Task] = set()
 
 
 class StudioState(StatesGroup):
@@ -344,23 +347,7 @@ async def _safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, markup=
 
 async def _safe_bound_edit(message: Message, text: str, markup=None) -> bool:
     """Edit a received/sent message without letting Telegram UI errors break work."""
-
-    try:
-        await message.edit_text(text, reply_markup=markup)
-        return True
-    except TelegramRetryAfter as exc:
-        await asyncio.sleep(min(float(exc.retry_after), 5.0))
-        try:
-            await message.edit_text(text, reply_markup=markup)
-            return True
-        except TelegramBadRequest as retry_exc:
-            return "message is not modified" in str(retry_exc).lower()
-        except (TelegramRetryAfter, TelegramNetworkError):
-            return False
-    except TelegramBadRequest as exc:
-        return "message is not modified" in str(exc).lower()
-    except TelegramNetworkError:
-        return False
+    return await safe_edit_message(message, text, markup)
 
 
 def _safe_studio_error(exc: Exception, *, agent: bool = False) -> str:
@@ -493,6 +480,30 @@ async def watch_render_and_deliver(
 def _track(task: asyncio.Task) -> None:
     _delivery_tasks.add(task)
     task.add_done_callback(_delivery_tasks.discard)
+
+
+def _schedule_asset_analysis(asset_id: int, *, user_id: int, project_id: int) -> None:
+    """Analyze newly attached media without holding the Telegram update open."""
+
+    service = MediaIntelligenceService(settings)
+    task = asyncio.create_task(
+        service.analyze_asset(asset_id, user_id=user_id, project_id=project_id),
+        name=f"studio-analysis-{asset_id}",
+    )
+    _analysis_tasks.add(task)
+
+    def completed(done: asyncio.Task) -> None:
+        _analysis_tasks.discard(done)
+        if done.cancelled():
+            return
+        if exc := done.exception():
+            logger.warning(
+                "studio media analysis failed asset_id=%s error_type=%s",
+                asset_id,
+                type(exc).__name__,
+            )
+
+    task.add_done_callback(completed)
 
 
 async def _enqueue_agent_render(message: Message, project_id: int, user_id: int, kind: str) -> None:
@@ -655,9 +666,10 @@ async def open_agent(callback: CallbackQuery, state: FSMContext) -> None:
         for index, model in enumerate(models)
     ]
     rows.append([InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")])
-    await callback.message.edit_text(
+    await _safe_bound_edit(
+        callback.message,
         "🤖 اختر نموذج المونتاج. سيعدل النموذج نفس Timeline عبر أدوات آمنة فقط:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
@@ -685,11 +697,12 @@ async def choose_agent_model(callback: CallbackQuery, state: FSMContext) -> None
         studio_agent_model=model,
         studio_agent_native_tools=native_tools,
     )
-    await callback.message.edit_text(
+    await _safe_bound_edit(
+        callback.message,
         f"🤖 مونتاج بالذكاء الاصطناعي — Project #{project_id}\n\n"
         "أرسل ملفات أو روابط، أو اكتب تعليماتك الطبيعية. كل تعديل يطبق على نفس Timeline "
         "ويمكن التراجع عنه. استخدم المعاينة قبل التصدير النهائي.",
-        reply_markup=agent_keyboard(project_id),
+        agent_keyboard(project_id),
     )
     await callback.answer("تم اختيار النموذج")
 
@@ -841,6 +854,7 @@ async def ingest_upload_message(
             metadata={"original_name": candidate.file_name},
         )
         await projects.add_asset(project_id, asset.id, user_id=user.id)
+        _schedule_asset_analysis(asset.id, user_id=user.id, project_id=project_id)
         await message.answer(
             f"✅ أضيفت {_asset_icon(asset.asset_type)} {candidate.file_name[:60]}",
             reply_markup=project_keyboard(project_id),
@@ -893,6 +907,7 @@ async def receive_project_url(message: Message, state: FSMContext) -> None:
         try:
             asset = await asset_service.ingest_url(url, user_id=user.id, project_id=project_id)
             await project_service.add_asset(project_id, asset.id, user_id=user.id)
+            _schedule_asset_analysis(asset.id, user_id=user.id, project_id=project_id)
             added += 1
         except Exception as exc:
             if asset is not None:

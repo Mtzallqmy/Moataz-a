@@ -174,6 +174,35 @@ class MediaAsset(Base):
     metadata_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    analysis: Mapped[MediaAssetAnalysis | None] = relationship(
+        back_populates="asset", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class MediaAssetAnalysis(Base):
+    """Reusable, versioned intelligence derived from an immutable source asset."""
+
+    __tablename__ = "media_asset_analyses"
+    __table_args__ = (
+        Index("ix_media_asset_analysis_status_updated", "status", "updated_at"),
+    )
+
+    asset_id: Mapped[int] = mapped_column(
+        ForeignKey("media_assets.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    analyzer_version: Mapped[str] = mapped_column(String(32))
+    source_fingerprint: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    analysis_json: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    asset: Mapped[MediaAsset] = relationship(back_populates="analysis")
+
 
 class MediaProject(Base):
     __tablename__ = "media_projects"

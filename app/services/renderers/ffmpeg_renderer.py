@@ -315,9 +315,11 @@ class FFmpegRenderer(BaseRenderer):
             chain = (
                 f"atrim=start={source_start:.6f}:end={source_end:.6f},"
                 f"asetpts=(PTS-STARTPTS)/{speed:.6f},"
-                "aresample=48000,aformat=channel_layouts=stereo,"
-                f"volume='{volume_expression}':eval=frame"
+                "aresample=48000,aformat=channel_layouts=stereo"
             )
+            if clip.get("normalize_audio"):
+                chain += ",loudnorm=I=-16:LRA=11:TP=-1.5"
+            chain += f",volume='{volume_expression}':eval=frame"
             fade_in = min(float(clip.get("fade_in") or 0), duration / 2)
             fade_out = min(float(clip.get("fade_out") or 0), duration / 2)
             if fade_in:

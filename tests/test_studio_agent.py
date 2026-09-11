@@ -17,12 +17,14 @@ from app.db import (
     User,
     init_db,
 )
+from app.services.edit_planner import EditPlan
 from app.services.openai_compatible import AIProviderError, ChatReply, ToolChatReply
 from app.services.studio_agent import (
     AGENT_TOOLS,
     StudioAgentReply,
     StudioAgentService,
     _parse_json_reply,
+    requires_edit_plan,
 )
 from app.services.timeline import TimelineService, new_timeline
 
@@ -368,3 +370,75 @@ async def test_agent_mode_routes_url_only_message_to_existing_downloader_flow(mo
     monkeypatch.setattr(studio, "receive_project_url", route)
     await studio.handle_agent_instruction(Message(), State())
     assert routed == ["https://youtu.be/example"]
+
+
+def test_complex_semantic_requests_use_edit_planning_stage() -> None:
+    assert requires_edit_plan("اختر أفضل اللقطات واحذف الصمت") is True
+    assert requires_edit_plan("قص أول خمس ثوان") is False
+
+
+@pytest.mark.asyncio
+async def test_complex_agent_request_analyzes_plans_and_applies_one_timeline_batch(
+    tmp_path,
+) -> None:
+    user_id, project_id = await _project_with_video(tmp_path)
+    captured: dict[str, object] = {}
+
+    class Intelligence:
+        async def analyze_project(self, candidate_project, *, user_id):
+            captured["analysis"] = (candidate_project, user_id)
+            return {
+                "assets": [
+                    {
+                        "asset_id": 1,
+                        "quality": {"duration": 10},
+                        "transcription": {"segments": []},
+                    }
+                ]
+            }
+
+    class Planner:
+        async def generate(self, instruction, **kwargs):
+            captured["instruction"] = instruction
+            captured["history"] = kwargs["conversation_history"]
+            asset_id = kwargs["timeline"]["tracks"][0]["clips"][0]["asset_id"]
+            kwargs["project_intelligence"]["assets"][0]["asset_id"] = asset_id
+            return EditPlan.from_payload(
+                {
+                    "goal": "أفضل لقطة",
+                    "target_duration": 5,
+                    "aspect_ratio": "9:16",
+                    "style_preset": "reels-fast",
+                    "pacing": "fast",
+                    "selected_ranges": [
+                        {"asset_id": asset_id, "start": 0, "end": 5}
+                    ],
+                    "removed_clip_ids": [],
+                    "transition": "slide",
+                    "captions": {"enabled": False},
+                    "audio": {"mode": "keep"},
+                    "texts": [],
+                    "overlays": [],
+                    "rationale": "المشهد أوضح",
+                }
+            )
+
+    service = StudioAgentService(
+        registry=StructuredRegistry([]),
+        timelines=TimelineService(),
+        planner=Planner(),
+        intelligence=Intelligence(),
+    )
+    reply = await service.handle(
+        project_id,
+        user_id=user_id,
+        instruction="اختر أفضل اللقطات واعمل فيديو احترافي",
+        provider_id="router",
+        model="model",
+    )
+
+    assert captured["analysis"] == (project_id, user_id)
+    assert reply.applied_tools[:2] == ("apply_editing_style", "set_canvas")
+    assert "select_ranges" in reply.applied_tools
+    assert reply.timeline["canvas"]["width"] == 1080
+    assert reply.timeline["revision"] == 1
