@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -9,10 +10,20 @@ from sqlalchemy import select
 
 from app.db import MediaProject, SessionLocal, StudioAgentMessage
 from app.services.ai_registry import AIProviderRegistry, get_ai_provider_registry
-from app.services.edit_planner import AIEditPlanner, compile_tool_calls
-from app.services.media_intelligence import MediaIntelligenceService, media_intelligence_service
+from app.services.edit_planner import (
+    AIEditPlanner,
+    compile_tool_calls,
+    constrain_plan_for_operation,
+)
+from app.services.media_intelligence import (
+    MediaIntelligenceService,
+    ProviderVisionAnalyzer,
+    media_intelligence_service,
+)
 from app.services.openai_compatible import AIProviderError
 from app.services.timeline import TOOL_NAMES, TimelineService, timeline_service
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +82,17 @@ _PLANNING_MARKERS = {
     "documentary",
 }
 
+_ANALYSIS_OPERATIONS = {
+    "split_30",
+    "split_60",
+    "split_scenes",
+    "remove_silence",
+    "best_moment",
+    "replace_audio",
+    "auto_duck",
+    "normalize",
+}
+
 
 def requires_edit_plan(instruction: str) -> bool:
     """Route semantic, multi-step requests through analysis before Timeline tools."""
@@ -80,6 +102,13 @@ def requires_edit_plan(instruction: str) -> bool:
         return True
     separators = normalized.count(" ثم ") + normalized.count("،") + normalized.count(",")
     return separators >= 2
+
+
+def requires_project_plan(
+    instruction: str, project_context: dict[str, Any] | None = None
+) -> bool:
+    operation = str((project_context or {}).get("selected_operation") or "")
+    return requires_edit_plan(instruction) or operation in _ANALYSIS_OPERATIONS
 
 
 def _tool(name: str, description: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -192,6 +221,7 @@ class StudioAgentService:
         provider_id: str,
         model: str,
         native_tools: bool = False,
+        vision: bool = False,
         project_context: dict[str, Any] | None = None,
         stage_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> StudioAgentReply:
@@ -207,7 +237,7 @@ class StudioAgentService:
             *history,
             {"role": "user", "content": instruction},
         ]
-        if requires_edit_plan(instruction):
+        if requires_project_plan(instruction, project_context):
             return await self._planned(
                 project_id,
                 user_id=user_id,
@@ -217,6 +247,7 @@ class StudioAgentService:
                 timeline=timeline,
                 history=history,
                 project_context=project_context,
+                vision=vision,
                 stage_callback=stage_callback,
             )
         if stage_callback is not None:
@@ -271,6 +302,7 @@ class StudioAgentService:
         timeline: dict[str, Any],
         history: list[dict[str, object]],
         project_context: dict[str, Any] | None,
+        vision: bool,
         stage_callback: Callable[[str], Awaitable[None]] | None,
     ) -> StudioAgentReply:
         if stage_callback is not None:
@@ -278,6 +310,27 @@ class StudioAgentService:
         intelligence = await self.intelligence.analyze_project(
             project_id, user_id=user_id
         )
+        if vision:
+            analyzer = ProviderVisionAnalyzer(
+                self.registry,
+                provider_id=provider_id,
+                model=model,
+                allowed_root=self.intelligence.settings.project_dir,
+            )
+            try:
+                intelligence = await self.intelligence.enrich_project_vision(
+                    project_id, user_id=user_id, vision=analyzer
+                )
+            except Exception as exc:
+                logger.warning(
+                    "studio vision enrichment skipped project_id=%s error_type=%s",
+                    project_id,
+                    type(exc).__name__,
+                )
+                intelligence = {
+                    **intelligence,
+                    "vision_warning": "Vision enrichment was unavailable; local analysis was used.",
+                }
         if project_context:
             intelligence = {**intelligence, "session_context": project_context}
         validation_feedback = ""
@@ -294,6 +347,9 @@ class StudioAgentService:
                 model=model,
                 conversation_history=history,
                 validation_feedback=validation_feedback,
+            )
+            plan = constrain_plan_for_operation(
+                plan, intelligence, project_context
             )
             try:
                 calls = compile_tool_calls(plan, timeline, intelligence)

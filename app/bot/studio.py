@@ -1057,7 +1057,10 @@ async def choose_agent_model(callback: CallbackQuery, state: FSMContext) -> None
         selected = models[int(raw_index)]
         provider_id = str(selected["provider_id"])
         model = str(selected["model_id"])
-        native_tools = "tools" in set(selected.get("capabilities") or [])
+        capabilities = set(selected.get("capabilities") or [])
+        input_modalities = set(selected.get("input_modalities") or [])
+        native_tools = "tools" in capabilities
+        vision = "vision" in capabilities or "image" in input_modalities
     except (IndexError, KeyError, TypeError, ValueError):
         await callback.answer("أعد فتح قائمة النماذج", show_alert=True)
         return
@@ -1067,6 +1070,7 @@ async def choose_agent_model(callback: CallbackQuery, state: FSMContext) -> None
         studio_agent_provider_id=provider_id,
         studio_agent_model=model,
         studio_agent_native_tools=native_tools,
+        studio_agent_vision=vision,
     )
     workflow = str(
         data.get("studio_workflow") or StudioWorkflow.SMART_EDIT.value
@@ -1211,6 +1215,7 @@ async def handle_agent_instruction(
             provider_id=provider_id,
             model=model,
             native_tools=bool(data.get("studio_agent_native_tools")),
+            vision=bool(data.get("studio_agent_vision")),
             project_context={
                 "workflow": workflow,
                 "selected_operation": operation or None,
@@ -1225,6 +1230,8 @@ async def handle_agent_instruction(
             f"✅ {reply.text[:1000]}\n\nالأدوات: {tools[:600]}",
             agent_keyboard(project_id),
         )
+        if operation:
+            await state.update_data(studio_operation=None)
         if reply.render_action:
             await _enqueue_agent_render(
                 message, project_id, user.id, reply.render_action, state=state

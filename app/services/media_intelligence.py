@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -29,6 +30,103 @@ class Transcriber(Protocol):
 
 class VisionAnalyzer(Protocol):
     async def describe(self, frames: list[Path]) -> list[dict[str, Any]]: ...
+
+
+class VisionChatRegistry(Protocol):
+    async def chat(
+        self,
+        provider_id: str,
+        model: str,
+        messages: list[dict[str, object]],
+        *,
+        max_reply_chars: int | None = None,
+    ) -> Any: ...
+
+
+class ProviderVisionAnalyzer:
+    """Describe extracted frames through the user's selected AI provider."""
+
+    def __init__(
+        self,
+        registry: VisionChatRegistry,
+        *,
+        provider_id: str,
+        model: str,
+        allowed_root: Path,
+    ) -> None:
+        self.registry = registry
+        self.provider_id = provider_id
+        self.model = model
+        self.allowed_root = allowed_root.resolve()
+
+    @property
+    def cache_key(self) -> str:
+        raw = f"{ANALYZER_VERSION}:{self.provider_id}:{self.model}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+    async def describe(self, frames: list[Path]) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "Return a JSON array with one object per image, in order. Each object must be "
+                    '{"description":"brief scene description","focus":{"x":0.5,"y":0.5}}. '
+                    "Use normalized focus coordinates from 0 to 1. Do not include markdown."
+                ),
+            }
+        ]
+        accepted = 0
+        for frame in frames[:4]:
+            resolved = frame.resolve()
+            if self.allowed_root not in resolved.parents or not resolved.is_file():
+                continue
+            raw = await asyncio.to_thread(resolved.read_bytes)
+            if not raw or len(raw) > 2 * 1024 * 1024:
+                continue
+            accepted += 1
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/jpeg;base64,"
+                        + base64.b64encode(raw).decode("ascii")
+                    },
+                }
+            )
+        if not accepted:
+            return []
+        reply = await self.registry.chat(
+            self.provider_id,
+            self.model,
+            [{"role": "user", "content": content}],
+            max_reply_chars=8000,
+        )
+        cleaned = str(reply.text).strip()
+        start = cleaned.find("[")
+        if start < 0:
+            raise ValueError("Vision response has no JSON array")
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+        except json.JSONDecodeError as exc:
+            raise ValueError("Vision response contains invalid JSON") from exc
+        if not isinstance(payload, list) or len(payload) < accepted:
+            raise ValueError("Vision response does not match supplied frames")
+        result: list[dict[str, Any]] = []
+        for item in payload[:accepted]:
+            if not isinstance(item, dict):
+                raise ValueError("Vision scene description must be an object")
+            focus = item.get("focus")
+            if not isinstance(focus, dict):
+                focus = {"x": 0.5, "y": 0.5}
+            x = min(1.0, max(0.0, float(focus.get("x", 0.5))))
+            y = min(1.0, max(0.0, float(focus.get("y", 0.5))))
+            result.append(
+                {
+                    "description": str(item.get("description") or "")[:1000],
+                    "focus": {"x": x, "y": y},
+                }
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +299,56 @@ class MediaIntelligenceService:
                 3,
             ),
         }
+
+    async def enrich_project_vision(
+        self,
+        project_id: int,
+        *,
+        user_id: int,
+        vision: ProviderVisionAnalyzer,
+    ) -> dict[str, Any]:
+        """Persist provider vision output without repeating local media analysis."""
+
+        project = await self.analyze_project(project_id, user_id=user_id)
+        updated: list[dict[str, Any]] = []
+        for original in project["assets"]:
+            payload = dict(original)
+            scenes = [dict(item) for item in payload.get("scenes") or []]
+            if payload.get("vision_cache_key") == vision.cache_key:
+                updated.append(payload)
+                continue
+            frames = [
+                Path(str(item["thumbnail"]))
+                for item in scenes
+                if item.get("thumbnail")
+            ]
+            descriptions = await vision.describe(frames)
+            for scene, description in zip(scenes, descriptions, strict=False):
+                scene["description"] = description["description"]
+                scene["focus"] = description["focus"]
+            payload["scenes"] = scenes
+            payload["vision_used"] = bool(descriptions)
+            payload["vision_cache_key"] = vision.cache_key
+            await self._persist_enrichment(payload, user_id=user_id)
+            updated.append(payload)
+        return {**project, "assets": updated}
+
+    @staticmethod
+    async def _persist_enrichment(payload: dict[str, Any], *, user_id: int) -> None:
+        asset_id = int(payload.get("asset_id") or 0)
+        async with SessionLocal() as session:
+            row = await session.scalar(
+                select(MediaAssetAnalysis).where(
+                    MediaAssetAnalysis.asset_id == asset_id,
+                    MediaAssetAnalysis.user_id == user_id,
+                )
+            )
+            if row is None or row.status != "COMPLETED":
+                raise LookupError("Completed asset analysis not found")
+            row.analysis_json = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
+            )
+            await session.commit()
 
     async def _owned_asset(
         self, asset_id: int, *, user_id: int, project_id: int

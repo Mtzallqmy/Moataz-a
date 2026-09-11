@@ -1056,8 +1056,8 @@ class TimelineService:
             clip["transition_out"] = {"type": transition, "duration": duration}
         elif name == "select_ranges":
             ranges = args.get("ranges")
-            if not isinstance(ranges, list) or not ranges or len(ranges) > 20:
-                raise ValueError("select_ranges requires 1-20 timestamp ranges")
+            if not isinstance(ranges, list) or not ranges or len(ranges) > 120:
+                raise ValueError("select_ranges requires 1-120 timestamp ranges")
             asset = assets.get(int(clip.get("asset_id") or 0))
             if asset is None or not asset.duration:
                 raise ValueError("Clip source duration is unavailable")

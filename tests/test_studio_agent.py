@@ -25,6 +25,7 @@ from app.services.studio_agent import (
     StudioAgentService,
     _parse_json_reply,
     requires_edit_plan,
+    requires_project_plan,
 )
 from app.services.timeline import TimelineService, new_timeline
 
@@ -463,6 +464,12 @@ async def _noop_edit(*args, **kwargs):
 def test_complex_semantic_requests_use_edit_planning_stage() -> None:
     assert requires_edit_plan("اختر أفضل اللقطات واحذف الصمت") is True
     assert requires_edit_plan("قص أول خمس ثوان") is False
+    assert requires_project_plan(
+        "نفّذ", {"selected_operation": "remove_silence"}
+    ) is True
+    assert requires_project_plan(
+        "نفّذ", {"selected_operation": "replace_audio"}
+    ) is True
 
 
 @pytest.mark.asyncio

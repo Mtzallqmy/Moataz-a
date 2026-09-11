@@ -9,7 +9,11 @@ import pytest
 from app.config import Settings
 from app.db import MediaAssetAnalysis, SessionLocal, User, init_db
 from app.services.assets import AssetService
-from app.services.media_intelligence import MediaIntelligenceService
+from app.services.media_intelligence import (
+    MediaIntelligenceService,
+    ProviderVisionAnalyzer,
+)
+from app.services.openai_compatible import ChatReply
 from app.services.projects import ProjectService
 
 _IDS = itertools.count(9_600_000)
@@ -79,6 +83,35 @@ class FakeTranscriber:
                 {"start": 0.25, "end": 0.6, "word": "بالعالم"},
             ],
         }
+
+
+class FakeVision:
+    cache_key = "vision-model-v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def describe(self, frames: list[Path]):
+        self.calls += 1
+        return [
+            {
+                "description": f"scene {index}",
+                "focus": {"x": 0.25, "y": 0.75},
+            }
+            for index, _ in enumerate(frames)
+        ]
+
+
+class FakeVisionRegistry:
+    def __init__(self) -> None:
+        self.messages = []
+
+    async def chat(self, provider_id, model, messages, *, max_reply_chars=None):
+        self.messages.append((provider_id, model, messages, max_reply_chars))
+        return ChatReply(
+            text='[{"description":"منتج على الطاولة","focus":{"x":2,"y":-1}}]',
+            model=model,
+        )
 
 
 @pytest.mark.asyncio
@@ -151,3 +184,63 @@ async def test_media_intelligence_enforces_project_ownership(tmp_path: Path) -> 
             user_id=stranger.id,
             project_id=project.id,
         )
+
+
+@pytest.mark.asyncio
+async def test_provider_vision_is_safe_structured_and_clamps_focus(tmp_path: Path) -> None:
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"jpeg-fixture")
+    registry = FakeVisionRegistry()
+    analyzer = ProviderVisionAnalyzer(
+        registry,  # type: ignore[arg-type]
+        provider_id="configured-provider",
+        model="vision-model",
+        allowed_root=tmp_path,
+    )
+    result = await analyzer.describe([frame])
+    assert result == [
+        {
+            "description": "منتج على الطاولة",
+            "focus": {"x": 1.0, "y": 0.0},
+        }
+    ]
+    assert registry.messages[0][0:2] == ("configured-provider", "vision-model")
+    content = registry.messages[0][2][0]["content"]
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+@pytest.mark.asyncio
+async def test_vision_enrichment_is_persisted_and_reused(tmp_path: Path) -> None:
+    await init_db()
+    settings = Settings(
+        project_dir=tmp_path / "projects", render_temp_dir=tmp_path / "tmp"
+    )
+    async with SessionLocal() as session:
+        user = User(telegram_id=next(_IDS))
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        session.expunge(user)
+    projects = ProjectService(settings)
+    project = await projects.create_project(user_id=user.id, chat_id=user.telegram_id)
+    asset = await AssetService(settings).ingest_file(
+        _media(tmp_path / "vision.mp4"),
+        user_id=user.id,
+        project_id=project.id,
+        declared_type="video",
+    )
+    await projects.add_asset(project.id, asset.id, user_id=user.id)
+    service = MediaIntelligenceService(settings)
+    vision = FakeVision()
+    first = await service.enrich_project_vision(
+        project.id, user_id=user.id, vision=vision  # type: ignore[arg-type]
+    )
+    second = await service.enrich_project_vision(
+        project.id, user_id=user.id, vision=vision  # type: ignore[arg-type]
+    )
+    assert vision.calls == 1
+    assert first["assets"][0]["vision_used"] is True
+    assert second["assets"][0]["vision_cache_key"] == "vision-model-v1"
+    stored = await service.get(asset.id, user_id=user.id)
+    assert stored is not None
+    assert stored.payload["scenes"][0]["description"].startswith("scene")
