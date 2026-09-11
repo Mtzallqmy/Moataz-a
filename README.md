@@ -1,174 +1,267 @@
 # Moataz Media Bot
 
-Media Download Manager يعمل من Telegram ومن Dashboard اختيارية، مبني على Python 3.12 وFastAPI وaiogram وPostgreSQL وyt-dlp وFFmpeg.
+مدير تنزيل ومعالجة وسائط يعمل من Telegram وDashboard وMedia Studio، مبني على Python 3.12 وFastAPI وaiogram وSQLAlchemy وyt-dlp وFFmpeg.
 
 ## التشغيل الأساسي
 
-تشغيل ميزات الوسائط على Railway يحتاج متغيرين أساسيين فقط:
+الحد الأدنى للتشغيل:
 
 ```env
 BOT_TOKEN=
 DATABASE_URL=
 ```
 
-ولتفعيل دردشة AI عبر أي مزود **OpenAI-compatible** أضف اختياريًا:
-
-```env
-OPENAI_BASE_URL=
-OPENAI_API_TOKEN=
-```
-
-`OPENAI_BASE_URL` يجب أن يكون جذر API المتوافق، مثل `https://provider.example/v1`. لا تضع API Token في رسائل Telegram أو داخل المستودع؛ مكانه الصحيح هو Railway Variables.
-
-يعمل البوت افتراضيًا عبر **Telegram Polling**، وتعمل المهام عبر **Inline Queue** داخل الخدمة نفسها. لا يحتاج Redis أو ARQ أو Webhook أو Worker منفصل. Cookies ليست مطلوبة للروابط العامة عادةً، لكن بعض المنصات قد تطلبها أو تحظر عناوين مراكز البيانات.
+ثم:
 
 ```bash
 python -m app.main
 ```
 
-Railway يمرر `PORT` تلقائيًا، والتطبيق يستخدمه مباشرة.
+على Railway يمرر `PORT` تلقائيًا. التطبيق يشغّل Telegram Polling وInline Queue داخل الخدمة نفسها، ولا يحتاج Redis أو Worker منفصل للمسار الحالي.
 
-## القدرات
+## مسار التنزيل في Production
 
-- DownloaderService مستقل عن Telegram: `probe()`, `get_formats()`, `download()`, `download_audio()`, `expand_playlist()`, `cancel()`, `classify_error()`.
-- YouTube وFacebook مساران أساسيان ومختبران، مع Generic yt-dlp لأي URL عام يستطيع yt-dlp التعرف عليه فعليًا.
-- MP4 وMP3 وBest Quality واختيار Resolution من الجودات الموجودة فعلًا فقط.
-- أزرار Telegram الرئيسية أصبحت مسارات فعلية: **تحميل فيديو** يعرض الجودات، **MP3** يحلل ثم يضع تنزيل الصوت مباشرة في الطابور، **قص** يفتح خيارات القص بعد التحليل، و**تحميل عدة روابط** ينشئ Job مستقل لكل رابط.
-- لا يحدث downgrade صامت: اختيار 1080p مثلًا يستخدم تطابق ارتفاع exact، وإذا لم يعد متاحًا تفشل المهمة بـ `FORMAT_UNAVAILABLE`.
-- Metadata: العنوان، الصورة المصغرة، المدة، الناشر، المنصة والجودات.
-- Bulk URLs مع normalization وdeduplication، وكل URL يصبح Job مستقلًا.
-- Playlist confirmation/expansion إلى Jobs مستقلة بحد آمن افتراضي 10 عناصر.
-- Progress على نفس رسالة Telegram: Job ID، الحالة، الجودة، Downloaded/Total، النسبة، الشريط، السرعة وETA.
-- القص يدعم **قص حر**، **30 ثانية للقصص**، **60 ثانية**، مع FAST stream-copy أو PRECISE H.264/AAC.
-- cancellation فعلية للـyt-dlp وFFmpeg، retry محدود مع exponential backoff + jitter، startup reconciliation وcleanup.
-- Dashboard: Overview / Downloads / Jobs / Users / Workers / Errors / System، مع Analyze وDownload وDownload All وCancel، إضافة إلى قص حر/30ث/60ث مع FAST/PRECISE.
-- تبويب System يعرض `RAILWAY_GIT_COMMIT_SHA` وbranch وdeployment ID عندما يكون التشغيل من Railway، لتعرف أي Commit يعمل فعليًا.
+المسار الفعلي موحد الآن:
 
-### مسارات تحميل احتياطية
+```text
+Telegram / Dashboard / Media Studio
+        ↓
+DownloaderService compatibility facade
+        ↓
+DownloadManager
+        ↓
+PlatformDetector
+        ↓
+ProviderRouter
+        ↓
+DownloadBackend adapters
+        ↓
+NormalizedMediaResult
+        ↓
+FFmpeg / MP3 / cut / 30-60 split / AssetService
+```
 
-يستخدم التحميل العادي وMP3 والقص والتقسيم وروابط Media Studio الخدمة المركزية نفسها. عند خطأ مؤقت أو حظر anti-bot تنتقل الخدمة بالترتيب بين: yt-dlp المباشر، browser impersonation عبر `curl_cffi`، ثم Proxies المضبوطة، ثم خوادم Cobalt ذاتية الاستضافة أو المصرح باستخدامها. الفيديو الخاص أو الرابط الذي يحتاج تسجيل دخول لا يُعاد بلا فائدة.
+`DownloaderService` يحافظ على API القديم المستخدم في handlers والworker:
+
+- `probe()`
+- `get_formats()`
+- `download()`
+- `download_audio()`
+- `expand_playlist()`
+- `cancel()`
+- `classify_error()`
+
+ولا يوجد Cobalt fallback منفصل خارج الـRouter. إذا فشل backend أول ثم نجح التالي، لا يظهر فشل الأول للمستخدم.
+
+## ترتيب Backends
+
+الترتيب الحالي حسب المنصة ونوع المحتوى:
+
+| المنصة | الترتيب |
+| --- | --- |
+| YouTube | `yt-dlp → Cobalt → pytubefix` |
+| Instagram Story | `gallery-dl → Instaloader → yt-dlp → Cobalt` |
+| Instagram Highlight | `gallery-dl → Instaloader → yt-dlp → Cobalt` |
+| Instagram Post/Reel | `yt-dlp → Cobalt → gallery-dl → Instaloader` |
+| TikTok/Douyin Story | `gallery-dl → TikTok sidecar → yt-dlp → Cobalt` |
+| TikTok/Douyin | `yt-dlp → Cobalt → TikTok sidecar → gallery-dl` |
+| Facebook | `yt-dlp → Cobalt → gallery-dl` |
+| Generic URLs | `yt-dlp → Cobalt → gallery-dl` |
+
+داخل `yt-dlp` نفسه يوجد ترتيب attempts مستقل: direct ثم browser impersonation عبر `curl_cffi` عند توفره، ثم الـproxies المضبوطة.
+
+لا يحدث fallback عند `AUTH_REQUIRED` أو `PRIVATE_MEDIA`. هذه الحالات لا تُحسب أيضًا كعطل عالمي في Circuit Breaker. أما `HTTP_403`, `HTTP_429`, anti-bot, timeouts, upstream 5xx والأعطال المؤقتة فتسمح بالانتقال إلى backend التالي.
+
+## إعدادات yt-dlp وCobalt
 
 ```env
-# Netscape cookies.txt: اختر ملفًا mounted أو محتوى Base64، وليس الاثنين.
 YTDLP_COOKIES_FILE=
 YTDLP_COOKIES_B64=
-
-# حتى أربعة مخارج مرتبة، مفصولة بفاصلة أو سطر جديد.
 YTDLP_PROXY_URLS=
 YTDLP_IMPERSONATE=true
 
-# حتى أربعة Cobalt API roots ذاتية/مصرح بها. لا تستخدم الخادم العام دون إذن.
 COBALT_API_URLS=
 COBALT_API_TOKEN=
 COBALT_AUTH_SCHEME=Api-Key
 COBALT_TIMEOUT_SECONDS=45
+
+DOWNLOAD_BACKEND_FAILURE_THRESHOLD=3
+DOWNLOAD_BACKEND_COOLDOWN_SECONDS=120
 ```
 
-تُحفظ الأسرار في Railway Variables فقط وتُنقّح من السجلات. لا يتبع عميل Cobalt redirects غير المفحوصة، ولا يرسل مفتاح الـAPI إلى host خارجي، ويلتزم بحد الحجم والإلغاء والتنظيف. وجود أكثر من backend يزيد الاعتمادية لكنه لا يتجاوز DRM أو صلاحيات المحتوى الخاص، ولا يضمن تجاوز حظر المنصة إذا كانت كل المخارج محظورة.
+- `YTDLP_COOKIES_FILE`: ملف Netscape `cookies.txt` mounted.
+- `YTDLP_COOKIES_B64`: بديل مناسب للـRailway Variables. لا تضبط الملف وBase64 معًا إلا إذا كنت تقصد أن يكون الملف هو المصدر الأول.
+- `YTDLP_PROXY_URLS`: حتى أربعة مخارج مرتبة، مفصولة بفاصلة أو سطر جديد.
+- `COBALT_API_URLS`: حتى أربعة API roots ذاتية الاستضافة أو مصرح باستخدامها.
+- `COBALT_API_TOKEN`: سر، ويُرسل فقط إلى Cobalt endpoint الموافق.
 
-## Media Studio MVP
+لا يضيف المشروع `api.cobalt.tools` تلقائيًا ولا يجب استخدام الخادم العام دون إذن من مشغله.
 
-زر **🎞 مشروع مونتاج** في Telegram يفتح workflow مستقلًا عن Download Jobs:
+### تشغيل Cobalt ذاتيًا
 
-1. أنشئ مشروعًا جديدًا.
-2. أرسل فيديوهات أو صورًا أو ملفات صوت/voice أو documents وسائط، وأضف روابط URL مفردة أو متعددة ضمن حدود المشروع.
-3. راجع **📦 المواد**، غيّر الترتيب، احذف الرابط من المشروع، أو عيّن أدوار `main / intro / outro / music / voice / logo / background` المتوافقة مع نوع الملف.
-4. اختر Canvas: `9:16` أو `16:9` أو `1:1`، وFit: `fit / fill / blur-background`، وانتقال `fade / dissolve / slide / wipe / zoom / blur / push / dip-to-black`، ووضع الصوت `replace / mix / background music`، ومكان الشعار.
-5. اختر القالب المقترح، تابع تقدم FFmpeg الحقيقي، ألغِ عند الحاجة، ثم استلم MP4 صالحًا. إذا تجاوز الناتج ميزانية Telegram يُضغط تكيفيًا قبل الإرسال.
+المشروع لا يضم كود Cobalt. شغّل instance منفصلًا وفق توثيق Cobalt الرسمي. مثال Docker أساسي:
 
-القوالب المنفذة فعليًا: **Audio + Image، Slideshow بصوت اختياري، Merge Videos، Video + Audio، Intro/Main/Outro، Logo Overlay**. يتم توحيد المقاس وFPS وSAR وpixel format والصوت قبل الدمج، وتضاف silent audio للفيديو الصامت. الملفات الأصلية للأصول لا تُعدّل أثناء الرندر.
+```yaml
+services:
+  cobalt:
+    image: ghcr.io/imputnet/cobalt:11
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      API_URL: "https://cobalt.example.com/"
+```
 
-الرابط داخل المشروع يستخدم `DownloaderService` والحماية نفسها ضد SSRF والـprivate networks؛ Playlists لا تُضاف ككيان واحد في MVP، ويجب إرسال روابط العناصر المفردة. الملفات المرفوعة تمر بفحص الامتداد/MIME وFFprobe ولا يُستخدم اسم Telegram كمسار تخزين.
+إذا كان الـinstance مكشوفًا للإنترنت، فعّل API-key protection في Cobalt بدل تركه مفتوحًا. Cobalt يدعم `API_KEY_URL` و`API_AUTH_REQUIRED=1`، والعميل هنا يرسل المفتاح بهذا الشكل:
 
-### Timeline V2 والمونتاج بالمحادثة
+```text
+Authorization: Api-Key <uuid-key>
+```
 
-زر **🤖 مونتاج بالذكاء الاصطناعي** داخل المشروع يربط المشروع بأي نموذج نصي مفعّل في `AIProviderRegistry`. يمكن متابعة رفع الملفات والصور والصوت والـvoice والروابط في الوضع نفسه، ثم كتابة تعليمات طبيعية لتعديل المشروع الحالي بدل إنشاء نتيجة جديدة.
-
-تبدأ التجربة الآن من شاشة عمليات منظّمة: مونتاج AI، قص وتقسيم، تعديل/استبدال الصوت، كابتشن، أو إعادة فتح مشروع. ينشئ البوت جلسة Project واضحة في حالة `COLLECTING_MEDIA` ويجمع كل المواد أولًا من دون تشغيل Agent أو Render عند وصول أول ملف. يعرض **ملخص المشروع** أعداد الفيديوهات والصور والموسيقى والصوت والشعارات، مدة المواد، إعداد Canvas وRevision الحالية؛ وبعد زر **انتهيت من رفع المواد** ينتقل إلى التعليمات ثم التحليل والتخطيط وتطبيق Timeline والمعاينة وانتظار الملاحظات.
-
-يحتفظ سياق الجلسة بآخر مادة مضافة، لذلك يمكن الإشارة بأمان إلى «الصورة الأخيرة» أو «الصوت الذي أرسلته الآن». عمليات حذف الصمت، تقسيم 30/60 ثانية، التقسيم حسب المشاهد، أفضل اللحظات، استبدال الصوت وAuto Duck تتحول إلى تعديلات Timeline حتمية مبنية على التحليل المخزّن وليست أوامر FFmpeg من النموذج. إذا كان النموذج المختار يعلن دعم Vision، تُرسل له فقط thumbnails محدودة الحجم عبر نفس المزود، وتُخزّن أوصاف المشاهد ونقاط التركيز لإعادة الاستخدام؛ وإذا تعذر Vision يستمر التخطيط بالتحليل المحلي بدل إسقاط المشروع.
-
-مصدر الحقيقة هو Timeline JSON مستقل عن FFmpeg وTelegram. يدعم مسارات visual/audio/overlay/text/subtitle، وعمليات trim/split/move/reorder، السرعة والصوت وfade، crop/scale/position، canvas وfit modes، الانتقالات، النصوص والترجمة، Intro/Main/Outro، keyframes قابلة للتوسعة، ونسخ revisions كاملة مع undo/redo. يمكن إزالة الصوت الأصلي من فيديو كامل، أو خفضه/كتمه ضمن نطاق زمني، واستبداله بملف Audio/Voice مع خيار المزج، وخفض الموسيقى تلقائيًا أثناء Voice متداخل. كل مجموعة تعديلات من Agent تحفظ كعملية ذرية قابلة للمراجعة والتراجع.
-
-الـAI لا يحصل على shell ولا يبني FFmpeg command. النموذج يستدعي catalog أدوات محددة، ثم يتحقق `TimelineService` من الأداة والملكية والأنواع والحدود قبل تعديل Timeline. النماذج التي تدعم native tool calling تستخدمه، والبقية تستخدم Structured JSON مع تحقق وإعادة محاولة محدودة. مفاتيح المزود تبقى في متغيرات البيئة ولا تُكتب في Timeline أو سجل المحادثة.
-
-يمكن طلب **معاينة** قصيرة منخفضة الدقة ثم متابعة المحادثة والتعديل، أو طلب **تصدير نهائي**. ومن **مشاريعي** يمكن إعادة فتح مشروع مكتمل، إضافة مواد جديدة وإعادة ترتيبها ثم رندره مجددًا؛ يظل ملف الرندر السابق مستقلًا ولا تُعدّل الأصول الأصلية. FFmpegRenderer يترجم Timeline إلى filter graph آمن ويدعم compositing للنصوص والشعارات والترجمة والمزج متعدد المسارات. Remotion ليس dependency؛ واجهة `BaseRenderer` تبقي إضافة renderer اختياري لاحقًا ممكنة.
-
-اعتمد التصميم على فصل Timeline/commands الموجود في OpenChatCut وفكرة composition/op-log في MakeMyClip كمرجع معماري فقط. لم يُنسخ كود AGPL من OpenChatCut.
-
-### متغيرات Media Studio
-
-جميعها اختيارية ولها defaults آمنة، وأسماؤها موثقة أيضًا في `.env.example`:
+ثم اضبط في التطبيق:
 
 ```env
-PROJECT_DIR=/data/projects
-RENDER_TEMP_DIR=/data/tmp
-MAX_PROJECT_ASSETS=20
-MAX_PROJECT_DURATION_SECONDS=1800
-MAX_RENDER_DURATION_SECONDS=1800
-MAX_CONCURRENT_RENDERS=1
-MAX_RENDERS_PER_USER=1
-RENDER_TIMEOUT_SECONDS=1800
-MAX_RENDER_RETRIES=1
-DEFAULT_RENDER_FPS=30
+COBALT_API_URLS=https://cobalt.example.com
+COBALT_API_TOKEN=<uuid-key>
+COBALT_AUTH_SCHEME=Api-Key
 ```
 
-تُطبّق كذلك الحدود العامة `MAX_FILE_SIZE_MB` و`MAX_VIDEO_DURATION_SECONDS` و`TELEGRAM_UPLOAD_LIMIT_MB` على ingestion والتسليم. تحديث رسالة Telegram مضبوط بواسطة `PROGRESS_UPDATE_SECONDS` ولا يستخدم timer وهميًا.
+توثيق Cobalt الرسمي:
 
-## OpenAI-compatible AI Chat
+- https://github.com/imputnet/cobalt/blob/main/docs/run-an-instance.md
+- https://github.com/imputnet/cobalt/blob/main/docs/protect-an-instance.md
+- https://github.com/imputnet/cobalt/blob/main/docs/api.md
 
-عند ضبط `OPENAI_BASE_URL` و`OPENAI_API_TOKEN` يظهر مسار **🤖 دردشة AI** في Telegram. البوت يتصل فعليًا بـ:
+## gallery-dl
 
-- `GET {OPENAI_BASE_URL}/models` لقراءة النماذج الحقيقية.
-- `POST {OPENAI_BASE_URL}/chat/completions` للمحادثة.
-
-تختار النموذج من Telegram ثم ترسل الرسائل بشكل طبيعي، ويحتفظ البوت بسياق قصير للمحادثة داخل جلسة Telegram. يمكن بدء محادثة جديدة أو تغيير النموذج من الأزرار. إذا كان المزود لا يدعم `/models` أو `/chat/completions` بالشكل المتوافق مع OpenAI فلن يتم الادعاء بأنه مدعوم.
-
-يدعم registry إعدادات OpenAI وOpenRouter وDeepSeek وواجهة Gemini المتوافقة مع OpenAI، إضافة إلى Runware وNVIDIA وAgentRouter وxAI وGroq وأي عدد من المزودين المخصصين عبر `AI_PROVIDER_<ID>_*`. لكل مزود Base URL وAPI key وأولوية، ولكل نموذج capabilities مكتشفة من catalog المزود.
-
-### أين أضع Base URL وAPI Token؟
-
-**Railway → Service `Moataz-a` → Variables** هو المكان الموصى به:
+`gallery-dl` مدمج كـCLI adapter معزول؛ لا يتم استيراد أو نسخ كوده داخل المشروع. صورة Docker الكاملة تثبت executable خارجيًا، لكن backend يبقى معطلًا حتى تفعيله:
 
 ```env
-OPENAI_BASE_URL=https://your-provider.example/v1
-OPENAI_API_TOKEN=your-secret-token
+GALLERYDL_ENABLED=true
+GALLERYDL_COOKIE_FILE=
+GALLERYDL_TIMEOUT_SECONDS=180
 ```
 
-لا توجد نافذة في البوت لإدخال الـToken عمدًا، حتى لا يمر السر عبر Telegram أو يدخل في history/logs. البوت يعرض فقط اختيار النموذج والاستخدام، وليس إدارة الأسرار.
+التنفيذ يستخدم `asyncio.create_subprocess_exec()` مع argument array فقط، بدون `shell=True`. الملفات تبقى داخل Job directory، مع timeout وcancellation وterminate/kill وتنظيف partial outputs. الناتج يُفحص كمحتوى وسائط ولا يعتمد على الامتداد وحده.
 
-## الحماية
+يستخدم خصوصًا لصور/Carousels Instagram، Stories/Highlights عندما يستطيع extractor الوصول إليها، وصور TikTok عند دعم extractor الحالي.
 
-كل URL وسائط يمر عبر طبقة حماية قبل yt-dlp: HTTP/HTTPS فقط، حظر localhost وprivate/link-local/reserved addresses وcloud metadata، والتحقق من DNS. `SafeYoutubeDL` يعيد فحص الطلبات التي ينفذها yt-dlp للمساعدة في حماية redirects. لا توجد آليات لتجاوز DRM أو paywalls أو private/authenticated media.
+## Instaloader
 
-العمليات الخارجية تستخدم argument arrays فقط ولا تستخدم `shell=True`. كل Job يكتب داخل مجلد معزول، مع حدود للمدة والحجم والمهلة والتزامن والتنظيف التلقائي وSecret Redaction للـlogs.
+Instaloader optional dependency وlazy import. صورة Railway الكاملة تثبته، لكن تفعيله صريح:
 
-## Dashboard
+```env
+INSTALOADER_ENABLED=true
+INSTAGRAM_SESSION_FILE=
+```
 
-اللوحة **معطلة** افتراضيًا. إذا لم يكن `DASHBOARD_PASSWORD` مضبوطًا فإن `/dashboard` يعيد 404 ولا توجد لوحة غير محمية. هذا متغير اختياري وليس مطلوبًا لتشغيل البوت.
+Posts/Reels يمكن تجربتها بدون session. Story مفردة تستخدم media id مباشرة ولا تقوم بتنزيل Profile كامل. Stories تتطلب `INSTAGRAM_SESSION_FILE` مصرحًا به.
 
-## Railway Auto Deploy
+Highlight URLs تُمرر أولًا إلى gallery-dl. Instaloader لا يقوم بعمل profile crawl لمجرد Highlight URL لا يمكن حله بأمان إلى عنصر مفرد؛ في هذه الحالة يرفض adapter المسار ويستمر Router في fallback المسموح.
 
-المستودع مهيأ لـRailway عبر `railway.json` وDockerfile، وGitHub Actions يعمل على `push` إلى `main`. النشر التلقائي نفسه إعداد Native داخل Railway.
+اسم المستخدم أو محتوى session لا يُخزن في Job metadata.
 
-في خدمة Railway المرتبطة بهذا المستودع اضبط:
+## pytubefix
 
-1. **Source → GitHub Repo:** `Mtzallqmy/Moataz-a`.
-2. **Trigger Branch:** `main`.
-3. **Autodeploy:** Enabled.
-4. **Wait for CI:** Enabled إن كان متاحًا في إعداد المصدر.
+pytubefix fallback اختياري ليوتيوب بعد yt-dlp وCobalt:
 
-بهذا يصبح أي Merge/Push ناجح إلى `main` مرشحًا للنشر تلقائيًا. لا يحتاج ذلك Railway token داخل المستودع.
+```env
+PYTUBEFIX_ENABLED=true
+```
 
-## Health
+يدعم metadata للفيديو وplaylist، تنزيل video/audio، اختيار streams بشكل deterministic، ودمج adaptive video+audio عبر FFmpeg عند الحاجة. الاستيراد lazy، وغياب الحزمة لا يسقط Startup أو Edge Runtime.
 
-- `GET /healthz`: liveness بدون اتصال Telegram أو yt-dlp أو مزود AI.
-- `GET /readyz`: PostgreSQL + وجود FFmpeg/FFprobe.
-- `GET /version`: إصدار التطبيق.
+pytubefix ليس ضمانًا لتجاوز YouTube IP/anti-bot challenge؛ قد يتأثر بالحظر نفسه.
 
-لا يتم تشغيل yt-dlp أو FFmpeg أو AI أثناء startup، وفشل Job أو خطأ Telegram/AI مؤقت لا يسقط FastAPI container.
+## TikTok / Douyin sidecar
+
+لا يحتوي المستودع TikTokDownloader أو أي كود GPL-3.0 منه. التكامل عبارة عن adapter إلى sidecar/API يشغله مالك النظام:
+
+```env
+TIKTOK_BACKEND_ENABLED=false
+TIKTOK_BACKEND_URL=
+TIKTOK_BACKEND_TOKEN=
+TIKTOK_COOKIE_FILE=
+TIKTOK_BACKEND_TIMEOUT_SECONDS=60
+```
+
+يبقى backend معطلًا إذا لم يكن `TIKTOK_BACKEND_ENABLED=true` أو لم يوجد URL. الواجهة تدعم تدريجيًا `video`, `images/slideshow`, `audio` و`story` عندما يوفرها الـsidecar. HTTP 401/403 من الـsidecar يصنف كـ`AUTH_REQUIRED` ولا يفتح fallback غير مصرح.
+
+لا تستخدم sidecar عامًا مجهول المصدر، ولا ترسل cookies إليه إلا إذا كنت أنت مشغل الخدمة أو تثق بها صراحة.
+
+## Anti-bot على Railway
+
+وجود Multi-Backend routing لا يعني أن حظر YouTube أصبح محلولًا. إذا لم تتوفر Cookies أو Proxy أو Cobalt self-hosted/authorized، فقد يستمر الخطأ:
+
+```text
+Sign in to confirm you’re not a bot
+```
+
+المسار يحافظ على browser impersonation، ويجرب proxies/Cobalt/pytubefix عند السماح، لكنه لا يتجاوز DRM ولا تسجيل الدخول ولا صلاحيات المحتوى الخاص.
+
+إذا كانت كل المخارج من عناوين datacenter محظورة، فقد تفشل جميع backends. في هذه الحالة الحل التشغيلي هو توفير credentials صالحة أو egress مصرح أو Cobalt instance على شبكة مناسبة، وليس إضافة public API عشوائي.
+
+## Observability وHealth
+
+كل محاولة backend تسجل حقولًا منظمة بدون أسرار:
+
+```text
+job=<id> platform=<platform> backend=<backend> result=<SUCCESS|ERROR_CODE> fallback_count=<n>
+```
+
+ويُحفظ في schema الحالي عبر `JobEvent`:
+
+- `attempted_backends`
+- `successful_backend`
+- `normalized_error`
+- `fallback_count`
+
+لم تتم إعادة تسمية أي جدول ولم تُفرض migration لكسر `create_all` deployments الحالية.
+
+Dashboard يعرض health snapshot لكل platform/backend (`HEALTHY`, `DEGRADED`, `OPEN`, `UNAVAILABLE`) ولا يعرض cookies أو proxy credentials أو tokens أو signed URLs.
+
+## الأسرار والحماية
+
+الحقول الحساسة تستخدم `SecretStr` حيث يلزم. الـlogging يزيل أو يخفي:
+
+- Cookies
+- `Authorization`
+- API keys/tokens
+- Proxy credentials
+- signed URL query parameters
+- Telegram bot token وDatabase credentials
+
+روابط المستخدم تمر بحماية SSRF، وتُرفض private/special IPs وcredential-bearing URLs والمنافذ غير القياسية.
+
+## Media Studio
+
+Media Studio يدعم مشاريع تحتوي فيديو/صور/صوت/voice/subtitles وروابط URL. URL ingestion يمر بنفس `DownloaderService → DownloadManager` ثم يتحول الناتج إلى Asset بعد فحصه.
+
+القص والتقسيم 30/60 ثانية يعيدان Job نفسه إلى Queue؛ التنزيل الأصلي يتم أولًا عبر DownloadManager ثم يطبق FFmpeg العملية على ملف backend الناجح. MP3 يستخدم المسار نفسه.
+
+Timeline/AI layer منفصل عن shell: النموذج لا ينشئ أوامر FFmpeg مباشرة، وإنما يطلب أدوات محددة وتتحقق الخدمات من الملكية والأنواع والحدود قبل تعديل Timeline أو بدء Render.
+
+## Dependencies الاختيارية
+
+التثبيت الأساسي يبقى بدون specialist Python packages:
+
+```bash
+pip install .
+```
+
+لتثبيت Instaloader وpytubefix:
+
+```bash
+pip install ".[download-specialists]"
+```
+
+وصورة Docker الإنتاجية تثبت أيضًا `gallery-dl` كـCLI منفصل. Edge Runtime workflow يتعمد الاستيراد بدون هذه optional dependencies للتأكد أن غيابها لا يمنع startup.
 
 ## الاختبارات
+
+لا تتصل اختبارات CI بمنصات أو APIs حقيقية؛ تستخدم mocks وfixtures محلية.
+
+شغّل قبل الدمج أو النشر:
 
 ```bash
 ruff check .
@@ -176,4 +269,15 @@ python -m compileall -q app tests
 pytest -q
 ```
 
-الاختبارات لا تعتمد على Telegram أو YouTube أو AI provider حي. وهي تغطي أيضًا fixtures مولدة بـFFmpeg لكل قوالب الاستوديو، Timeline متعدد المسارات، الانتقالات الثمانية، النصوص والترجمة والـoverlays، كتم واستبدال الصوت والنطاقات الزمنية، revisions وundo/redo، إعادة فتح المشروع، Agent tool validation وStructured JSON/native tools، preview، نسب العرض وfit modes، الفيديو الصامت واختلاف FPS/المقاسات، تقدم FFmpeg، الإلغاء والتنظيف، recovery بعد restart، ownership، Telegram uploads، URL ingestion، وفشل التسليم دون تحويل render ناجح إلى FAILED.
+CI يغطي، من ضمن ما يغطيه:
+
+- yt-dlp success وfallback إلى Cobalt ثم pytubefix.
+- 403/429/timeouts/anti-bot وكل-backends-fail.
+- عدم fallback لـAUTH_REQUIRED/private media.
+- Circuit Breaker per platform وcooldown recovery.
+- gallery-dl CLI argument isolation وcancellation cleanup.
+- Instaloader carousel وStory session behavior.
+- pytubefix video/audio/playlist deterministic selection.
+- TikTok sidecar video/audio/slideshow وAUTH behavior.
+- MP3/القص/التقسيم/Media Studio عبر الـfacade الموحد.
+- Secret redaction وEdge Runtime imports بدون optional dependencies.

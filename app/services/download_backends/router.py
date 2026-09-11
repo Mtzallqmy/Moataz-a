@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterable
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+from app.config import Settings, get_settings
+from app.errors import ErrorCode, classify_error
+from app.security import redact_secrets
+from app.services.download_backends.base import (
+    BackendUnavailableError,
+    DownloadBackend,
+    DownloadRequest,
+    NormalizedMediaResult,
+)
+from app.services.download_backends.health import BackendHealthRegistry
+
+logger = logging.getLogger("moataz.downloader.router")
+
+
+@dataclass(frozen=True, slots=True)
+class DetectedMedia:
+    platform: str
+    media_type: str
+
+
+class PlatformDetector:
+    @staticmethod
+    def detect(url: str, media_type: str | None = None) -> DetectedMedia:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        path = parsed.path.lower()
+        if host in {"youtu.be", "youtube.com", "m.youtube.com", "music.youtube.com"}:
+            platform = "youtube"
+        elif host.endswith("instagram.com"):
+            platform = "instagram"
+        elif host.endswith(("tiktok.com", "douyin.com")):
+            platform = "tiktok"
+        elif host.endswith(("facebook.com", "fb.watch")):
+            platform = "facebook"
+        elif host.endswith("snapchat.com"):
+            platform = "snapchat"
+        elif host.endswith(("twitter.com", "x.com")):
+            platform = "twitter"
+        elif host.endswith("vimeo.com"):
+            platform = "vimeo"
+        elif host.endswith("reddit.com"):
+            platform = "reddit"
+        else:
+            platform = "generic"
+
+        kind = media_type or "video"
+        if platform == "instagram" and (
+            "/stories/highlights/" in path or "/highlights/" in path
+        ):
+            kind = "highlight"
+        elif platform == "instagram" and "/stories/" in path:
+            kind = "story"
+        elif platform == "tiktok" and "/story/" in path:
+            kind = "story"
+        elif any(value in path for value in ("/p/", "/photo/", "/photos/", "/pin/")):
+            kind = "images"
+        return DetectedMedia(platform, kind)
+
+
+DEFAULT_ROUTES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("youtube", "*"): ("yt-dlp", "cobalt", "pytubefix"),
+    ("instagram", "story"): ("gallery-dl", "instaloader", "yt-dlp", "cobalt"),
+    ("instagram", "highlight"): ("gallery-dl", "instaloader", "yt-dlp", "cobalt"),
+    ("instagram", "*"): ("yt-dlp", "cobalt", "gallery-dl", "instaloader"),
+    ("tiktok", "story"): ("gallery-dl", "tiktok", "yt-dlp", "cobalt"),
+    ("tiktok", "*"): ("yt-dlp", "cobalt", "tiktok", "gallery-dl"),
+    ("facebook", "*"): ("yt-dlp", "cobalt", "gallery-dl"),
+    ("generic", "*"): ("yt-dlp", "cobalt", "gallery-dl"),
+}
+
+_FALLBACK_ERRORS = {
+    ErrorCode.ANTI_BOT,
+    ErrorCode.UNSUPPORTED_EXTRACTOR,
+    ErrorCode.FORMAT_UNAVAILABLE,
+    ErrorCode.EXTRACTOR_ERROR,
+    ErrorCode.HTTP_403,
+    ErrorCode.HTTP_429,
+    ErrorCode.NETWORK_TIMEOUT,
+    ErrorCode.UPSTREAM_5XX,
+    ErrorCode.BACKEND_UNAVAILABLE,
+}
+
+
+class ProviderRouter:
+    def __init__(
+        self,
+        backends: Iterable[DownloadBackend],
+        *,
+        health: BackendHealthRegistry | None = None,
+        register_optional: bool = True,
+        optional_settings: Settings | None = None,
+    ) -> None:
+        self.backends = {backend.name: backend for backend in backends}
+        if register_optional:
+            settings = optional_settings or self._settings_from_backends() or get_settings()
+            from app.services.download_backends.gallerydl_backend import GalleryDlBackend
+            from app.services.download_backends.instaloader_backend import InstaloaderBackend
+            from app.services.download_backends.pytubefix_backend import PytubefixBackend
+            from app.services.download_backends.tiktok_backend import TikTokBackend
+
+            for backend in (
+                GalleryDlBackend(settings),
+                InstaloaderBackend(settings),
+                PytubefixBackend(settings),
+                TikTokBackend(settings),
+            ):
+                self.backends.setdefault(backend.name, backend)
+        self.health = health or BackendHealthRegistry()
+
+    def _settings_from_backends(self) -> Settings | None:
+        for backend in self.backends.values():
+            settings = getattr(backend, "settings", None)
+            if isinstance(settings, Settings):
+                return settings
+            for owner_name in ("engine", "relay"):
+                owner = getattr(backend, owner_name, None)
+                settings = getattr(owner, "settings", None)
+                if isinstance(settings, Settings):
+                    return settings
+        return None
+
+    def order(self, detected: DetectedMedia) -> tuple[DownloadBackend, ...]:
+        names = DEFAULT_ROUTES.get(
+            (detected.platform, detected.media_type),
+            DEFAULT_ROUTES.get((detected.platform, "*"), DEFAULT_ROUTES[("generic", "*")]),
+        )
+        return tuple(self.backends[name] for name in names if name in self.backends)
+
+    @staticmethod
+    def allows_fallback(exc: BaseException) -> bool:
+        return classify_error(exc).code in _FALLBACK_ERRORS
+
+
+class DownloadManager:
+    def __init__(
+        self,
+        router: ProviderRouter,
+        *,
+        detector: PlatformDetector | None = None,
+    ) -> None:
+        self.router = router
+        self.detector = detector or PlatformDetector()
+        self.last_attempts: tuple[dict[str, str], ...] = ()
+        self._attempts_by_job: dict[str, tuple[dict[str, str], ...]] = {}
+
+    def _record_attempts(self, job_key: str, attempts: list[dict[str, str]]) -> None:
+        frozen = tuple(dict(item) for item in attempts)
+        self.last_attempts = frozen
+        if job_key and job_key != "-":
+            self._attempts_by_job[job_key] = frozen
+
+    def route_telemetry(self, job_key: str, *, pop: bool = False) -> dict[str, object]:
+        attempts = (
+            self._attempts_by_job.pop(job_key, ())
+            if pop
+            else self._attempts_by_job.get(job_key, ())
+        )
+        attempted_backends = [item["backend"] for item in attempts]
+        successful_backend = next(
+            (item["backend"] for item in reversed(attempts) if item["result"] == "SUCCESS"),
+            None,
+        )
+        normalized_error = None
+        if attempts and successful_backend is None:
+            normalized_error = attempts[-1]["result"]
+        return {
+            "attempted_backends": attempted_backends,
+            "successful_backend": successful_backend,
+            "normalized_error": normalized_error,
+            "fallback_count": max(0, len(attempts) - 1),
+        }
+
+    async def _candidates(self, url: str, media_type: str | None):
+        detected = self.detector.detect(url, media_type)
+        for backend in self.router.order(detected):
+            if not self.router.health.allows(backend.name, detected.platform):
+                continue
+            if not await backend.available():
+                continue
+            if await backend.supports(url, detected.media_type):
+                yield detected, backend
+
+    async def probe(self, url: str, media_type: str | None = None) -> NormalizedMediaResult:
+        return await self._execute(url, media_type, None)
+
+    async def expand_playlist(self, url: str, *, limit: int | None = None) -> list[dict[str, object]]:
+        attempts: list[dict[str, str]] = []
+        last_error: BaseException | None = None
+        had_candidate = False
+        async for detected, backend in self._candidates(url, "playlist"):
+            had_candidate = True
+            try:
+                entries = await backend.expand_playlist(url, limit=limit)
+                self.router.health.success(backend.name, detected.platform)
+                attempts.append({"backend": backend.name, "result": "SUCCESS"})
+                self._record_attempts("-", attempts)
+                logger.info(
+                    "job=- platform=%s backend=%s result=SUCCESS fallback_count=%s",
+                    detected.platform,
+                    backend.name,
+                    len(attempts) - 1,
+                )
+                return entries
+            except Exception as exc:
+                last_error = exc
+                error = classify_error(exc)
+                attempts.append({"backend": backend.name, "result": error.code.value})
+                self.router.health.failure(backend.name, detected.platform, error)
+                if not self.router.allows_fallback(exc):
+                    break
+        self._record_attempts("-", attempts)
+        if last_error is not None:
+            raise last_error
+        if not had_candidate:
+            raise BackendUnavailableError("No configured download backend supports playlists for this URL")
+        raise BackendUnavailableError("All configured playlist backends failed")
+
+    async def download(self, request: DownloadRequest) -> NormalizedMediaResult:
+        return await self._execute(request.url, request.media_type, request)
+
+    async def _execute(
+        self,
+        url: str,
+        media_type: str | None,
+        request: DownloadRequest | None,
+    ) -> NormalizedMediaResult:
+        attempts: list[dict[str, str]] = []
+        last_error: BaseException | None = None
+        had_candidate = False
+        job_key = request.job_key if request and request.job_key else "-"
+        async for detected, backend in self._candidates(url, media_type):
+            had_candidate = True
+            try:
+                result = await (backend.download(request) if request else backend.probe(url))
+                self.router.health.success(backend.name, detected.platform)
+                attempts.append({"backend": backend.name, "result": "SUCCESS"})
+                self._record_attempts(job_key, attempts)
+                logger.info(
+                    "job=%s platform=%s backend=%s result=SUCCESS fallback_count=%s",
+                    job_key,
+                    detected.platform,
+                    backend.name,
+                    len(attempts) - 1,
+                )
+                result.provider = backend.name
+                result.platform = detected.platform
+                result.metadata.setdefault("attempted_backends", [dict(item) for item in attempts])
+                result.metadata.setdefault("successful_backend", backend.name)
+                result.metadata.setdefault("normalized_error", None)
+                result.metadata.setdefault("fallback_count", len(attempts) - 1)
+                return result
+            except Exception as exc:
+                last_error = exc
+                error = classify_error(exc)
+                attempts.append({"backend": backend.name, "result": error.code.value})
+                self._record_attempts(job_key, attempts)
+                self.router.health.failure(backend.name, detected.platform, error)
+                logger.warning(
+                    "job=%s platform=%s backend=%s result=%s fallback_count=%s fallback=%s detail=%s",
+                    job_key,
+                    detected.platform,
+                    backend.name,
+                    error.code.value,
+                    len(attempts) - 1,
+                    self.router.allows_fallback(exc),
+                    redact_secrets(exc)[:1000],
+                )
+                if not self.router.allows_fallback(exc):
+                    break
+        self._record_attempts(job_key, attempts)
+        if last_error is not None:
+            raise last_error
+        if not had_candidate:
+            raise BackendUnavailableError("No configured download backend supports this URL")
+        raise BackendUnavailableError("All configured download backends failed")
+
+    async def healthcheck(self, url: str) -> dict[str, str]:
+        detected = self.detector.detect(url)
+        result: dict[str, str] = {}
+        for backend in self.router.order(detected):
+            available = await backend.available()
+            result[backend.name] = self.router.health.status(
+                backend.name, detected.platform, available=available
+            ).value
+        return result

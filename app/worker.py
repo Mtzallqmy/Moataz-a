@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -64,7 +65,6 @@ async def _edit_status(job_id: int, text: str, *, markup: InlineKeyboardMarkup |
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return
-            # Metadata messages can be photos; edit their caption instead.
             try:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
@@ -114,6 +114,17 @@ async def _persist_progress(job_id: int, snapshot: ProgressSnapshot, quality: st
     )
 
 
+async def _record_backend_route(job_id: int, *, pop: bool) -> None:
+    telemetry = downloader.manager.route_telemetry(str(job_id), pop=pop)
+    if not telemetry["attempted_backends"]:
+        return
+    await record_job_event(
+        job_id,
+        "DOWNLOAD_BACKENDS",
+        json.dumps(telemetry, separators=(",", ":"), sort_keys=True),
+    )
+
+
 async def _download_with_retries(
     job_id: int,
     url: str,
@@ -139,6 +150,7 @@ async def _download_with_retries(
                 known_qualities=known_qualities,
             )
         except Exception as exc:
+            await _record_backend_route(job_id, pop=True)
             if await _is_cancelled(job_id, cancel_event):
                 raise CancelledError("Job cancelled") from exc
             info = classify_error(exc)
@@ -274,6 +286,7 @@ async def process_download(job_id: int) -> None:
             progress_hook,
             cancel_event,
         )
+        await _record_backend_route(job_id, pop=True)
         if await _is_cancelled(job_id, cancel_event):
             raise CancelledError("Job cancelled")
 
@@ -338,6 +351,7 @@ async def process_download(job_id: int) -> None:
 
         await _edit_status(job_id, f"Job #{job_id}\nStatus: COMPLETED ✅\nQuality: {quality}")
     except Exception as exc:
+        await _record_backend_route(job_id, pop=True)
         info = classify_error(exc)
         if info.code == ErrorCode.CANCELLED or cancel_event.is_set():
             await set_job_status(job_id, JobStatus.CANCELLED, error=ErrorCode.CANCELLED.value, event_message="cancelled")

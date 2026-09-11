@@ -26,6 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+download-specialists = [
+  "instaloader>=4.15.3,<5",
+  "pytubefix>=11.1,<12",
+]
 dev = [
   "pytest>=8.4,<9",
   "pytest-asyncio>=1.1,<2",

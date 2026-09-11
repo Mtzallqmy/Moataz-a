@@ -14,6 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md ./
 COPY app ./app
-RUN pip install --upgrade pip && pip install .
+RUN pip install --upgrade pip \
+    && pip install ".[download-specialists]" "gallery-dl>=1.32.11,<2"
 RUN mkdir -p /data/downloads /data/projects /data/tmp
 CMD ["python", "-m", "app.main"]

@@ -114,6 +114,22 @@ def _serialize_job(job: DownloadJob, metadata: MediaMetadata | None) -> dict:
     }
 
 
+async def _backend_health_snapshot() -> dict[str, dict[str, str]]:
+    sample_urls = {
+        "youtube": "https://www.youtube.com/watch?v=healthcheck",
+        "instagram": "https://www.instagram.com/p/healthcheck/",
+        "tiktok": "https://www.tiktok.com/@health/video/1",
+        "facebook": "https://www.facebook.com/watch/?v=1",
+    }
+    snapshots = await asyncio.gather(
+        *(downloader.manager.healthcheck(url) for url in sample_urls.values())
+    )
+    return {
+        platform: snapshot
+        for platform, snapshot in zip(sample_urls, snapshots, strict=True)
+    }
+
+
 async def _snapshot() -> dict:
     async with SessionLocal() as session:
         total_jobs = await session.scalar(select(func.count()).select_from(DownloadJob)) or 0
@@ -140,7 +156,10 @@ async def _snapshot() -> dict:
         users = list(await session.scalars(select(User).where(User.telegram_id != 0).order_by(User.id.desc()).limit(100)))
         workers = list(await session.scalars(select(WorkerNode).order_by(WorkerNode.last_seen.desc()).limit(30)))
         jobs = [_serialize_job(job, metadata) for job, metadata in rows]
-    system = await readiness_snapshot()
+    system, download_backends = await asyncio.gather(
+        readiness_snapshot(),
+        _backend_health_snapshot(),
+    )
     return {
         "release": RELEASE,
         "stats": {
@@ -173,6 +192,7 @@ async def _snapshot() -> dict:
             for worker in workers
         ],
         "system": system,
+        "download_backends": download_backends,
     }
 
 

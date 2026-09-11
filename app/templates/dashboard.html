@@ -27,7 +27,7 @@
     <section class="tab active" id="tab-overview">
       <section class="stats" id="stats"></section>
       <article class="glass panel downloader-panel">
-        <div class="panel-head"><div><p class="eyebrow">RECLIP-STYLE FLOW · SHARED ENGINE</p><h2>تنزيل وقص الوسائط / Download & Cut</h2></div><span>yt-dlp + FFmpeg</span></div>
+        <div class="panel-head"><div><p class="eyebrow">RECLIP-STYLE FLOW · SHARED ENGINE</p><h2>تنزيل وقص الوسائط / Download & Cut</h2></div><span>Multi-backend + FFmpeg</span></div>
         <textarea id="urls" rows="3" placeholder="Paste one or more public HTTP/HTTPS URLs…"></textarea>
         <div class="download-actions">
           <button class="primary" id="analyzeBtn">Analyze</button>
@@ -59,6 +59,7 @@
     </section>
 
     <section class="tab" id="tab-system">
+      <article class="glass panel"><div class="panel-head"><h2>Download Backends</h2><span>per platform</span></div><div id="backendHealth" class="list"></div></article>
       <article class="glass panel"><div class="panel-head"><h2>System</h2><span id="release"></span></div><div id="system" class="system-grid"></div></article>
     </section>
   </main>
@@ -195,6 +196,10 @@ function render(data){
   $('#users').innerHTML = data.users.map(u => `<div class="list-row"><div><b>${esc(u.username)}</b><small>${u.telegram_id}</small></div><span>${u.allowed ? '✅' : '⛔'} ${esc(u.language)}</span></div>`).join('') || '<p class="muted">No users.</p>';
   $('#workers').innerHTML = data.workers.map(w => `<div class="list-row"><div><b>${esc(w.id)}</b><small>${esc(w.hostname)}</small></div><span>${w.status === 'ONLINE' ? '🟢' : '⚪'} ${w.active_jobs} jobs</span></div>`).join('') || '<p class="muted">No workers.</p>';
   $('#errors').innerHTML = data.errors.map(e => `<div class="list-row error-row"><div><b>#${e.id} · ${esc(e.title)}</b><small>${esc(e.error)}</small></div><span>${esc(e.platform)}</span></div>`).join('') || '<p class="muted">No recent errors.</p>';
+  $('#backendHealth').innerHTML = Object.entries(data.download_backends || {}).map(([platform, backends]) => {
+    const summary = Object.entries(backends).map(([backend, state]) => `${esc(backend)}: ${esc(state)}`).join(' · ');
+    return `<div class="list-row"><div><b>${esc(platform)}</b><small>${summary}</small></div></div>`;
+  }).join('') || '<p class="muted">No backend health data.</p>';
   $('#system').innerHTML = Object.entries(data.system).map(([k,v]) => `<div class="system-item"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
   $('#release').textContent = data.release;
   $('#updated').textContent = new Date().toLocaleTimeString();

@@ -9,12 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime settings.
-
-    BOT_TOKEN and DATABASE_URL are the only variables needed for the media bot.
-    AI provider variables remain optional. Media Studio limits also have safe
-    defaults, so enabling the Studio does not introduce a new required secret.
-    """
+    """Runtime settings with optional download backends disabled safely by default."""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -58,10 +53,30 @@ class Settings(BaseSettings):
     ytdlp_cookies_b64: SecretStr | None = None
     ytdlp_proxy_urls: SecretStr | None = None
     ytdlp_impersonate: bool = True
+
     cobalt_api_urls: SecretStr | None = None
     cobalt_api_token: SecretStr | None = None
     cobalt_auth_scheme: str = "Api-Key"
     cobalt_timeout_seconds: int = 45
+
+    gallerydl_enabled: bool = False
+    gallerydl_cookie_file: Path | None = None
+    gallerydl_timeout_seconds: int = 180
+
+    instaloader_enabled: bool = False
+    instagram_session_file: Path | None = None
+
+    pytubefix_enabled: bool = False
+
+    tiktok_backend_enabled: bool = False
+    tiktok_backend_url: str = ""
+    tiktok_backend_token: SecretStr | None = None
+    tiktok_cookie_file: Path | None = None
+    tiktok_backend_timeout_seconds: int = 60
+
+    download_backend_failure_threshold: int = 3
+    download_backend_cooldown_seconds: int = 120
+
     job_max_retries: int = 2
     job_retry_base_seconds: float = 4.0
     job_retry_cap_seconds: float = 45.0
@@ -109,6 +124,19 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_openai_api_token(cls, value: str) -> str:
         return str(value or "").strip()
+
+    @field_validator("tiktok_backend_url", mode="before")
+    @classmethod
+    def validate_tiktok_backend_url(cls, value: str) -> str:
+        url = str(value or "").strip().rstrip("/")
+        if not url:
+            return ""
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("TIKTOK_BACKEND_URL must be a valid HTTP/HTTPS API root")
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("TIKTOK_BACKEND_URL cannot contain credentials or a fragment")
+        return url
 
     @field_validator("default_language")
     @classmethod
@@ -194,6 +222,21 @@ class Settings(BaseSettings):
     @classmethod
     def validate_cobalt_timeout(cls, value: int) -> int:
         return max(10, min(int(value), 300))
+
+    @field_validator("gallerydl_timeout_seconds", "tiktok_backend_timeout_seconds")
+    @classmethod
+    def validate_optional_backend_timeout(cls, value: int) -> int:
+        return max(10, min(int(value), 600))
+
+    @field_validator("download_backend_failure_threshold")
+    @classmethod
+    def validate_backend_failure_threshold(cls, value: int) -> int:
+        return max(1, min(int(value), 20))
+
+    @field_validator("download_backend_cooldown_seconds")
+    @classmethod
+    def validate_backend_cooldown(cls, value: int) -> int:
+        return max(5, min(int(value), 3600))
 
     @field_validator("job_retry_base_seconds")
     @classmethod

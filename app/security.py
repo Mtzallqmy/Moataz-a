@@ -119,7 +119,20 @@ def redact_secrets(
         r"\1[REDACTED]@",
         text,
     )
-    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
+    text = re.sub(
+        r"(?i)((?:authorization|proxy-authorization)\s*[:=]\s*(?:bearer|basic)?\s*)[^\s,;]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)((?:x-api-key|api-key|apikey|api_token|access_token)\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED]",
+        text,
+    )
     text = re.sub(r"(?i)(cookie(?:s)?\s*[:=]\s*)[^\s,;]+", r"\1[REDACTED]", text)
-    text = re.sub(r"(?i)([?&](?:token|key|api_key|auth|signature)=)[^&#\s]+", r"\1[REDACTED]", text)
+    text = re.sub(
+        r"(?i)([?&](?:token|key|api_key|api-key|auth|access_token|sig|signature|x-amz-signature|x-goog-signature|x-amz-security-token|credential|policy|key-pair-id)=)[^&#\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
     return text
