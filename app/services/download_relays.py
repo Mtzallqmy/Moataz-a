@@ -11,8 +11,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
-import requests
-
 from app.config import Settings
 from app.errors import CancelledError
 from app.security import assert_public_dns, redact_secrets
@@ -58,11 +56,17 @@ class CobaltRelayClient:
         self,
         settings: Settings,
         *,
-        session_factory: Callable[[], requests.Session] = requests.Session,
+        session_factory: Callable[[], Any] | None = None,
         url_guard: Callable[[str], str] = assert_public_dns,
     ) -> None:
         self.settings = settings
         self.endpoints = _configured_urls(settings.cobalt_api_urls)
+        if session_factory is None and self.endpoints:
+            # Keep the optional relay dependency out of constrained Edge imports.
+            # Full Railway/runtime installs include requests through pyproject.toml.
+            from requests import Session
+
+            session_factory = Session
         self.session_factory = session_factory
         self.url_guard = url_guard
 
@@ -101,6 +105,8 @@ class CobaltRelayClient:
         return body
 
     def _ticket(self, endpoint: str, url: str, quality: str) -> dict[str, Any]:
+        if self.session_factory is None:
+            raise RuntimeError("Download relay is not configured")
         with self.session_factory() as session:
             response = session.post(
                 endpoint + "/",
@@ -200,6 +206,8 @@ class CobaltRelayClient:
         progress_hook: Callable[[dict[str, Any]], None] | None,
         endpoint_index: int,
     ) -> Path:
+        if self.session_factory is None:
+            raise RuntimeError("Download relay is not configured")
         target = self.url_guard(str(ticket["url"]))
         relay_host = urlsplit(str(ticket.get("_relay_endpoint") or "")).hostname
         target_host = urlsplit(target).hostname
