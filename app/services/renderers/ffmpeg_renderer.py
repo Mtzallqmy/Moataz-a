@@ -388,7 +388,25 @@ class FFmpegRenderer(BaseRenderer):
                 last = value
                 await emit_progress(progress_callback, value)
 
-        command = [args[0], "-progress", "pipe:1", "-nostats", *args[1:]]
+        # Railway production has a bounded CPU/memory container. Limiting both
+        # filter and encoder concurrency avoids short-lived memory spikes while
+        # still using both available vCPUs. Every renderer command ends with its
+        # isolated output path, so the trailing -threads option applies to the
+        # output encoder rather than an input decoder.
+        command = [
+            args[0],
+            "-filter_threads",
+            "1",
+            "-filter_complex_threads",
+            "1",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            *args[1:-1],
+            "-threads",
+            "2",
+            args[-1],
+        ]
         await _run_process(
             *command,
             timeout=self.settings.render_timeout_seconds,

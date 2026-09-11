@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -128,8 +129,24 @@ async def _run_process(
         code = wait_task.result()
         stdout, stderr = await asyncio.gather(out_task, err_task)
         if code != 0:
-            detail = stderr.decode(errors="replace")[-settings.stderr_limit_bytes :]
-            raise FFmpegError(f"FFmpeg failed: {detail}")
+            detail = stderr.decode(errors="replace").strip()
+            if code < 0:
+                try:
+                    signal_name = signal.Signals(-code).name
+                except ValueError:
+                    signal_name = f"SIGNAL_{-code}"
+                reason = f"process terminated by signal {signal_name} ({code})"
+            else:
+                reason = f"process exited with code {code}"
+            if not detail:
+                progress_tail = stdout.decode(errors="replace").strip()[-512:]
+                detail = (
+                    f"no stderr diagnostics; last progress: {progress_tail}"
+                    if progress_tail
+                    else "no stderr diagnostics"
+                )
+            detail = detail[-settings.stderr_limit_bytes :]
+            raise FFmpegError(f"FFmpeg failed ({reason}): {detail}")
         return stdout, stderr
     except asyncio.CancelledError:
         await _terminate(process, settings.ffmpeg_kill_grace_seconds)
