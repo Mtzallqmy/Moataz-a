@@ -173,3 +173,25 @@ async def test_ffmpeg_cancellation_terminates_process(monkeypatch):
     with pytest.raises(CancelledError):
         await media._run_process("ffmpeg", "-version", timeout=2, cancel_event=event)
     assert terminated["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_failure_without_stderr_keeps_exit_signal(monkeypatch):
+    class FakeStream:
+        async def read(self, size):  # noqa: ARG002
+            return b""
+
+    class FakeProcess:
+        returncode = -9
+        stdout = FakeStream()
+        stderr = FakeStream()
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create(*args, **kwargs):  # noqa: ARG001
+        return FakeProcess()
+
+    monkeypatch.setattr(media.asyncio, "create_subprocess_exec", fake_create)
+    with pytest.raises(FFmpegError, match=r"SIGKILL.*no stderr diagnostics"):
+        await media._run_process("ffmpeg", "-version", timeout=2)

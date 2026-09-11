@@ -100,6 +100,26 @@ class TransientOnceRenderer(FailOnceRenderer):
         )
 
 
+class ResourceLimitedOnceRenderer(SuccessRenderer):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.canvases = []
+
+    async def render(self, plan, *, render_job_id, progress_callback=None, cancel_event=None):
+        self.canvases.append((plan.width, plan.height))
+        if len(self.canvases) == 1:
+            raise FFmpegError(
+                "FFmpeg failed (process terminated by signal SIGKILL (-9)): "
+                "no stderr diagnostics"
+            )
+        return await super().render(
+            plan,
+            render_job_id=render_job_id,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+
+
 async def _project() -> tuple[int, int]:
     await init_db()
     async with SessionLocal() as session:
@@ -217,6 +237,36 @@ async def test_render_retries_only_transient_ffmpeg_failure(tmp_path: Path, monk
     stored = await service.get_render(job.id)
     assert stored is not None and stored.status == RenderStatus.COMPLETED.value
     assert renderer.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_oom_killed_render_retries_once_with_resource_safe_canvas(
+    tmp_path: Path, monkeypatch
+) -> None:
+    user_id, project_id = await _project()
+
+    class FullHdComposer(StaticComposer):
+        async def build(self, project_id: int, *, user_id: int | None = None):
+            plan = await super().build(project_id, user_id=user_id)
+            return replace(plan, width=1080, height=1920)
+
+    renderer = ResourceLimitedOnceRenderer(tmp_path)
+    settings = _settings(tmp_path)
+    settings.max_render_retries = 1
+    service = RenderService(
+        settings, composer=FullHdComposer(), renderer=renderer
+    )
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("app.services.render_service.asyncio.sleep", no_sleep)
+    job = await service.create_render(project_id, user_id=user_id)
+    await service.process_render(job.id)
+
+    stored = await service.get_render(job.id)
+    assert stored is not None and stored.status == RenderStatus.COMPLETED.value
+    assert renderer.canvases == [(1080, 1920), (720, 1280)]
 
 
 @pytest.mark.asyncio

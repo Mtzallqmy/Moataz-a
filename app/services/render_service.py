@@ -4,6 +4,7 @@ import asyncio
 import logging
 import shutil
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -202,6 +203,19 @@ class RenderService:
                 )
             else:
                 plan = await self.composer.build(project_id, user_id=user_id)
+            logger.info(
+                "render plan prepared render_job_id=%s project_id=%s kind=%s "
+                "template=%s assets=%s canvas=%sx%s fps=%s duration=%.3f",
+                render_job_id,
+                project_id,
+                render_kind,
+                plan.template,
+                ",".join(asset.asset_type for asset in plan.assets),
+                plan.width,
+                plan.height,
+                plan.fps,
+                plan.expected_duration,
+            )
             async with SessionLocal() as session:
                 job = await session.get(RenderJob, render_job_id)
                 if job is None:
@@ -224,12 +238,31 @@ class RenderService:
                     )
                     break
                 except FFmpegError as exc:
+                    resource_plan = (
+                        self._resource_safe_plan(plan)
+                        if self._is_resource_ffmpeg_error(exc)
+                        else plan
+                    )
                     if (
                         attempt >= self.settings.max_render_retries
-                        or not self._is_transient_ffmpeg_error(exc)
+                        or (
+                            resource_plan is plan
+                            and not self._is_transient_ffmpeg_error(exc)
+                        )
                         or event.is_set()
                     ):
                         raise
+                    if resource_plan is not plan:
+                        logger.warning(
+                            "resource-limited render retry render_job_id=%s "
+                            "canvas=%sx%s fallback_canvas=%sx%s",
+                            render_job_id,
+                            plan.width,
+                            plan.height,
+                            resource_plan.width,
+                            resource_plan.height,
+                        )
+                        plan = resource_plan
                     logger.warning(
                         "transient render failure; retrying render_job_id=%s attempt=%s",
                         render_job_id,
@@ -301,11 +334,11 @@ class RenderService:
                 cancelled=False,
                 message=self._friendly_render_error(safe),
             )
-            logger.warning(
+            logger.exception(
                 "render failed render_job_id=%s operation=render error=%s detail=%s",
                 render_job_id,
                 type(exc).__name__,
-                safe[:500],
+                safe[:1000].replace("\n", " | "),
             )
         finally:
             self._release(render_job_id)
@@ -324,6 +357,28 @@ class RenderService:
         )
 
     @staticmethod
+    def _is_resource_ffmpeg_error(error: Exception) -> bool:
+        detail = str(error).lower()
+        return any(
+            marker in detail
+            for marker in (
+                "signal sigkill",
+                "cannot allocate memory",
+                "out of memory",
+            )
+        )
+
+    @staticmethod
+    def _resource_safe_plan(plan):
+        longest = max(int(plan.width), int(plan.height))
+        if longest <= 1280:
+            return plan
+        ratio = 1280 / longest
+        width = max(64, int(plan.width * ratio) // 2 * 2)
+        height = max(64, int(plan.height * ratio) // 2 * 2)
+        return replace(plan, width=width, height=height)
+
+    @staticmethod
     def _friendly_render_error(detail: str) -> str:
         lowered = detail.lower()
         if "no space left" in lowered:
@@ -333,8 +388,12 @@ class RenderService:
         if "permission denied" in lowered:
             return "Render failed: media storage is not writable."
         if "unknown encoder" in lowered or "error initializing output stream" in lowered:
-            return "Render failed: the server FFmpeg build cannot initialize the required H.264 encoder."
-        return detail[-1000:]
+            return "تعذر بدء ترميز H.264 على الخادم. حاول إعادة الرندر."
+        if "signal sigkill" in lowered or "signal sigterm" in lowered:
+            return "أوقف الخادم عملية الرندر بسبب حد الموارد. جرّب المعاينة أو مشروعًا أقصر."
+        if "no stderr diagnostics" in lowered:
+            return "تعذر على FFmpeg معالجة هذه المواد ولم يُرجع تفاصيل. تحقق من الملفات وأعد المحاولة."
+        return "تعذر على FFmpeg معالجة أحد المقاطع. تحقق من المواد أو جرّب المعاينة أولًا."
 
     async def _finish_failed(self, render_job_id: int, *, cancelled: bool, message: str) -> None:
         async with SessionLocal() as session:
