@@ -15,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.bot.access import ensure_user, is_allowed
+from app.bot.safe_edit import safe_edit_message
 from app.bot.uploads import download_upload, upload_candidate
 from app.config import get_settings
 from app.db import MediaProject, ProjectStatus, RenderStatus, User
@@ -346,23 +347,7 @@ async def _safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, markup=
 
 async def _safe_bound_edit(message: Message, text: str, markup=None) -> bool:
     """Edit a received/sent message without letting Telegram UI errors break work."""
-
-    try:
-        await message.edit_text(text, reply_markup=markup)
-        return True
-    except TelegramRetryAfter as exc:
-        await asyncio.sleep(min(float(exc.retry_after), 5.0))
-        try:
-            await message.edit_text(text, reply_markup=markup)
-            return True
-        except TelegramBadRequest as retry_exc:
-            return "message is not modified" in str(retry_exc).lower()
-        except (TelegramRetryAfter, TelegramNetworkError):
-            return False
-    except TelegramBadRequest as exc:
-        return "message is not modified" in str(exc).lower()
-    except TelegramNetworkError:
-        return False
+    return await safe_edit_message(message, text, markup)
 
 
 def _safe_studio_error(exc: Exception, *, agent: bool = False) -> str:
@@ -681,9 +666,10 @@ async def open_agent(callback: CallbackQuery, state: FSMContext) -> None:
         for index, model in enumerate(models)
     ]
     rows.append([InlineKeyboardButton(text="⬅️ المشروع", callback_data=f"studio:open:{project_id}")])
-    await callback.message.edit_text(
+    await _safe_bound_edit(
+        callback.message,
         "🤖 اختر نموذج المونتاج. سيعدل النموذج نفس Timeline عبر أدوات آمنة فقط:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
@@ -711,11 +697,12 @@ async def choose_agent_model(callback: CallbackQuery, state: FSMContext) -> None
         studio_agent_model=model,
         studio_agent_native_tools=native_tools,
     )
-    await callback.message.edit_text(
+    await _safe_bound_edit(
+        callback.message,
         f"🤖 مونتاج بالذكاء الاصطناعي — Project #{project_id}\n\n"
         "أرسل ملفات أو روابط، أو اكتب تعليماتك الطبيعية. كل تعديل يطبق على نفس Timeline "
         "ويمكن التراجع عنه. استخدم المعاينة قبل التصدير النهائي.",
-        reply_markup=agent_keyboard(project_id),
+        agent_keyboard(project_id),
     )
     await callback.answer("تم اختيار النموذج")
 

@@ -157,6 +157,8 @@ class AIEditPlanner:
         timeline: dict[str, Any],
         provider_id: str,
         model: str,
+        conversation_history: list[dict[str, object]] | None = None,
+        validation_feedback: str = "",
     ) -> EditPlan:
         prompt = (
             "You are a video edit planner. Return one JSON object only. Do not return FFmpeg or shell. "
@@ -171,8 +173,20 @@ class AIEditPlanner:
             f"Media intelligence: {json.dumps(project_intelligence, ensure_ascii=False)[:24000]}. "
             f"Timeline: {json.dumps(timeline, ensure_ascii=False)[:16000]}."
         )
+        if validation_feedback:
+            prompt += (
+                " The previous semantic plan was rejected by deterministic validation: "
+                f"{validation_feedback[:1000]}. Correct that issue."
+            )
+        history = [
+            item
+            for item in (conversation_history or [])[-8:]
+            if item.get("role") in {"user", "assistant"}
+            and isinstance(item.get("content"), str)
+        ]
         messages: list[dict[str, object]] = [
             {"role": "system", "content": prompt},
+            *history,
             {"role": "user", "content": instruction[:8000]},
         ]
         last_error = ""

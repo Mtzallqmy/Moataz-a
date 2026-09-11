@@ -8,6 +8,8 @@ from sqlalchemy import select
 
 from app.db import MediaProject, SessionLocal, StudioAgentMessage
 from app.services.ai_registry import AIProviderRegistry, get_ai_provider_registry
+from app.services.edit_planner import AIEditPlanner, compile_tool_calls
+from app.services.media_intelligence import MediaIntelligenceService, media_intelligence_service
 from app.services.openai_compatible import AIProviderError
 from app.services.timeline import TOOL_NAMES, TimelineService, timeline_service
 
@@ -49,6 +51,34 @@ _REQUIRED_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "apply_editing_style": ("style",),
     "add_subtitles": ("cues",),
 }
+
+_PLANNING_MARKERS = {
+    "أفضل",
+    "احترافي",
+    "أسلوب",
+    "سينمائي",
+    "اختر اللقطات",
+    "احذف الصمت",
+    "إزالة الصمت",
+    "كابتشن",
+    "ترجمة",
+    "cinematic",
+    "best moments",
+    "highlight reel",
+    "remove silence",
+    "captions",
+    "documentary",
+}
+
+
+def requires_edit_plan(instruction: str) -> bool:
+    """Route semantic, multi-step requests through analysis before Timeline tools."""
+
+    normalized = " ".join(instruction.casefold().split())
+    if any(marker in normalized for marker in _PLANNING_MARKERS):
+        return True
+    separators = normalized.count(" ثم ") + normalized.count("،") + normalized.count(",")
+    return separators >= 2
 
 
 def _tool(name: str, description: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -142,9 +172,15 @@ class StudioAgentService:
         *,
         registry: AIProviderRegistry | None = None,
         timelines: TimelineService | None = None,
+        planner: AIEditPlanner | None = None,
+        intelligence: MediaIntelligenceService | None = None,
     ) -> None:
         self.registry = registry or get_ai_provider_registry()
         self.timelines = timelines or timeline_service
+        self.planner = planner or AIEditPlanner(
+            registry=self.registry, timelines=self.timelines
+        )
+        self.intelligence = intelligence or media_intelligence_service
 
     async def handle(
         self,
@@ -168,6 +204,16 @@ class StudioAgentService:
             *history,
             {"role": "user", "content": instruction},
         ]
+        if requires_edit_plan(instruction):
+            return await self._planned(
+                project_id,
+                user_id=user_id,
+                instruction=instruction,
+                provider_id=provider_id,
+                model=model,
+                timeline=timeline,
+                history=history,
+            )
         calls: list[dict[str, Any]]
         response_text = ""
         response_model = model
@@ -206,6 +252,69 @@ class StudioAgentService:
             render_action=result.render_action,
             timeline=result.timeline,
         )
+
+    async def _planned(
+        self,
+        project_id: int,
+        *,
+        user_id: int,
+        instruction: str,
+        provider_id: str,
+        model: str,
+        timeline: dict[str, Any],
+        history: list[dict[str, object]],
+    ) -> StudioAgentReply:
+        intelligence = await self.intelligence.analyze_project(
+            project_id, user_id=user_id
+        )
+        validation_feedback = ""
+        calls: list[dict[str, Any]] = []
+        plan = None
+        for attempt in range(2):
+            plan = await self.planner.generate(
+                instruction,
+                project_intelligence=intelligence,
+                timeline=timeline,
+                provider_id=provider_id,
+                model=model,
+                conversation_history=history,
+                validation_feedback=validation_feedback,
+            )
+            try:
+                calls = compile_tool_calls(plan, timeline, intelligence)
+                break
+            except ValueError as exc:
+                if attempt:
+                    raise AIProviderError(
+                        f"AI edit plan failed deterministic validation: {exc}"
+                    ) from exc
+                validation_feedback = str(exc)
+        if plan is None:
+            raise AIProviderError("AI did not produce an edit plan")
+        render_action = self._requested_render(instruction)
+        if render_action:
+            calls.append({"name": f"render_{render_action}", "arguments": {}})
+        result = await self.timelines.apply(project_id, user_id=user_id, calls=calls)
+        text = f"تم تطبيق خطة المونتاج: {plan.goal}"
+        if plan.rationale:
+            text += f" — {plan.rationale[:500]}"
+        await self._store(project_id, "assistant", text, provider_id, model)
+        return StudioAgentReply(
+            text=text,
+            model=model,
+            applied_tools=tuple(str(call["name"]) for call in calls),
+            render_action=result.render_action,
+            timeline=result.timeline,
+        )
+
+    @staticmethod
+    def _requested_render(instruction: str) -> str | None:
+        normalized = instruction.casefold()
+        if "معاينة" in normalized or "preview" in normalized:
+            return "preview"
+        if any(value in normalized for value in ("تصدير نهائي", "الرندر النهائي", "final render")):
+            return "final"
+        return None
 
     async def _structured(
         self,
