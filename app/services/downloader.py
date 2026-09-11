@@ -136,15 +136,16 @@ class DownloaderService:
             raise ValueError("YTDLP_COOKIES_B64 exceeds the 2 MiB safety limit")
         if b"Netscape HTTP Cookie File" not in payload[:256]:
             raise ValueError("YTDLP_COOKIES_B64 must contain a Netscape cookies.txt file")
-        credential_dir = (self.settings.render_temp_dir / "credentials").resolve()
-        credential_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(credential_dir, 0o700)
-        destination = credential_dir / "yt-dlp-cookies.txt"
-        temporary = credential_dir / "yt-dlp-cookies.tmp"
-        temporary.write_bytes(payload)
-        os.chmod(temporary, 0o600)
-        temporary.replace(destination)
-        os.chmod(destination, 0o600)
+        with self._lock:
+            credential_dir = (self.settings.render_temp_dir / "credentials").resolve()
+            credential_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(credential_dir, 0o700)
+            destination = credential_dir / "yt-dlp-cookies.txt"
+            temporary = credential_dir / "yt-dlp-cookies.tmp"
+            temporary.write_bytes(payload)
+            os.chmod(temporary, 0o600)
+            temporary.replace(destination)
+            os.chmod(destination, 0o600)
         return destination
 
     def _log_failure(self, operation: str, url: str, exc: BaseException) -> None:
