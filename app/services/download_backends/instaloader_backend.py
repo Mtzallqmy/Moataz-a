@@ -42,6 +42,18 @@ class InstaloaderBackend(DownloadBackend):
             raise BackendUnavailableError("Instaloader supports Instagram post/reel URLs only for anonymous access")
         return match.group(1)
 
+    @staticmethod
+    def _story_media_id(url: str) -> int:
+        path = urlsplit(url).path.rstrip("/")
+        if "/stories/highlights/" in path.lower() or "/highlights/" in path.lower():
+            raise BackendUnavailableError(
+                "Single Instagram Highlight item URLs are not safely resolvable by Instaloader"
+            )
+        match = re.search(r"/(\d+)(?:/|$)", path)
+        if not match:
+            raise BackendUnavailableError("Instagram Story URL has no media id")
+        return int(match.group(1))
+
     def _session_username(self) -> tuple[str, Path]:
         path = self.settings.instagram_session_file
         if path is None:
@@ -80,7 +92,28 @@ class InstaloaderBackend(DownloadBackend):
         if not await self.available():
             raise BackendUnavailableError("Instaloader optional dependency is unavailable")
 
-        def run() -> NormalizedMediaResult:
+        path = urlsplit(url).path.lower()
+        if "/stories/" in path:
+            media_id = self._story_media_id(url)
+
+            def run_story() -> NormalizedMediaResult:
+                import instaloader
+
+                loader = self._loader(Path("."))
+                username, session_file = self._session_username()
+                loader.load_session_from_file(username, str(session_file))
+                instaloader.StoryItem.from_mediaid(loader.context, media_id)
+                return NormalizedMediaResult(
+                    provider=self.name,
+                    platform="instagram",
+                    media_type="story",
+                    title=f"Instagram Story {media_id}",
+                    metadata={"media_id": str(media_id)},
+                )
+
+            return await asyncio.to_thread(run_story)
+
+        def run_post() -> NormalizedMediaResult:
             import instaloader
 
             loader = self._loader(Path("."))
@@ -94,7 +127,7 @@ class InstaloaderBackend(DownloadBackend):
                 metadata={"media_id": str(post.mediaid), "shortcode": post.shortcode},
             )
 
-        return await asyncio.to_thread(run)
+        return await asyncio.to_thread(run_post)
 
     async def download(self, request: DownloadRequest) -> NormalizedMediaResult:
         if not await self.available():
@@ -110,13 +143,13 @@ class InstaloaderBackend(DownloadBackend):
                 username, session_file = self._session_username()
                 loader.load_session_from_file(username, str(session_file))
                 if request.media_type == "story":
-                    media_match = re.search(r"/(\d+)(?:/|$)", urlsplit(request.url).path.rstrip("/"))
-                    if not media_match:
-                        raise BackendUnavailableError("Instagram Story URL has no media id")
-                    item = instaloader.StoryItem.from_mediaid(loader.context, int(media_match.group(1)))
+                    media_id = self._story_media_id(request.url)
+                    item = instaloader.StoryItem.from_mediaid(loader.context, media_id)
                     loader.download_storyitem(item, request.output_dir)
                     return
-                raise BackendUnavailableError("Single Instagram Highlight item URLs are not safely resolvable by Instaloader")
+                raise BackendUnavailableError(
+                    "Single Instagram Highlight item URLs are not safely resolvable by Instaloader"
+                )
             post = instaloader.Post.from_shortcode(loader.context, self._shortcode(request.url))
             loader.download_post(post, target=request.output_dir)
 
