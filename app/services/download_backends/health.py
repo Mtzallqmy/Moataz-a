@@ -71,7 +71,7 @@ class BackendHealthRegistry:
         record = self._record(backend, platform)
         record.failures += 1
         record.last_error = error.code
-        if record.failures >= self.failure_threshold:
+        if error.code in {ErrorCode.HTTP_429, ErrorCode.ANTI_BOT} or record.failures >= self.failure_threshold:
             record.open_until = self.clock() + self.cooldown_seconds
 
     def status(self, backend: str, platform: str, *, available: bool = True) -> HealthStatus:

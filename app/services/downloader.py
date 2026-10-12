@@ -6,6 +6,7 @@ import binascii
 import logging
 import os
 import re
+import shutil
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -123,8 +124,23 @@ class _YtDlpEngine:
             "nocheckcertificate": False,
             "restrictfilenames": True,
             "ignoreerrors": False,
+            "skip_unavailable_fragments": False,
+            "sleep_interval_requests": 1.0,
+            "retry_sleep_functions": {
+                "http": lambda n: min(30, 2 ** n),
+                "fragment": lambda n: min(30, 2 ** n),
+                "extractor": lambda n: min(30, 2 ** n),
+            },
             "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
         }
+        # Python API calls do not inherit CLI configuration. Enable installed
+        # runtimes explicitly, including Node/QuickJS on non-Docker hosts.
+        runtimes = {}
+        for name, executable in (("deno", "deno"), ("node", "node"), ("quickjs", "qjs")):
+            if path := shutil.which(executable):
+                runtimes[name] = {"path": path}
+        if runtimes:
+            options["js_runtimes"] = runtimes
         cookie_file = self._cookie_file()
         if cookie_file is not None:
             options["cookiefile"] = str(cookie_file)
@@ -390,6 +406,7 @@ class _YtDlpEngine:
                 raise FormatUnavailableError(f"Requested format {height}p is not available")
         event = cancel_event or threading.Event()
         job_dir.mkdir(parents=True, exist_ok=True)
+        before = {path.resolve() for path in job_dir.iterdir() if path.is_file()}
 
         def guarded_progress(payload: dict[str, Any]) -> None:
             if event.is_set():
@@ -399,6 +416,8 @@ class _YtDlpEngine:
 
         last_error: Exception | None = None
         for attempt in self._attempts():
+            if event.is_set():
+                raise CancelledError("Download cancelled")
             opts = self._base_options()
             opts.update(attempt.options)
             opts.update(
@@ -422,7 +441,9 @@ class _YtDlpEngine:
                 ]
             try:
                 with self._safe_ydl(opts) as ydl:
-                    ydl.download([guarded])
+                    status = ydl.download([guarded])
+                    if status:
+                        raise RuntimeError("Temporary extractor failure: yt-dlp reported unsuccessful download")
                 if event.is_set():
                     raise CancelledError("Download cancelled")
                 suffixes = {".mp3"} if value in {"audio", "mp3"} else {".mp4", ".mkv", ".webm"}
@@ -430,6 +451,8 @@ class _YtDlpEngine:
                     path
                     for path in job_dir.iterdir()
                     if path.is_file()
+                    and path.resolve() not in before
+                    and not re.search(r"\.f\d+\.", path.name)
                     and path.suffix.lower() in suffixes
                     and not path.name.endswith((".part", ".ytdl"))
                 ]
@@ -438,6 +461,8 @@ class _YtDlpEngine:
                 output = max(candidates, key=lambda path: path.stat().st_size)
                 if output.stat().st_size <= 0:
                     raise RuntimeError("yt-dlp produced an empty output file")
+                if output.stat().st_size > self.settings.max_file_size_bytes:
+                    raise RuntimeError("File too large for configured download limit")
                 return output
             except Exception as exc:
                 last_error = exc
