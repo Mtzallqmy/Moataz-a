@@ -123,3 +123,28 @@ def test_new_backend_errors_are_classified(message, code):
     else:
         error = RuntimeError(message)
     assert classify_error(error).code is code
+
+
+def test_rate_limit_opens_circuit_immediately():
+    now = [0.0]
+    health = BackendHealthRegistry(clock=lambda: now[0], cooldown_seconds=10)
+    health.failure("yt-dlp", "youtube", classify_error(RuntimeError("HTTP 429")))
+    assert not health.allows("yt-dlp", "youtube")
+    assert health.allows("yt-dlp", "vimeo")
+    now[0] = 11
+    assert health.allows("yt-dlp", "youtube")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_never_invokes_backend(tmp_path):
+    import threading
+
+    from app.errors import CancelledError
+
+    event = threading.Event()
+    event.set()
+    backend = FakeBackend("yt-dlp")
+    manager = DownloadManager(ProviderRouter([backend], register_optional=False))
+    with pytest.raises(CancelledError):
+        await manager.download(DownloadRequest("https://youtu.be/x", tmp_path, cancel_event=event))
+    assert backend.calls == 0

@@ -185,3 +185,77 @@ def test_cobalt_cancellation_removes_partial_output(tmp_path):
 def test_cobalt_configuration_requires_public_https_roots(url):
     with pytest.raises(ValueError, match="public HTTPS"):
         CobaltRelayClient(Settings(_env_file=None, cobalt_api_urls=url))
+
+
+def test_relays_spread_requests_and_skip_rate_limited_endpoint():
+    sessions = []
+
+    def factory():
+        session = FakeSession(ticket=FakeResponse(payload={
+            "status": "tunnel", "url": "https://cdn.example/file", "filename": "video.mp4",
+        }))
+        sessions.append(session)
+        return session
+
+    client = CobaltRelayClient(
+        Settings(_env_file=None, cobalt_api_urls="https://one.example,https://two.example"),
+        session_factory=factory, url_guard=lambda url: url,
+    )
+    assert [client.probe("https://youtu.be/x").endpoint_index for _ in range(4)] == [1, 2, 1, 2]
+    sessions.clear()
+
+    def fail_first():
+        session = factory()
+        original = session.post
+
+        def post(url, **kwargs):
+            if "one.example" in url:
+                session.posts.append((url, kwargs))
+                return FakeResponse(status=429)
+            return original(url, **kwargs)
+
+        session.post = post
+        return session
+
+    client.session_factory = fail_first
+    assert client.probe("https://youtu.be/x").endpoint_index == 2
+    assert client.probe("https://youtu.be/x").endpoint_index == 2
+    assert client.probe("https://youtu.be/x").endpoint_index == 2
+    assert sum("one.example" in url for s in sessions for url, _ in s.posts) == 1
+
+
+def test_cancel_does_not_contact_any_relay(tmp_path):
+    calls = []
+    event = threading.Event()
+    event.set()
+    client = CobaltRelayClient(
+        Settings(_env_file=None, cobalt_api_urls="https://one.example,https://two.example"),
+        session_factory=lambda: calls.append(True), url_guard=lambda url: url,
+    )
+    with pytest.raises(CancelledError):
+        client.download("https://youtu.be/x", "best", tmp_path, cancel_event=event)
+    assert calls == []
+
+
+def test_truncated_relay_file_is_removed(tmp_path):
+    client = CobaltRelayClient(
+        Settings(_env_file=None, cobalt_api_urls="https://one.example"),
+        session_factory=lambda: FakeSession(
+            ticket=FakeResponse(payload={"status": "tunnel", "url": "https://cdn.example/file"}),
+            media=FakeResponse(body=b"short", headers={"Content-Length": "100"}),
+        ), url_guard=lambda url: url,
+    )
+    with pytest.raises(RuntimeError, match="incomplete"):
+        client.download("https://youtu.be/x", "best", tmp_path, cancel_event=threading.Event())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_api_redirect_cannot_leak_credentials():
+    session = FakeSession(ticket=FakeResponse(status=307))
+    client = CobaltRelayClient(
+        Settings(_env_file=None, cobalt_api_urls="https://one.example"),
+        session_factory=lambda: session, url_guard=lambda url: url,
+    )
+    with pytest.raises(RuntimeError, match="unchecked redirect"):
+        client.probe("https://youtu.be/x")
+    assert session.posts[0][1]["allow_redirects"] is False

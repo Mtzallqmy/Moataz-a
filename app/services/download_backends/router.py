@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from app.config import Settings, get_settings
-from app.errors import ErrorCode, classify_error
+from app.errors import CancelledError, ErrorCode, classify_error
 from app.security import redact_secrets
 from app.services.download_backends.base import (
     BackendUnavailableError,
@@ -223,6 +223,7 @@ class DownloadManager:
         raise BackendUnavailableError("All configured playlist backends failed")
 
     async def download(self, request: DownloadRequest) -> NormalizedMediaResult:
+        request.output_dir.mkdir(parents=True, exist_ok=True)
         return await self._execute(request.url, request.media_type, request)
 
     async def _execute(
@@ -236,6 +237,8 @@ class DownloadManager:
         had_candidate = False
         job_key = request.job_key if request and request.job_key else "-"
         async for detected, backend in self._candidates(url, media_type):
+            if request and request.cancel_event and request.cancel_event.is_set():
+                raise CancelledError("Download cancelled")
             had_candidate = True
             try:
                 result = await (backend.download(request) if request else backend.probe(url))

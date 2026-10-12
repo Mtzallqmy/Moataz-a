@@ -309,3 +309,39 @@ def test_proxy_failover_profiles_are_ordered(monkeypatch):
         "proxy-2",
     ]
     assert attempts[2].options["proxy"].startswith("http://user:secret@")
+
+
+def test_installed_js_runtimes_are_enabled(monkeypatch):
+    monkeypatch.setattr("app.services.downloader.shutil.which", lambda name: "/usr/bin/node" if name == "node" else None)
+    opts = service()._engine._base_options()
+    assert opts["js_runtimes"] == {"node": {"path": "/usr/bin/node"}}
+    assert opts["skip_unavailable_fragments"] is False
+    assert opts["retry_sleep_functions"]["http"](10) == 30
+
+
+def test_ytdlp_cannot_return_preexisting_or_unmerged_file(tmp_path):
+    from app.services.downloader import _YtDlpEngine
+
+    (tmp_path / "old.mp4").write_bytes(b"old")
+
+    class FailedMerge(FakeYDL):
+        def download(self, urls):
+            (tmp_path / "new.f137.mp4").write_bytes(b"unmerged-video")
+            return 0
+
+    engine = _YtDlpEngine(Settings(_env_file=None), ydl_factory=FailedMerge, url_guard=lambda url: url)
+    with pytest.raises(RuntimeError, match="valid output"):
+        engine.download("https://youtu.be/x", "best", tmp_path, cancel_event=None)
+
+
+def test_ytdlp_nonzero_exit_does_not_return_partial_file(tmp_path):
+    from app.services.downloader import _YtDlpEngine
+
+    class FailedDownload(FakeYDL):
+        def download(self, urls):
+            (tmp_path / "partial.mp4").write_bytes(b"partial")
+            return 1
+
+    engine = _YtDlpEngine(Settings(_env_file=None), ydl_factory=FailedDownload, url_guard=lambda url: url)
+    with pytest.raises(RuntimeError, match="unsuccessful"):
+        engine.download("https://youtu.be/x", "best", tmp_path, cancel_event=None)

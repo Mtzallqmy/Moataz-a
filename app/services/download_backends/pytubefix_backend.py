@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from app.config import Settings
 from app.errors import CancelledError, FormatUnavailableError
@@ -25,7 +26,8 @@ class PytubefixBackend(DownloadBackend):
         return bool(self.settings.pytubefix_enabled and importlib.util.find_spec("pytubefix"))
 
     async def supports(self, url: str, media_type: str | None = None) -> bool:  # noqa: ARG002
-        return "youtu" in url.lower() and media_type in {None, "video", "audio", "playlist"}
+        host = (urlsplit(url).hostname or "").lower()
+        return (host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")) and media_type in {None, "video", "audio", "playlist"}
 
     @staticmethod
     def _progressive_key(stream) -> tuple[int, int, str]:
@@ -106,9 +108,12 @@ class PytubefixBackend(DownloadBackend):
     async def download(self, request: DownloadRequest) -> NormalizedMediaResult:
         if not await self.available():
             raise BackendUnavailableError("pytubefix optional dependency is unavailable")
+        if request.cancel_event and request.cancel_event.is_set():
+            raise CancelledError("pytubefix download cancelled")
         request.output_dir.mkdir(parents=True, exist_ok=True)
         before = {path.resolve() for path in request.output_dir.iterdir() if path.is_file()}
         cancel_event = request.cancel_event
+        audio_request = request.media_type == "audio" or request.quality.lower().strip() in {"audio", "mp3"}
 
         def interrupted() -> bool:
             return bool(cancel_event and cancel_event.is_set())
@@ -118,7 +123,7 @@ class PytubefixBackend(DownloadBackend):
 
             yt = YouTube(request.url)
             yt.check_availability()
-            if request.media_type == "audio":
+            if audio_request:
                 audio = sorted(
                     yt.streams.filter(only_audio=True), key=self._audio_key, reverse=True
                 )
@@ -226,7 +231,7 @@ class PytubefixBackend(DownloadBackend):
                 video_or_audio.unlink(missing_ok=True)
                 secondary.unlink(missing_ok=True)
                 final = output
-            elif request.media_type == "audio":
+            elif audio_request:
                 output = request.output_dir / "pytubefix-audio.mp3"
                 await _run_process(
                     "ffmpeg",

@@ -12,8 +12,9 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from app.config import Settings
-from app.errors import CancelledError
+from app.errors import CancelledError, ErrorCode, classify_error
 from app.security import assert_public_dns, redact_secrets
+from app.services.download_backends.base import BackendUnavailableError
 
 logger = logging.getLogger("moataz.downloader.relay")
 _SAFE_EXTENSIONS = {".mp4", ".webm", ".mkv", ".mp3", ".m4a", ".ogg", ".opus", ".wav"}
@@ -69,6 +70,9 @@ class CobaltRelayClient:
             session_factory = Session
         self.session_factory = session_factory
         self.url_guard = url_guard
+        self._lock = threading.Lock()
+        self._cursor = 0
+        self._cooldowns: dict[str, float] = {}
 
     @property
     def enabled(self) -> bool:
@@ -109,11 +113,14 @@ class CobaltRelayClient:
             raise RuntimeError("Download relay is not configured")
         with self.session_factory() as session:
             response = session.post(
-                endpoint + "/",
+                self.url_guard(endpoint + "/"),
                 json=self._request_body(url, quality),
                 headers=self._headers(),
                 timeout=(10, self.settings.cobalt_timeout_seconds),
+                allow_redirects=False,
             )
+            if 300 <= response.status_code < 400:
+                raise RuntimeError("Download relay returned an unchecked redirect")
             if response.status_code == 429:
                 raise RuntimeError("HTTP 429 from download relay")
             if response.status_code in {401, 403}:
@@ -145,10 +152,25 @@ class CobaltRelayClient:
 
     def _attempt(self, operation: str, callback: Callable[[str, int], Any]) -> Any:
         last: Exception | None = None
-        for index, endpoint in enumerate(self.endpoints, start=1):
+        with self._lock:
+            start = self._cursor
+            self._cursor = (start + 1) % max(1, len(self.endpoints))
+            ordered = list(enumerate(self.endpoints, start=1))
+            ordered = ordered[start:] + ordered[:start]
+        for index, endpoint in ordered:
+            with self._lock:
+                if self._cooldowns.get(endpoint, 0) > time.monotonic():
+                    continue
             try:
                 return callback(endpoint, index)
             except Exception as exc:
+                error = classify_error(exc)
+                if error.code in {ErrorCode.CANCELLED, ErrorCode.FILE_TOO_LARGE,
+                                  ErrorCode.INVALID_URL, ErrorCode.STORAGE_ERROR}:
+                    raise
+                with self._lock:
+                    cooldown = 300 if error.code in {ErrorCode.HTTP_429, ErrorCode.ANTI_BOT} else 60
+                    self._cooldowns[endpoint] = time.monotonic() + cooldown
                 last = exc
                 logger.warning(
                     "download relay %s failed endpoint=%s error_type=%s detail=%s",
@@ -158,10 +180,11 @@ class CobaltRelayClient:
                     redact_secrets(exc, api_token=_secret_values(self.settings.cobalt_api_token))[:1000],
                 )
         if last is None:
-            raise RuntimeError("No download relay is configured")
+            raise BackendUnavailableError("No download relay is configured or all relays are cooling down")
         raise last
 
     def probe(self, url: str) -> RelayProbe:
+        url = self.url_guard(url)
         def run(endpoint: str, index: int) -> RelayProbe:
             payload = self._ticket(endpoint, url, "best")
             filename = Path(str(payload.get("filename") or "download")).name
@@ -183,7 +206,10 @@ class CobaltRelayClient:
         cancel_event: threading.Event,
         progress_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> Path:
+        url = self.url_guard(url)
         def run(endpoint: str, index: int) -> Path:
+            if cancel_event.is_set():
+                raise CancelledError("Download cancelled")
             payload = self._ticket(endpoint, url, quality)
             return self._stream(
                 payload,
@@ -262,6 +288,8 @@ class CobaltRelayClient:
                             )
             if downloaded <= 0:
                 raise RuntimeError("Download relay produced an empty file")
+            if total and downloaded != total:
+                raise RuntimeError("Temporary failure: incomplete download relay response")
             return output
         except Exception:
             output.unlink(missing_ok=True)
