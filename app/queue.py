@@ -34,6 +34,7 @@ class InlineJobManager:
         self._dispatcher: asyncio.Task | None = None
         self._running = False
         self._condition = asyncio.Condition()
+        self._revision = 0
 
     async def start(self) -> None:
         if self._running:
@@ -44,10 +45,15 @@ class InlineJobManager:
     async def enqueue(self, job_id: int, *, priority: int = 0) -> bool:
         if job_id in self._known:
             return False
-        user_id = await self.user_lookup(job_id)
         self._known.add(job_id)
+        try:
+            user_id = await self.user_lookup(job_id)
+        except BaseException:
+            self._known.discard(job_id)
+            raise
         await self.queue.put((-int(priority), next(self._sequence), job_id, user_id))
         async with self._condition:
+            self._revision += 1
             self._condition.notify_all()
         return True
 
@@ -59,6 +65,7 @@ class InlineJobManager:
             if not self._running:
                 break
 
+            revision = self._revision
             item = await self.queue.get()
             deferred: list[tuple[int, int, int, int]] = []
             while self._running and self._active_users[item[3]] >= self.per_user_limit:
@@ -71,7 +78,9 @@ class InlineJobManager:
                         self.queue.put_nowait(waiting)
                     deferred.clear()
                     async with self._condition:
-                        await self._condition.wait()
+                        await self._condition.wait_for(
+                            lambda revision=revision: not self._running or self._revision != revision
+                        )
                     item = None
                     break
 
@@ -105,6 +114,7 @@ class InlineJobManager:
             if self._active_users[user_id] <= 0:
                 self._active_users.pop(user_id, None)
             async with self._condition:
+                self._revision += 1
                 self._condition.notify_all()
 
     async def cancel(self, job_id: int) -> bool:

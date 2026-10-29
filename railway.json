@@ -3,7 +3,7 @@
   "build": {"builder": "DOCKERFILE"},
   "deploy": {
     "startCommand": "python -m app.main",
-    "healthcheckPath": "/healthz",
+    "healthcheckPath": "/readyz",
     "healthcheckTimeout": 100,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 5

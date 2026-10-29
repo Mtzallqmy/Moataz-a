@@ -243,7 +243,12 @@ async def _history(user: User, page: int, size: int = 5) -> tuple[str, InlineKey
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"history:{page - 1}"))
     if has_next:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"history:{page + 1}"))
-    rows = [nav] if nav else []
+    rows = [
+        [InlineKeyboardButton(text=f"✂️ قص الملف #{job.id}", callback_data=f"reuse:{job.id}:localcut")]
+        for job in jobs if job.status == JobStatus.COMPLETED.value and job.output_path
+    ]
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton(text="🏠", callback_data="menu:home")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 

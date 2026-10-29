@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ssl
 from collections.abc import AsyncIterator
 from datetime import datetime
 from enum import StrEnum
@@ -18,13 +19,26 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
 settings = get_settings()
-engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+def database_engine_options(database_url: str) -> dict:
+    options = {"pool_pre_ping": True}
+    parsed = make_url(database_url)
+    if parsed.drivername == "postgresql+asyncpg" and (parsed.host or "").endswith(".neon.tech"):
+        options["connect_args"] = {"ssl": ssl.create_default_context(), "timeout": 15, "command_timeout": 60}
+        if "-pooler." in (parsed.host or ""):
+            options["poolclass"] = NullPool
+            options["connect_args"].update(statement_cache_size=0, prepared_statement_cache_size=0)
+    return options
+
+
+engine = create_async_engine(settings.database_url, **database_engine_options(settings.database_url))
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
@@ -19,13 +20,15 @@ from app.errors import CancelledError, ErrorCode, classify_error, retry_delay, u
 from app.jobs import is_job_cancelled, record_job_event, set_job_status
 from app.progress import ProgressSnapshot
 from app.security import redact_secrets
+from app.services.download_cache import cached_source, remember_source
 from app.services.downloader import get_downloader_service
 from app.services.job_service import deserialize_qualities
-from app.services.media import cut_media, fit_media_for_upload
+from app.services.media import _run_process, cut_media, fit_media_for_upload, probe_media_file
 
 settings = get_settings()
 downloader = get_downloader_service()
 _cancel_events: dict[int, threading.Event] = {}
+logger = logging.getLogger("moataz.worker")
 
 
 def request_cancel(job_id: int) -> None:
@@ -53,7 +56,7 @@ async def _job_delivery(job_id: int) -> tuple[int, int | None]:
         return job.chat_id, job.progress_message_id
 
 
-async def _edit_status(job_id: int, text: str, *, markup: InlineKeyboardMarkup | None = None) -> None:
+async def _send_status(job_id: int, text: str, *, markup: InlineKeyboardMarkup | None = None) -> None:
     chat_id, message_id = await _job_delivery(job_id)
     if chat_id == 0 or not message_id:
         return
@@ -81,6 +84,14 @@ async def _edit_status(job_id: int, text: str, *, markup: InlineKeyboardMarkup |
         await bot.session.close()
 
 
+async def _edit_status(job_id: int, text: str, *, markup: InlineKeyboardMarkup | None = None) -> None:
+    # Progress delivery is best effort; a Telegram outage must not abort a download.
+    try:
+        await asyncio.wait_for(_send_status(job_id, text, markup=markup), timeout=10)
+    except (TelegramAPIError, OSError, TimeoutError) as exc:
+        logger.warning("Progress message skipped for job=%s: %s", job_id, type(exc).__name__)
+
+
 async def _is_cancelled(job_id: int, event: threading.Event) -> bool:
     return event.is_set() or await is_job_cancelled(job_id)
 
@@ -101,7 +112,7 @@ async def _update_worker(active_delta: int) -> None:
 async def _persist_progress(job_id: int, snapshot: ProgressSnapshot, quality: str) -> None:
     async with SessionLocal() as session:
         job = await session.get(DownloadJob, job_id)
-        if job is None or job.status == JobStatus.CANCELLED.value:
+        if job is None or job.status not in {JobStatus.DOWNLOADING.value, JobStatus.MERGING.value}:
             return
         job.progress = snapshot.percent
         job.speed = f"{snapshot.speed:.0f} B/s" if snapshot.speed else None
@@ -134,13 +145,35 @@ async def _download_with_retries(
     progress_hook,
     cancel_event: threading.Event,
 ) -> Path:
+    if await _is_cancelled(job_id, cancel_event):
+        raise CancelledError("Job cancelled")
+    async with SessionLocal() as session:
+        metadata = await session.get(MediaMetadata, job_id)
+        is_local = bool(metadata and metadata.source == "local")
+    if is_local:
+        output = await cached_source(job_dir, "local")
+        if output is None:
+            raise ValueError("Saved media has expired; download the link again")
+        probe = await probe_media_file(output)
+        if quality in {"audio", "mp3"} and probe.has_video:
+            audio = job_dir / "saved-audio.mp3"
+            await _run_process(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(output),
+                "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(audio),
+                timeout=settings.ffmpeg_timeout_seconds, cancel_event=cancel_event,
+            )
+            return audio
+        return output
+    if output := await cached_source(job_dir, quality):
+        await record_job_event(job_id, "SOURCE_REUSED", "retry uses downloaded source")
+        return output
     for attempt in range(settings.job_max_retries + 1):
         if await _is_cancelled(job_id, cancel_event):
             raise CancelledError("Job cancelled")
         if attempt:
             await set_job_status(job_id, JobStatus.DOWNLOADING, event_message=f"retry attempt={attempt}")
         try:
-            return await asyncio.to_thread(
+            output = await asyncio.to_thread(
                 downloader.download,
                 url,
                 quality,
@@ -149,6 +182,8 @@ async def _download_with_retries(
                 progress_hook=progress_hook,
                 known_qualities=known_qualities,
             )
+            remember_source(job_dir, output, quality)
+            return output
         except Exception as exc:
             await _record_backend_route(job_id, pop=True)
             if await _is_cancelled(job_id, cancel_event):
@@ -248,6 +283,7 @@ async def process_download(job_id: int) -> None:
         job_dir = settings.download_dir / str(job_id)
         loop = asyncio.get_running_loop()
         last_update = 0.0
+        progress_futures = []
 
         def consume_future(future) -> None:
             try:
@@ -265,6 +301,7 @@ async def process_download(job_id: int) -> None:
                     set_job_status(job_id, JobStatus.MERGING, event_message="download streams finished"),
                     loop,
                 )
+                progress_futures.append(future)
                 future.add_done_callback(consume_future)
                 return
             if status != "downloading":
@@ -275,6 +312,7 @@ async def process_download(job_id: int) -> None:
             last_update = now
             snapshot = ProgressSnapshot.from_ytdlp(payload)
             future = asyncio.run_coroutine_threadsafe(_persist_progress(job_id, snapshot, quality), loop)
+            progress_futures.append(future)
             future.add_done_callback(consume_future)
 
         output = await _download_with_retries(
@@ -286,6 +324,8 @@ async def process_download(job_id: int) -> None:
             progress_hook,
             cancel_event,
         )
+        if progress_futures:
+            await asyncio.gather(*(asyncio.wrap_future(item) for item in progress_futures), return_exceptions=True)
         await _record_backend_route(job_id, pop=True)
         if await _is_cancelled(job_id, cancel_event):
             raise CancelledError("Job cancelled")
