@@ -74,7 +74,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         JobStatus.CANCELLED.value,
     },
     JobStatus.FAILED.value: {JobStatus.QUEUED.value},
-    JobStatus.CANCELLED.value: set(),
+    JobStatus.CANCELLED.value: {JobStatus.QUEUED.value},
     JobStatus.COMPLETED.value: set(),
 }
 

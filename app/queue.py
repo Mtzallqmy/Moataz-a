@@ -129,26 +129,22 @@ class InlineJobManager:
         if not self._running:
             return
         self._running = False
-        from app.worker import request_cancel
-
-        for job_id in list(self._active):
-            request_cancel(job_id)
+        # Task cancellation means process shutdown, never a user cancellation.
+        # The worker persists INTERRUPTED and cleans up its subprocess group.
         if self._dispatcher:
             self._dispatcher.cancel()
             await asyncio.gather(self._dispatcher, return_exceptions=True)
-        if self._active:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*list(self._active.values()), return_exceptions=True),
-                    timeout=10,
-                )
-            except TimeoutError:
-                for task in list(self._active.values()):
-                    task.cancel()
-                await asyncio.gather(*list(self._active.values()), return_exceptions=True)
+        tasks = list(self._active.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._active.clear()
         self._known.clear()
         self._active_users.clear()
+
+    @property
+    def known_job_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._known))
 
     @property
     def active_job_ids(self) -> tuple[int, ...]:

@@ -390,12 +390,29 @@ async def process_download(job_id: int) -> None:
             await record_job_event(job_id, JobStatus.COMPLETED.value, f"dashboard file ready; bytes={file_size}")
 
         await _edit_status(job_id, f"Job #{job_id}\nStatus: COMPLETED ✅\nQuality: {quality}")
+    except asyncio.CancelledError:
+        # A restart/deploy cancels asyncio tasks; it is not a Cancel button press.
+        # Preserve an explicit cancellation already persisted by the user.
+        cancel_event.set()
+        downloader.cancel(str(job_id))
+        if not await is_job_cancelled(job_id):
+            await set_job_status(
+                job_id, JobStatus.FAILED,
+                error="INTERRUPTED: service stopped while processing this job",
+                event_message="service shutdown; manual retry available",
+            )
+            await _edit_status(
+                job_id,
+                f"Job #{job_id}\nStatus: INTERRUPTED\nتوقف الخادم أثناء التنفيذ. يمكنك إعادة المحاولة.",
+                markup=_retry_markup(job_id),
+            )
+        raise
     except Exception as exc:
         await _record_backend_route(job_id, pop=True)
         info = classify_error(exc)
         if info.code == ErrorCode.CANCELLED or cancel_event.is_set():
             await set_job_status(job_id, JobStatus.CANCELLED, error=ErrorCode.CANCELLED.value, event_message="cancelled")
-            await _edit_status(job_id, f"Job #{job_id}\nStatus: CANCELLED")
+            await _edit_status(job_id, f"Job #{job_id}\nStatus: CANCELLED", markup=_retry_markup(job_id))
         else:
             safe_message = redact_secrets(
                 str(exc), bot_token=settings.bot_token, database_url=settings.database_url
