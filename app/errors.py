@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 from dataclasses import dataclass
 from enum import StrEnum
@@ -66,7 +67,7 @@ def classify_error(exc: BaseException) -> ErrorInfo:
     name = type(exc).__name__.lower()
     text = f"{name} {str(exc).lower()}"
 
-    if "cancel" in text:
+    if isinstance(exc, asyncio.CancelledError):
         return ErrorInfo(ErrorCode.CANCELLED, False)
     if "requested format" in text or "format is not available" in text:
         return ErrorInfo(ErrorCode.FORMAT_UNAVAILABLE, False)

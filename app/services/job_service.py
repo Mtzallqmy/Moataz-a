@@ -274,11 +274,15 @@ async def analyze_and_create_job(
 
 
 async def queue_existing_job(job_id: int, quality: str, *, priority: int | None = None) -> None:
+    from app.queue import get_job_manager
+
+    if job_id in get_job_manager().known_job_ids:
+        raise ValueError("Previous attempt is still stopping; retry shortly")
     async with SessionLocal() as session:
         job = await session.get(DownloadJob, job_id)
         if job is None:
             raise LookupError("Job not found")
-        if job.status not in {JobStatus.READY.value, JobStatus.FAILED.value}:
+        if job.status not in {JobStatus.READY.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value}:
             raise ValueError("Job is not queueable")
         metadata = await session.get(MediaMetadata, job_id)
         if quality not in {"best", "audio", "mp3"}:

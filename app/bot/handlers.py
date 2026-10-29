@@ -470,7 +470,10 @@ async def cancel_job(callback: CallbackQuery) -> None:
     await set_job_status(job_id, JobStatus.CANCELLED, error="CANCELLED", event_message="cancel requested")
     await cancel_download(job_id)
     if callback.message:
-        await safe_edit_message(callback.message, f"Job #{job_id}\nStatus: CANCELLED")
+        await safe_edit_message(callback.message, f"Job #{job_id}\nStatus: CANCELLED",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🔁 Retry / إعادة", callback_data=f"retry:{job_id}")
+                                ]]))
     await callback.answer()
 
 
@@ -481,7 +484,7 @@ async def retry_job(callback: CallbackQuery) -> None:
     if owned is None:
         return
     job, user = owned
-    if job.status != JobStatus.FAILED.value or not job.selected_quality:
+    if job.status not in {JobStatus.FAILED.value, JobStatus.CANCELLED.value} or not job.selected_quality:
         await callback.answer("Cannot retry this job", show_alert=True)
         return
     try:
