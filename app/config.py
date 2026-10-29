@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     max_render_retries: int = 1
     default_render_fps: int = 30
 
+    probe_timeout_seconds: int = Field(default=120, ge=10, le=600)
+    download_timeout_seconds: int = Field(default=900, ge=30, le=7200)
     ytdlp_socket_timeout_seconds: int = 30
     ytdlp_retries: int = 2
     ytdlp_fragment_retries: int = 3
@@ -99,9 +101,18 @@ class Settings(BaseSettings):
         if not url:
             return "sqlite+aiosqlite:///./moataz.db"
         if url.startswith("postgres://"):
-            return "postgresql+asyncpg://" + url[len("postgres://") :]
+            url = "postgresql+asyncpg://" + url[len("postgres://") :]
         if url.startswith("postgresql://") and "+asyncpg" not in url:
-            return "postgresql+asyncpg://" + url[len("postgresql://") :]
+            url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+        if url.startswith("postgresql+asyncpg://"):
+            parts = urlsplit(url)
+            query = dict(parse_qsl(parts.query))
+            if "sslmode" in query:
+                query.setdefault("ssl", query.pop("sslmode"))
+            # libpq-only parameter, unsupported by asyncpg. TLS verification is
+            # configured on the driver for Neon in db.py.
+            query.pop("channel_binding", None)
+            url = urlunsplit(parts._replace(query=urlencode(query)))
         return url
 
     @field_validator("openai_base_url", mode="before")

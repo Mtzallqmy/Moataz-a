@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import shutil
 import time
 from dataclasses import dataclass
 
@@ -18,10 +19,11 @@ import app.worker as worker_module
 from app.bot.access import ensure_user, is_allowed
 from app.config import get_settings
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
-from app.errors import CancelledError, ErrorCode, classify_error, user_error_message
+from app.errors import CancelledError, ErrorCode, MediaError, classify_error, user_error_message
 from app.jobs import record_job_event, set_job_status
 from app.progress import ProgressSnapshot
 from app.security import canonicalize_url, redact_secrets
+from app.services.download_cache import copy_saved_media, remember_source
 from app.services.downloader import MediaInfo
 from app.services.job_service import deserialize_formats, deserialize_qualities, queue_existing_job
 from app.services.segmenting import MAX_SPLIT_SEGMENTS, split_media
@@ -165,6 +167,8 @@ def reuse_menu_keyboard(job_id: int) -> InlineKeyboardMarkup:
 def completed_reuse_keyboard(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="✂️ قص الملف المحمّل", callback_data=f"reuse:{job_id}:localcut")],
+            [InlineKeyboardButton(text="🧩 تقسيم الملف المحمّل", callback_data=f"reuse:{job_id}:localsplit")],
             [InlineKeyboardButton(text="♻️ استخدام نفس الرابط", callback_data=f"reusemenu:{job_id}")],
             [
                 InlineKeyboardButton(text="🔖 الروابط", callback_data="menu:saved"),
@@ -237,7 +241,7 @@ def _saved_keyboard(items: list[SavedMedia]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _clone_ready_job(source_job_id: int, user_id: int, chat_id: int) -> tuple[DownloadJob, MediaInfo]:
+async def _clone_ready_job(source_job_id: int, user_id: int, chat_id: int, *, local: bool = False) -> tuple[DownloadJob, MediaInfo]:
     async with SessionLocal() as session:
         result = await session.execute(
             select(DownloadJob, MediaMetadata)
@@ -262,6 +266,21 @@ async def _clone_ready_job(source_job_id: int, user_id: int, chat_id: int) -> tu
         )
         session.add(clone)
         await session.flush()
+        if local:
+            if source.status != JobStatus.COMPLETED.value or not source.output_path:
+                raise ValueError("الملف غير متاح للقص؛ استخدم الرابط مجددًا لتنزيله.")
+            target_dir = settings.download_dir / str(clone.id)
+            try:
+                saved, probe = await copy_saved_media(
+                    source.output_path, settings.download_dir / str(source.id), target_dir,
+                )
+            except Exception:
+                shutil.rmtree(target_dir, ignore_errors=True)
+                raise
+            remember_source(target_dir, saved, "local")
+            clone.output_path = str(saved)
+            clone.duration = math.ceil(probe.duration)
+            clone.selected_quality = (source.selected_quality or "best") if probe.has_video else "audio"
         session.add(
             MediaMetadata(
                 job_id=clone.id,
@@ -271,7 +290,7 @@ async def _clone_ready_job(source_job_id: int, user_id: int, chat_id: int) -> tu
                 is_playlist=False,
                 playlist_count=0,
                 cut_mode="PRECISE",
-                source="telegram",
+                source="local" if local else "telegram",
                 priority=metadata.priority if metadata else 0,
             )
         )
@@ -320,6 +339,8 @@ async def _configure_split(
             raise ValueError(
                 f"سيتم إنشاء {count} مقطعًا؛ الحد {MAX_SPLIT_SEGMENTS}. استخدم 60 ثانية أو اختر نطاقًا أقصر."
             )
+        if metadata.source == "local" and job.selected_quality == "audio" and quality != "audio":
+            raise ValueError("الملف المحفوظ صوتي؛ اختر التقسيم الصوتي.")
         job.cut_start = start_value
         job.cut_end = end_value
         metadata.cut_mode = f"SPLIT{segment_seconds}"
@@ -406,8 +427,12 @@ async def reuse_action(callback: CallbackQuery) -> None:
         return
     _, user = owned
     try:
-        clone, info = await _clone_ready_job(source_job_id, user.id, callback.message.chat.id)
-    except (LookupError, ValueError) as exc:
+        clone, info = await _clone_ready_job(
+            source_job_id, user.id, callback.message.chat.id, local=action in {"localcut", "localsplit"},
+        )
+        if action.startswith("local"):
+            action = action.removeprefix("local")
+    except (LookupError, ValueError, OSError, MediaError) as exc:
         await callback.answer(str(exc)[:180], show_alert=True)
         return
     progress = await callback.message.answer(f"♻️ Job #{clone.id} • READY")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal
@@ -35,7 +36,7 @@ def resolve_cut_plan(
         raise ValueError("Cut preset must be free, 30 or 60")
 
     start_value = float(start)
-    if start_value < 0:
+    if not math.isfinite(start_value) or start_value < 0:
         raise ValueError("Cut start cannot be negative")
 
     if normalized_preset == "free":
@@ -45,7 +46,7 @@ def resolve_cut_plan(
     else:
         end_value = start_value + float(normalized_preset)
 
-    if end_value <= start_value:
+    if not math.isfinite(end_value) or end_value <= start_value:
         raise ValueError("Cut end must be after the start")
     if source_duration is not None and end_value > float(source_duration) + 0.05:
         if normalized_preset in {"30", "60"}:
@@ -80,6 +81,8 @@ async def configure_and_queue_cut(
             mode=mode,
             source_duration=float(job.duration) if job.duration is not None else None,
         )
+        if metadata is not None and metadata.source == "local":
+            quality = job.selected_quality or quality
         job.cut_start = plan.start
         job.cut_end = plan.end
         if metadata is not None:
