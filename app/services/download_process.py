@@ -123,7 +123,8 @@ def main() -> None:
                 keys = ("status", "downloaded_bytes", "total_bytes", "total_bytes_estimate", "speed", "eta")
                 _emit("progress", {key: event[key] for key in keys if key in event})
             output = engine.download(payload["url"], payload["quality"], Path(payload["output_dir"]),
-                                     progress_hook=progress, known_qualities=payload["known_qualities"])
+                                     cancel_event=None, progress_hook=progress,
+                                     known_qualities=payload["known_qualities"])
             result = {"output": str(output)}
         _emit("result", result)
     except Exception as exc:
