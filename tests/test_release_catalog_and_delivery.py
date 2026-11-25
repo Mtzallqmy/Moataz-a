@@ -13,7 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from app.bot import features
 from app.config import Settings
 from app.db import JobStatus
-from app.services import artifact_delivery, github_releases
+from app.services import artifact_delivery, artifact_links, github_releases
 from app.services.artifact_urls import artifact_target
 from app.services.downloader import MediaInfo
 
@@ -156,14 +156,14 @@ def test_independent_200_mb_cap(tmp_path):
 
 def test_signed_link_bound_to_job_and_expiration(tmp_path):
     settings = _settings(tmp_path)
-    link = artifact_delivery.artifact_download_link(settings, 22, now=1000)
+    link = artifact_links.artifact_download_link(settings, 22, now=1000)
     assert link and link.startswith('https://bot.example.com/files/artifacts/22?')
     params = parse_qs(urlsplit(link).query)
     expires, token = int(params['expires'][0]), params['token'][0]
-    assert artifact_delivery.valid_artifact_token(settings, 22, expires, token, now=1000)
-    assert not artifact_delivery.valid_artifact_token(settings, 23, expires, token, now=1000)
-    assert not artifact_delivery.valid_artifact_token(settings, 22, expires, 'é'*64, now=1000)
-    assert not artifact_delivery.valid_artifact_token(settings, 22, expires, token, now=expires+1)
+    assert artifact_links.valid_artifact_token(settings, 22, expires, token, now=1000)
+    assert not artifact_links.valid_artifact_token(settings, 23, expires, token, now=1000)
+    assert not artifact_links.valid_artifact_token(settings, 22, expires, 'é'*64, now=1000)
+    assert not artifact_links.valid_artifact_token(settings, 22, expires, token, now=expires+1)
 
 
 def _artifact_job(tmp_path):
@@ -203,7 +203,7 @@ async def test_signed_file_endpoint_supports_range_and_rejects_invalid_token(tmp
     monkeypatch.setattr(artifact_delivery, 'get_settings', lambda: settings)
     app = FastAPI()
     app.include_router(artifact_delivery.router)
-    link = artifact_delivery.artifact_download_link(settings, job.id)
+    link = artifact_links.artifact_download_link(settings, job.id)
     async with AsyncClient(transport=ASGITransport(app=app), base_url='https://bot.example.com') as client:
         response = await client.get(link, headers={'Range': 'bytes=2-5'})
         assert response.status_code == 206 and response.content == b'2345'

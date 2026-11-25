@@ -20,7 +20,7 @@ from app.errors import CancelledError, ErrorCode, classify_error, retry_delay, u
 from app.jobs import is_job_cancelled, record_job_event, set_job_status
 from app.progress import ProgressSnapshot, format_bytes
 from app.security import redact_secrets
-from app.services.artifact_delivery import artifact_download_link
+from app.services.artifact_links import artifact_download_link
 from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_platform, artifact_target
 from app.services.download_cache import cached_source, remember_source
 from app.services.downloader import get_downloader_service
