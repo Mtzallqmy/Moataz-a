@@ -255,3 +255,20 @@ async def test_worker_completes_large_artifact_with_link_without_upload(tmp_path
     markup = edited.await_args.kwargs['markup']
     assert markup.inline_keyboard[0][0].url.startswith(f'https://bot.example.com/files/artifacts/{job_id}?')
     assert markup.inline_keyboard[1][0].url == url
+
+
+async def test_release_listing_includes_recent_beta(monkeypatch):
+    github_releases._cache.clear()
+    ref = github_releases.release_reference('https://github.com/owner/repository/releases')
+    assert ref and ref.prefer_recent
+    calls = []
+
+    async def fake_json(_session, path, *, params=None):
+        calls.append((path, params))
+        return [{'id': 1, 'tag_name': 'v3-rc.1', 'prerelease': True, 'assets': [{'name': 'app.apk', 'size': 129*MIB, 'browser_download_url': 'https://github.com/owner/repository/releases/download/v3-rc.1/app.apk'}]}]
+
+    monkeypatch.setattr(github_releases, '_github_json', fake_json)
+    catalog = await github_releases.fetch_release_catalog(ref)
+    assert catalog.tag == 'v3-rc.1' and catalog.assets[0].name == 'app.apk'
+    assert calls == [('/repos/owner/repository/releases', {'per_page': 1})]
+    github_releases._cache.clear()

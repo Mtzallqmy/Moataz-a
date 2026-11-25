@@ -25,10 +25,11 @@ class ReleaseReference:
     repo: str
     tag: str | None = None
     repository_root: bool = False
+    prefer_recent: bool = False
 
     @property
     def page_url(self) -> str:
-        suffix = f"/tag/{quote(self.tag, safe='')}" if self.tag else "/latest"
+        suffix = f"/tag/{quote(self.tag, safe='')}" if self.tag else "" if self.repository_root or self.prefer_recent else "/latest"
         return f"https://github.com/{self.owner}/{self.repo}/releases{suffix}"
 
 
@@ -69,7 +70,9 @@ def release_reference(url: str) -> ReleaseReference | None:
         return None
     if len(segments) == 2:
         return ReleaseReference(owner, repo, repository_root=True)
-    if segments[2:] in (["releases"], ["releases", "latest"]):
+    if segments[2:] == ["releases"]:
+        return ReleaseReference(owner, repo, prefer_recent=True)
+    if segments[2:] == ["releases", "latest"]:
         return ReleaseReference(owner, repo)
     if len(segments) >= 5 and segments[2:4] == ["releases", "tag"]:
         tag = "/".join(segments[4:])
@@ -137,9 +140,23 @@ async def fetch_release_catalog(ref: ReleaseReference) -> ReleaseCatalog:
         _cache.move_to_end(ref)
         return cached[1]
     prefix = f"/repos/{quote(ref.owner, safe='')}/{quote(ref.repo, safe='')}"
-    path = f"{prefix}/releases/tags/{quote(ref.tag, safe='')}" if ref.tag else f"{prefix}/releases/latest"
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20, sock_read=10), trust_env=False, headers={"Accept": "application/vnd.github+json", "User-Agent": "MoatazMediaBot"}) as session:
-        release = await _github_json(session, path)
+        async def recent_release():
+            # The release listing includes RC/beta releases which /latest may omit.
+            listing = await _github_json(session, f"{prefix}/releases", params={"per_page": 1})
+            if not isinstance(listing, list) or not listing:
+                raise ReleaseUnavailable("No public GitHub release was found")
+            return listing[0]
+
+        if ref.tag:
+            release = await _github_json(session, f"{prefix}/releases/tags/{quote(ref.tag, safe='')}")
+        elif ref.repository_root or ref.prefer_recent:
+            release = await recent_release()
+        else:
+            try:
+                release = await _github_json(session, f"{prefix}/releases/latest")
+            except ReleaseUnavailable:
+                release = await recent_release()
         if not isinstance(release, dict) or release.get("draft"):
             raise ReleaseUnavailable("No public GitHub release was found")
         raw_assets = release.get("assets") or []

@@ -385,7 +385,7 @@ def _catalog_markup(token: str, catalog: ReleaseCatalog, page: int, language: st
         rows.append(navigation)
     if catalog.truncated:
         lines.append("More assets on GitHub." if language == "en" else "توجد ملفات إضافية في صفحة GitHub.")
-    rows.append([InlineKeyboardButton(text="🌐 Release page" if language == "en" else "🌐 صفحة الإصدار", url=catalog.page_url)])
+    rows.append([InlineKeyboardButton(text="🌐 Release page" if language == "en" else "🌐 صفحة الإصدار", url=catalog.page_url), InlineKeyboardButton(text="All releases" if language == "en" else "كل الإصدارات", url=f"https://github.com/{catalog.repository}/releases")])
     rows.append([InlineKeyboardButton(text="🏠 Home" if language == "en" else "🏠 الرئيسية", callback_data="menu:home")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
