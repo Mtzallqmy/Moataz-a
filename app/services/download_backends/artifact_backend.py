@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin, urlsplit
@@ -33,7 +34,7 @@ class ArtifactBackend(DownloadBackend):
     @asynccontextmanager
     async def _response(self, target: ArtifactTarget, *, timeout: int, method: str = "GET"):
         url = target.url
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, sock_read=30), trust_env=False, auto_decompress=False, headers={"User-Agent": "MoatazMediaBot/0.6.1", "Accept-Encoding": "identity"}) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, sock_read=30), trust_env=False, auto_decompress=False, headers={"User-Agent": "MoatazMediaBot/0.6.2", "Accept-Encoding": "identity"}) as session:
             for _ in range(6):
                 parsed = urlsplit(url)
                 if parsed.scheme != "https" or parsed.hostname not in _REDIRECT_HOSTS[target.platform] or parsed.port not in {None, 443}:
@@ -78,7 +79,7 @@ class ArtifactBackend(DownloadBackend):
         # Keep user-named files separate from the job cache manifest.
         path = request.output_dir / "artifact" / target.filename
         partial = path.with_name(path.name + ".part")
-        limit = min(self.settings.max_file_size_bytes, request.max_bytes) if request.max_bytes is not None else self.settings.max_file_size_bytes
+        limit = min(self.settings.artifact_download_limit_bytes, request.max_bytes) if request.max_bytes is not None else self.settings.artifact_download_limit_bytes
         start = time.monotonic()
         count = 0
         try:
@@ -87,15 +88,21 @@ class ArtifactBackend(DownloadBackend):
             async with self._response(target, timeout=self.settings.download_timeout_seconds) as response:
                 total = response.content_length
                 if total is not None and total > limit:
-                    raise RuntimeError("File too large: exceeds MAX_FILE_SIZE_MB")
+                    raise RuntimeError("File too large: exceeds artifact download limit")
                 path.parent.mkdir(parents=True, exist_ok=True)
+                # Keep room for the database/other jobs on the shared volume.
+                reserve = 16 * 1024 * 1024
+                if shutil.disk_usage(path.parent).free < reserve + (total or 0):
+                    raise OSError("No space left for software file")
                 with partial.open("wb") as stream:
                     async for chunk in response.content.iter_chunked(128 * 1024):
                         if request.cancel_event and request.cancel_event.is_set():
                             raise CancelledError("Download cancelled")
                         count += len(chunk)
                         if count > limit:
-                            raise RuntimeError("File too large: exceeds MAX_FILE_SIZE_MB")
+                            raise RuntimeError("File too large: exceeds artifact download limit")
+                        if shutil.disk_usage(path.parent).free < reserve + len(chunk):
+                            raise OSError("No space left for software file")
                         stream.write(chunk)
                         if request.progress_hook:
                             speed = count / max(0.001, time.monotonic() - start)

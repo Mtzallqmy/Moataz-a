@@ -16,8 +16,10 @@ from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
 from app.errors import classify_error, user_error_message
 from app.i18n import tr
 from app.jobs import TERMINAL_STATUSES, record_job_event, set_job_status
+from app.progress import format_bytes
 from app.queue import cancel_download
 from app.rate_limit import telegram_analyze_limiter
+from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_target
 from app.services.downloader import MediaInfo, get_downloader_service
 from app.services.job_service import (
     analyze_and_create_job,
@@ -237,17 +239,22 @@ async def _history(user: User, page: int, size: int = 5) -> tuple[str, InlineKey
         blocks = []
         for job in jobs:
             title = (job.title or "Untitled").replace("\n", " ")[:48]
-            blocks.append(f"#{job.id} • {job.status}\n{title}\n{job.platform} • {job.selected_quality or '—'}")
+            details = format_bytes(job.file_size) if job.platform in ARTIFACT_PLATFORMS else job.selected_quality or "—"
+            blocks.append(f"#{job.id} • {job.status}\n{title}\n{job.platform} • {details}")
         text = "📋 Downloads\n\n" + "\n\n".join(blocks)
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"history:{page - 1}"))
     if has_next:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"history:{page + 1}"))
-    rows = [
-        [InlineKeyboardButton(text=f"✂️ قص الملف #{job.id}", callback_data=f"reuse:{job.id}:localcut")]
-        for job in jobs if job.status == JobStatus.COMPLETED.value and job.output_path
-    ]
+    rows = []
+    for job in jobs:
+        if job.status != JobStatus.COMPLETED.value or not job.output_path:
+            continue
+        if job.platform in ARTIFACT_PLATFORMS:
+            rows.append([InlineKeyboardButton(text=f"📦 رابط الملف #{job.id}", url=artifact_target(job.source_url).url)])
+        else:
+            rows.append([InlineKeyboardButton(text=f"✂️ قص الملف #{job.id}", callback_data=f"reuse:{job.id}:localcut")])
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🏠", callback_data="menu:home")])

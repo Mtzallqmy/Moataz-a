@@ -41,10 +41,14 @@ def artifact_target(url: str) -> ArtifactTarget:
     if not platform or parsed.scheme != "https" or parsed.port not in {None, 443} or any((k, v.lower()) not in {("raw", "true"), ("download", "true")} for k, v in parse_qsl(parsed.query, keep_blank_values=True)):
         raise InvalidURLError("Use a public HTTPS software download URL without credentials or parameters")
     parts = parsed.path.strip("/").split("/")
-    # Keep path separators structural; decoded segments may never contain them.
     decoded = [unquote(part) for part in parts]
-    if any(not p or p in {".", ".."} or any(c in p for c in "/\\\x00\r\n") for p in decoded):
-        raise InvalidURLError("Invalid software download path")
+    # Only a release tag may contain an encoded slash. Keep file-name and owner
+    # segments structural, and reject empty/traversal/control segments.
+    github_tag = host in {"github.com", "www.github.com"} and len(decoded) >= 6 and decoded[2:4] == ["releases", "download"]
+    for index, part in enumerate(decoded):
+        values = part.split("/") if github_tag and index == 4 else [part]
+        if any(not value or value in {".", ".."} or any(c in value for c in "/\\\x00\r\n") for value in values):
+            raise InvalidURLError("Invalid software download path")
     path = "/".join(quote(p, safe="-._~@+") for p in decoded)
     if host in {"github.com", "www.github.com"}:
         if len(parts) < 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in decoded[:2]):

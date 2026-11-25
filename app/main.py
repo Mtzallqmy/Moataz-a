@@ -26,6 +26,7 @@ from app.queue import enqueue_download, shutdown_queue, start_queue
 from app.render_queue import enqueue_render, shutdown_render_queue, start_render_queue
 from app.security import redact_secrets
 from app.services.ai_registry import get_ai_provider_registry
+from app.services.artifact_delivery import router as artifact_delivery_router
 from app.services.render_service import render_service
 from app.version import RELEASE
 
@@ -108,11 +109,15 @@ async def _cleanup_temp_dirs() -> None:
         root = settings.download_dir
         if not root.exists():
             return
-        cutoff = time.time() - settings.temp_retention_seconds
+        now = time.time()
+        cutoff = now - settings.temp_retention_seconds
+        # Reclaim large public artifacts shortly after their download link expires.
+        artifact_cutoff = now - min(settings.temp_retention_seconds, settings.artifact_link_ttl_seconds + 300)
         for path in root.iterdir():
             if not path.is_dir() or not path.name.isdigit() or int(path.name) in active:
                 continue
-            if path.stat().st_mtime < cutoff:
+            expiry_cutoff = artifact_cutoff if (path / "artifact").is_dir() else cutoff
+            if path.stat().st_mtime < expiry_cutoff:
                 shutil.rmtree(path, ignore_errors=True)
     except Exception as exc:
         logger.warning("Temp cleanup failed with %s", type(exc).__name__)
@@ -225,6 +230,7 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 app.include_router(dashboard_router)
+app.include_router(artifact_delivery_router)
 
 
 @app.get("/")

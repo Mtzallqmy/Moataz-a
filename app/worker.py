@@ -18,8 +18,9 @@ from app.config import get_settings
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User, WorkerNode
 from app.errors import CancelledError, ErrorCode, classify_error, retry_delay, user_error_message
 from app.jobs import is_job_cancelled, record_job_event, set_job_status
-from app.progress import ProgressSnapshot
+from app.progress import ProgressSnapshot, format_bytes
 from app.security import redact_secrets
+from app.services.artifact_delivery import artifact_download_link
 from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_platform, artifact_target
 from app.services.download_cache import cached_source, remember_source
 from app.services.downloader import get_downloader_service
@@ -151,8 +152,7 @@ async def _download_with_retries(
     async with SessionLocal() as session:
         metadata = await session.get(MediaMetadata, job_id)
         is_local = bool(metadata and metadata.source == "local")
-        job_row = await session.get(DownloadJob, job_id) if artifact_platform(url) else None
-        artifact_limit = settings.telegram_upload_limit_bytes if job_row and job_row.chat_id else None
+        artifact_limit = settings.artifact_download_limit_bytes if artifact_platform(url) else None
     if is_local:
         output = await cached_source(job_dir, "local")
         if output is None:
@@ -360,15 +360,12 @@ async def process_download(job_id: int) -> None:
                 cancel_event=cancel_event,
             )
 
-        if output.stat().st_size > settings.max_file_size_bytes:
-            raise RuntimeError("File too large: output exceeds MAX_FILE_SIZE_MB")
+        size_limit = settings.artifact_download_limit_bytes if is_artifact else settings.max_file_size_bytes
+        if output.stat().st_size > size_limit:
+            raise RuntimeError("File too large: output exceeds configured download limit")
 
-        if chat_id != 0 and output.stat().st_size > settings.telegram_upload_limit_bytes:
-            if is_artifact:
-                target = artifact_target(source_url)
-                await set_job_status(job_id, JobStatus.FAILED, error="FILE_TOO_LARGE: Telegram upload limit", event_message="direct download link available")
-                await _edit_status(job_id, f"Job #{job_id}\nالملف يتجاوز حد الرفع في Telegram. استخدم الرابط المباشر.", markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌐 تنزيل مباشر", url=target.url)]]))
-                return
+        linked_delivery = bool(is_artifact and chat_id != 0 and output.stat().st_size > settings.telegram_upload_limit_bytes)
+        if not is_artifact and chat_id != 0 and output.stat().st_size > settings.telegram_upload_limit_bytes:
             await set_job_status(job_id, JobStatus.PROCESSING, event_message="adaptive Telegram size fit")
             output = await fit_media_for_upload(
                 output,
@@ -391,11 +388,22 @@ async def process_download(job_id: int) -> None:
             db_job.output_path = str(output)
             db_job.file_size = file_size
             db_job.progress = 100.0
-            db_job.status = JobStatus.UPLOADING.value if chat_id != 0 else JobStatus.COMPLETED.value
-            if chat_id == 0:
+            db_job.status = JobStatus.UPLOADING.value if chat_id != 0 and not linked_delivery else JobStatus.COMPLETED.value
+            if chat_id == 0 or linked_delivery:
                 db_job.completed_at = datetime.now(UTC)
             await session.commit()
 
+        if linked_delivery:
+            original_url = artifact_target(source_url).url
+            signed_link = artifact_download_link(settings, job_id)
+            rows = [[InlineKeyboardButton(text="⬇️ تنزيل الملف الكامل", url=signed_link)]] if signed_link else []
+            rows.append([InlineKeyboardButton(text="🌐 الرابط الأصلي", url=original_url)])
+            rows.append([InlineKeyboardButton(text="🏠 الرئيسية", callback_data="menu:home")])
+            expiry_minutes = min(settings.artifact_link_ttl_seconds, settings.temp_retention_seconds) // 60
+            detail = f"رابط الملف الكامل متاح لمدة {expiry_minutes} دقيقة." if signed_link else "استخدم رابط المصدر لتنزيل الملف الكامل."
+            await record_job_event(job_id, JobStatus.COMPLETED.value, f"artifact link delivery; bytes={file_size}")
+            await _edit_status(job_id, f"Job #{job_id}\n✅ اكتمل التنزيل\n📦 {output.name}\nالحجم: {format_bytes(file_size)}\n{detail}", markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            return
         if chat_id != 0:
             await record_job_event(job_id, JobStatus.UPLOADING.value, f"bytes={file_size}")
             await _edit_status(
@@ -444,7 +452,7 @@ async def process_download(job_id: int) -> None:
                 event_message=info.code.value,
             )
             markup = _retry_markup(job_id)
-            if is_artifact and info.code == ErrorCode.FILE_TOO_LARGE:
+            if is_artifact and info.code in {ErrorCode.FILE_TOO_LARGE, ErrorCode.STORAGE_ERROR}:
                 markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌐 تنزيل مباشر", url=artifact_target(source_url).url)]])
             await _edit_status(
                 job_id,

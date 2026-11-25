@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     max_video_duration_seconds: int = 14_400
     max_file_size_mb: int = 512
     telegram_upload_limit_mb: int = 49
+    artifact_download_limit_mb: int = Field(default=200, ge=1, le=4096)
+    artifact_public_base_url: str = ""
+    artifact_link_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     progress_update_seconds: float = 2.5
     temp_retention_seconds: int = 21_600
 
@@ -272,6 +275,10 @@ class Settings(BaseSettings):
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024
+
+    @property
+    def artifact_download_limit_bytes(self) -> int:
+        return self.artifact_download_limit_mb * 1024 * 1024
 
     @property
     def telegram_upload_limit_bytes(self) -> int:

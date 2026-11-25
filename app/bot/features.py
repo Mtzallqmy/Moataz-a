@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import secrets
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import BaseFilter, Command, CommandStart
@@ -19,6 +24,7 @@ from app.rate_limit import telegram_analyze_limiter
 from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_target
 from app.services.cutting import configure_and_queue_cut
 from app.services.downloader import MediaInfo
+from app.services.github_releases import ReleaseCatalog, fetch_release_catalog, release_reference
 from app.services.job_service import analyze_and_create_job, deserialize_qualities, queue_existing_job
 from app.services.urls import parse_bulk_urls
 from app.utils import parse_time, seconds_to_hms
@@ -211,20 +217,29 @@ async def _show_analysis(
 ) -> None:
     if info.platform in ARTIFACT_PLATFORMS:
         target = artifact_target(job.source_url)
-        limit = min(settings.telegram_upload_limit_bytes, settings.max_file_size_bytes)
+        limit = settings.artifact_download_limit_bytes
         large = info.file_size is not None and info.file_size > limit
+        link_delivery = info.file_size is not None and info.file_size > settings.telegram_upload_limit_bytes
         if language == "en":
-            label, link, cancel = "📦 Download original file", "🌐 Open download link", "✖️ Cancel"
-            text = f"Job #{job.id}\n📦 {info.title}\nProvider: {info.platform}\nSize: {format_bytes(info.file_size)}\nTelegram limit: {format_bytes(limit)}"
+            label, link, cancel = "📦 Download original file", "🌐 Open source link", "✖️ Cancel"
+            text = f"Job #{job.id}\n📦 {info.title}\nProvider: {info.platform}\nSize: {format_bytes(info.file_size)}\nDownload limit: {format_bytes(limit)}"
             if large:
-                text += "\nThis file exceeds the upload limit. Open the direct link instead."
+                text += "\nAbove the download limit. Use the original provider link."
+            elif link_delivery:
+                text += "\nThe entire file will be delivered using a temporary download link."
         else:
-            label, link, cancel = "📦 تنزيل الملف الأصلي", "🌐 فتح رابط التنزيل", "✖️ إلغاء"
-            text = f"Job #{job.id}\n📦 {info.title}\nالمصدر: {info.platform}\nالحجم: {format_bytes(info.file_size)}\nحد الرفع: {format_bytes(limit)}"
+            label, link, cancel = "📦 تنزيل الملف الأصلي", "🌐 فتح رابط المصدر", "✖️ إلغاء"
+            text = f"Job #{job.id}\n📦 {info.title}\nالمصدر: {info.platform}\nالحجم: {format_bytes(info.file_size)}\nحد التنزيل: {format_bytes(limit)}"
             if large:
-                text += "\nالملف أكبر من حد الرفع؛ استخدم رابط التنزيل المباشر."
+                text += "\nالملف أكبر من حد التنزيل؛ استخدم رابط المصدر."
+            elif link_delivery:
+                text += "\nسيتم تنزيل الملف كاملًا وإرسال رابط تحميل مؤقت دون تقسيمه."
         if large:
-            await set_job_status(job.id, JobStatus.FAILED, error="FILE_TOO_LARGE: use direct link", event_message="artifact too large for Telegram")
+            await set_job_status(job.id, JobStatus.FAILED, error="FILE_TOO_LARGE: use direct link", event_message="artifact exceeds download limit")
+        if not large and intent == "artifact_selected":
+            await progress.edit_text(f"{text}\n\n{tr(language, 'queued', job_id=job.id)}", reply_markup=_cancel_keyboard(job.id))
+            await queue_existing_job(job.id, "best")
+            return
         rows = [] if large else [[InlineKeyboardButton(text=label, callback_data=f"q:{job.id}:best")]]
         rows += [[InlineKeyboardButton(text=link, url=target.url)], [InlineKeyboardButton(text=cancel, callback_data=f"cancel:{job.id}")]]
         await progress.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -328,6 +343,102 @@ async def _analyze_one(message: Message, user: User, url: str, intent: str = "ge
         await progress.edit_text(tr(user.language, "failed", message=user_error_message(error, user.language)))
 
 
+
+_CATALOG_PAGE_SIZE = 8
+_CATALOG_TTL = 900
+
+
+@dataclass(frozen=True, slots=True)
+class _CatalogMenu:
+    telegram_id: int
+    chat_id: int
+    expires: float
+    catalog: ReleaseCatalog
+
+
+_catalog_menus: OrderedDict[str, _CatalogMenu] = OrderedDict()
+
+
+def _catalog_markup(token: str, catalog: ReleaseCatalog, page: int, language: str) -> tuple[str, InlineKeyboardMarkup]:
+    count = len(catalog.assets)
+    pages = max(1, (count + _CATALOG_PAGE_SIZE - 1) // _CATALOG_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    first = page * _CATALOG_PAGE_SIZE
+    if language == "en":
+        lines = [f"📦 GitHub • {catalog.repository}", f"Release: {catalog.tag}", f"Choose a file ({count} files • page {page + 1}/{pages}).", f"Maximum download: {format_bytes(settings.artifact_download_limit_bytes)}", ""]
+    else:
+        lines = [f"📦 GitHub • {catalog.repository}", f"الإصدار: {catalog.tag}", f"اختر الملف ({count} ملفات • الصفحة {page + 1}/{pages}).", f"الحد الأقصى للتنزيل: {format_bytes(settings.artifact_download_limit_bytes)}", ""]
+    rows = []
+    for idx, asset in enumerate(catalog.assets[first:first + _CATALOG_PAGE_SIZE], first):
+        size = format_bytes(asset.size)
+        large = asset.size is not None and asset.size > settings.artifact_download_limit_bytes
+        label = f"{'🌐' if large else '⬇️'} {idx + 1}. {asset.name[:40]} • {size}"
+        lines.append(f"{idx + 1}. {asset.name[:180]} — {size}{' (direct link)' if large and language == 'en' else ' (رابط مباشر)' if large else ''}")
+        button = InlineKeyboardButton(text=label, url=asset.url) if large else InlineKeyboardButton(text=label, callback_data=f"ghasset:{token}:{idx}")
+        rows.append([button])
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton(text="◀️ Previous" if language == "en" else "◀️ السابق", callback_data=f"ghpage:{token}:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton(text="Next ▶️" if language == "en" else "التالي ▶️", callback_data=f"ghpage:{token}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    if catalog.truncated:
+        lines.append("More assets on GitHub." if language == "en" else "توجد ملفات إضافية في صفحة GitHub.")
+    rows.append([InlineKeyboardButton(text="🌐 Release page" if language == "en" else "🌐 صفحة الإصدار", url=catalog.page_url)])
+    rows.append([InlineKeyboardButton(text="🏠 Home" if language == "en" else "🏠 الرئيسية", callback_data="menu:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_release_catalog(message: Message, user: User, url: str) -> bool:
+    reference = release_reference(url)
+    if reference is None:
+        return False
+    try:
+        catalog = await fetch_release_catalog(reference)
+    except Exception:
+        if reference.repository_root:
+            return False  # A repository without a published release still downloads as source ZIP.
+        await message.answer("تعذر قراءة ملفات الإصدار العام. تحقق من الرابط أو حاول لاحقًا." if user.language != "en" else "Could not read public release files. Check the link or try again later.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="GitHub", url=reference.page_url)]]))
+        return True
+    token = secrets.token_urlsafe(9)
+    _catalog_menus[token] = _CatalogMenu(user.telegram_id, message.chat.id, time.monotonic() + _CATALOG_TTL, catalog)
+    while len(_catalog_menus) > 256:
+        _catalog_menus.popitem(last=False)
+    text, markup = _catalog_markup(token, catalog, 0, user.language)
+    await message.answer(text, reply_markup=markup, parse_mode=None)
+    return True
+
+
+@router.callback_query(F.data.startswith("ghasset:") | F.data.startswith("ghpage:"))
+async def select_release_asset(callback: CallbackQuery) -> None:
+    user = await _get_callback_user(callback)
+    if user is None or callback.message is None:
+        return
+    try:
+        action, token, raw_index = (callback.data or "").split(":")
+        index = int(raw_index)
+        menu = _catalog_menus.get(token)
+    except ValueError:
+        await callback.answer("Invalid selection", show_alert=True)
+        return
+    if menu is None or menu.expires < time.monotonic() or menu.telegram_id != user.telegram_id or menu.chat_id != callback.message.chat.id or index < 0:
+        await callback.answer("انتهت القائمة أو ليست لك؛ أرسل الرابط مجددًا." if user.language != "en" else "Menu expired or belongs to another user. Send the link again.", show_alert=True)
+        return
+    if action == "ghpage":
+        text, markup = _catalog_markup(token, menu.catalog, index, user.language)
+        await callback.answer()
+        await _edit_callback(callback, text, markup)
+        return
+    if index >= len(menu.catalog.assets):
+        await callback.answer("Invalid selection", show_alert=True)
+        return
+    if not await telegram_analyze_limiter.allow(f"tg:{user.telegram_id}"):
+        await callback.answer("حاول بعد قليل.", show_alert=True)
+        return
+    await callback.answer("جارٍ تجهيز الملف…" if user.language != "en" else "Preparing file…")
+    await _analyze_one(callback.message, user, menu.catalog.assets[index].url, "artifact_selected")
+
 async def _process_urls(message: Message, *, intent: str = "general") -> None:
     user = await _get_message_user(message)
     if user is None or not message.text:
@@ -349,6 +460,8 @@ async def _process_urls(message: Message, *, intent: str = "general") -> None:
         await message.answer(text)
     effective_intent = intent if len(parsed.urls) == 1 else ("audio" if intent == "audio" else "general")
     for url in parsed.urls:
+        if await _show_release_catalog(message, user, url):
+            continue
         await _analyze_one(message, user, url, effective_intent)
 
 

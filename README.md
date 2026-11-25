@@ -344,12 +344,12 @@ CI يغطي، من ضمن ما يغطيه:
 من بيئة الاستضافة بعد النشر للتحقق من الشبكة وسمعة عنوان IP الخاص بها.
 
 
-## Public software downloads (0.6.1)
+## Public software downloads (0.6.2)
 
 Use `/github` or `/file`, or the **GitHub والملفات البرمجية** entry in Telegram. Paste a public HTTPS link. Supported links include:
 
-- `https://github.com/owner/repository` (default-branch source ZIP), direct GitHub archive or release asset URLs, and single-file `blob`/raw URLs. A release tag URL downloads the source archive; to download an APK or other built artifact, paste that asset's direct download URL.
+- `https://github.com/owner/repository` (default-branch source ZIP), direct GitHub archive or release asset URLs, and single-file `blob`/raw URLs. A repository, `/releases`, `/releases/latest`, or `/releases/tag/<tag>` URL displays the public release assets with file names and sizes, paginated selection, and source ZIP/TAR.GZ options. Direct asset URLs are still supported.
 - `https://gitlab.com/group/project` (source ZIP) and public GitLab archive or raw file links.
 - Public Hugging Face `blob` or `resolve` file links and direct PyPI package files on `files.pythonhosted.org`.
 
-Software artifacts use the existing durable job queue and are uploaded unchanged as documents. The bot shows the direct provider link for files that exceed its Telegram upload limit (default 49 MiB). It does not unpack, install or execute downloaded content. No extra database migration or provider credentials are required. Private or login-gated resources are not supported by this feature.
+Software artifacts use the existing durable job queue and are uploaded unchanged as documents. The independent software download cap is 200 MiB (`ARTIFACT_DOWNLOAD_LIMIT_MB`). Files up to the Telegram upload limit (default 49 MiB) are sent as documents; larger files up to the software cap are delivered via a time-limited signed download link (`ARTIFACT_PUBLIC_BASE_URL`, or Railway public domain), along with the original provider link. Above 200 MiB the original link is displayed. It does not unpack, install or execute downloaded content. No extra database migration or provider credentials are required. Private or login-gated resources are not supported by this feature.
