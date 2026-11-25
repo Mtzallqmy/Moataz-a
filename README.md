@@ -342,3 +342,14 @@ CI يغطي، من ضمن ما يغطيه:
 الاختبارات تعزل الشبكة وتغطي التحويل، التهدئة، الإلغاء، الملفات الناقصة،
 ورفض إعادة توجيه طلب API المحمل بمفتاح الخادم. يلزم اختبار رابط يوتيوب فعلي
 من بيئة الاستضافة بعد النشر للتحقق من الشبكة وسمعة عنوان IP الخاص بها.
+
+
+## Public software downloads (0.6.1)
+
+Use `/github` or `/file`, or the **GitHub والملفات البرمجية** entry in Telegram. Paste a public HTTPS link. Supported links include:
+
+- `https://github.com/owner/repository` (default-branch source ZIP), direct GitHub archive or release asset URLs, and single-file `blob`/raw URLs. A release tag URL downloads the source archive; to download an APK or other built artifact, paste that asset's direct download URL.
+- `https://gitlab.com/group/project` (source ZIP) and public GitLab archive or raw file links.
+- Public Hugging Face `blob` or `resolve` file links and direct PyPI package files on `files.pythonhosted.org`.
+
+Software artifacts use the existing durable job queue and are uploaded unchanged as documents. The bot shows the direct provider link for files that exceed its Telegram upload limit (default 49 MiB). It does not unpack, install or execute downloaded content. No extra database migration or provider credentials are required. Private or login-gated resources are not supported by this feature.

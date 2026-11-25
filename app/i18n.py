@@ -3,7 +3,8 @@ from __future__ import annotations
 STRINGS = {
     "ar": {
         "welcome": "مرحبًا بك في {name}. اختر ما تريد ثم أرسل رابطًا عامًا للوسائط.",
-        "help": "أرسل رابطًا واحدًا أو عدة روابط. سأحلل الوسائط أولًا ثم أعرض الجودات المتاحة فعليًا وMP3 والقص.",
+        "help": "أرسل رابطًا واحدًا أو عدة روابط. سأحلل الوسائط أولًا ثم أعرض الجودات المتاحة فعليًا وMP3 والقص. ولملفات GitHub وGitLab وHugging Face وPyPI استخدم /github أو أرسل رابط الملف المباشر.",
+        "artifact_prompt": "📦 أرسل رابط مستودع GitHub أو GitLab لتحميل المصدر ZIP، أو رابط ملف إصدار GitHub مباشر (APK/ZIP وغيرها)، أو ملف raw من GitHub/GitLab أو Hugging Face أو رابط حزمة PyPI مباشر. الملفات العامة فقط. للملفات الكبيرة سأعرض رابط التنزيل المباشر.",
         "private": "هذا المستخدم غير مسموح له حاليًا.",
         "send_prompt": "أرسل رابط HTTP/HTTPS عام. سيتم تحليله قبل التنزيل.",
         "bulk_prompt": "أرسل عدة روابط مفصولة بمسافة أو سطر جديد. الروابط المكررة تُحذف تلقائيًا.",
@@ -17,7 +18,8 @@ STRINGS = {
     },
     "en": {
         "welcome": "Welcome to {name}. Choose an action and send a public media URL.",
-        "help": "Send one URL or multiple URLs. Media is analyzed first; only real resolutions, MP3 and cutting options are shown.",
+        "help": "Send one URL or multiple URLs. Media is analyzed first; only real resolutions, MP3 and cutting options are shown. For GitHub, GitLab, Hugging Face and PyPI files use /github or send a direct file URL.",
+        "artifact_prompt": "📦 Send a GitHub/GitLab repository for a source ZIP, a direct GitHub release asset (APK/ZIP etc.), a raw GitHub/GitLab/Hugging Face file or a direct PyPI package URL. Public files only. Large files use a direct download link.",
         "private": "This user is currently not allowed.",
         "send_prompt": "Send a public HTTP/HTTPS media URL. It will be analyzed before downloading.",
         "bulk_prompt": "Send multiple URLs separated by spaces or new lines. Duplicates are removed automatically.",

@@ -14,7 +14,9 @@ from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal, User
 from app.errors import classify_error, user_error_message
 from app.i18n import tr
 from app.jobs import set_job_status
+from app.progress import format_bytes
 from app.rate_limit import telegram_analyze_limiter
+from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_target
 from app.services.cutting import configure_and_queue_cut
 from app.services.downloader import MediaInfo
 from app.services.job_service import analyze_and_create_job, deserialize_qualities, queue_existing_job
@@ -207,6 +209,26 @@ async def _show_analysis(
     intent: str,
     language: str,
 ) -> None:
+    if info.platform in ARTIFACT_PLATFORMS:
+        target = artifact_target(job.source_url)
+        limit = min(settings.telegram_upload_limit_bytes, settings.max_file_size_bytes)
+        large = info.file_size is not None and info.file_size > limit
+        if language == "en":
+            label, link, cancel = "📦 Download original file", "🌐 Open download link", "✖️ Cancel"
+            text = f"Job #{job.id}\n📦 {info.title}\nProvider: {info.platform}\nSize: {format_bytes(info.file_size)}\nTelegram limit: {format_bytes(limit)}"
+            if large:
+                text += "\nThis file exceeds the upload limit. Open the direct link instead."
+        else:
+            label, link, cancel = "📦 تنزيل الملف الأصلي", "🌐 فتح رابط التنزيل", "✖️ إلغاء"
+            text = f"Job #{job.id}\n📦 {info.title}\nالمصدر: {info.platform}\nالحجم: {format_bytes(info.file_size)}\nحد الرفع: {format_bytes(limit)}"
+            if large:
+                text += "\nالملف أكبر من حد الرفع؛ استخدم رابط التنزيل المباشر."
+        if large:
+            await set_job_status(job.id, JobStatus.FAILED, error="FILE_TOO_LARGE: use direct link", event_message="artifact too large for Telegram")
+        rows = [] if large else [[InlineKeyboardButton(text=label, callback_data=f"q:{job.id}:best")]]
+        rows += [[InlineKeyboardButton(text=link, url=target.url)], [InlineKeyboardButton(text=cancel, callback_data=f"cancel:{job.id}")]]
+        await progress.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
     if info.is_playlist:
         if language == "en":
             text = (
@@ -355,7 +377,7 @@ async def _slash_flow(message: Message, state: FSMContext, intent: str) -> None:
         "split": "🧩 أرسل رابط الفيديو ثم اختر التقسيم إلى 30 أو 60 ثانية.",
         "bulk": "📥 أرسل الروابط، كل رابط في سطر.",
     }
-    await message.answer(prompts[intent])
+    await message.answer(tr(user.language, "artifact_prompt") if intent == "artifact" else prompts[intent])
 
 
 @router.message(Command("download", "video"))
@@ -383,6 +405,11 @@ async def bulk_command(message: Message, state: FSMContext) -> None:
     await _slash_flow(message, state, "bulk")
 
 
+@router.message(Command("github", "file"))
+async def artifact_command(message: Message, state: FSMContext) -> None:
+    await _slash_flow(message, state, "artifact")
+
+
 @router.callback_query(F.data == "menu:home")
 async def reset_home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -391,7 +418,7 @@ async def reset_home(callback: CallbackQuery, state: FSMContext) -> None:
     await home(callback)
 
 
-@router.callback_query(F.data.in_({"menu:video", "menu:audio", "menu:cut", "menu:bulk"}))
+@router.callback_query(F.data.in_({"menu:video", "menu:audio", "menu:cut", "menu:bulk", "menu:artifact"}))
 async def choose_next_action(callback: CallbackQuery, state: FSMContext) -> None:
     user = await _get_callback_user(callback)
     if user is None:
@@ -406,6 +433,7 @@ async def choose_next_action(callback: CallbackQuery, state: FSMContext) -> None
                 "audio": "🎵 Send the URL. I will analyze it and queue MP3 automatically.",
                 "cut": "✂️ Send the video URL, then choose Free Cut, 30-second Story, or 60-second Cut.",
                 "bulk": "📥 Send multiple URLs separated by spaces or new lines.",
+                "artifact": tr(user.language, "artifact_prompt"),
             }
         else:
             prompts = {
@@ -413,6 +441,7 @@ async def choose_next_action(callback: CallbackQuery, state: FSMContext) -> None
                 "audio": "🎵 أرسل الرابط وسأحلله ثم أضيف تنزيل MP3 مباشرة.",
                 "cut": "✂️ أرسل رابط الفيديو ثم اختر: قص حر، 30 ثانية للقصص، أو 60 ثانية.",
                 "bulk": "📥 أرسل عدة روابط، كل رابط في سطر أو مفصول بمسافة.",
+                "artifact": tr(user.language, "artifact_prompt"),
             }
         await _edit_callback(callback, prompts[intent])
     await callback.answer()

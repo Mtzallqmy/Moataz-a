@@ -71,7 +71,7 @@ def classify_error(exc: BaseException) -> ErrorInfo:
         return ErrorInfo(ErrorCode.CANCELLED, False)
     if "requested format" in text or "format is not available" in text:
         return ErrorInfo(ErrorCode.FORMAT_UNAVAILABLE, False)
-    if any(marker in text for marker in ("confirm you're not a bot", "confirm you’re not a bot", "captcha", "unusual traffic", "bot challenge")):
+    if any(marker in text for marker in ("confirm you're not a bot", "confirm you’re not a bot", "captcha", "unusual traffic", "bot challenge", "detected as a bot")):
         return ErrorInfo(ErrorCode.ANTI_BOT, False)
     if "private" in text or "members-only" in text:
         return ErrorInfo(ErrorCode.PRIVATE_MEDIA, False)
@@ -118,8 +118,9 @@ _USER_MESSAGES = {
         ErrorCode.MEDIA_UNAVAILABLE: "الفيديو غير متاح أو تمت إزالته من المنصة.",
         ErrorCode.PRIVATE_MEDIA: "الفيديو خاص أو لا يملك الحساب صلاحية الوصول إليه.",
         ErrorCode.AUTH_REQUIRED: "هذا الرابط يحتاج تسجيل دخول أو Cookies صالحة.",
-        ErrorCode.ANTI_BOT: "تعذر اجتياز تحقق المنصة ضد الروبوتات بعد تجربة مسارات التحميل المتاحة. حدّث Cookies أو فعّل Proxy/Cobalt احتياطيًا ثم حاول مجددًا.",
+        ErrorCode.ANTI_BOT: "تعذر اجتياز تحقق المنصة ضد الروبوتات بعد تجربة مسارات التحميل المتاحة. جرّب رابطًا عامًا آخر أو استخدم طريقة التنزيل الرسمية للمنصة.",
         ErrorCode.UNSUPPORTED_EXTRACTOR: "هذه المنصة أو صيغة الرابط غير مدعومة حاليًا.",
+        ErrorCode.FILE_TOO_LARGE: "الملف أكبر من حد التنزيل أو الرفع المسموح به. استخدم رابط التحميل المباشر إذا توفر.",
         ErrorCode.FORMAT_UNAVAILABLE: "الجودة المطلوبة غير متاحة لهذا الفيديو.",
         ErrorCode.EXTRACTOR_ERROR: "تعذر استخراج الرابط من المنصة، جرّب لاحقًا أو حدّث الرابط.",
         ErrorCode.NETWORK_TIMEOUT: "انتهت مهلة الاتصال بالمنصة. ستتم المحاولة لاحقًا.",
@@ -133,8 +134,9 @@ _USER_MESSAGES = {
         ErrorCode.MEDIA_UNAVAILABLE: "The media is unavailable or was removed.",
         ErrorCode.PRIVATE_MEDIA: "The media is private or the account cannot access it.",
         ErrorCode.AUTH_REQUIRED: "This URL requires login or valid cookies.",
-        ErrorCode.ANTI_BOT: "The platform anti-bot check blocked all available download routes. Refresh cookies or configure a proxy/Cobalt fallback and retry.",
+        ErrorCode.ANTI_BOT: "The platform anti-bot check blocked all available download routes. Try another public URL or use the provider’s official download option.",
         ErrorCode.UNSUPPORTED_EXTRACTOR: "This platform or URL format is not currently supported.",
+        ErrorCode.FILE_TOO_LARGE: "The file exceeds the configured download or upload limit. Use a direct download link if available.",
         ErrorCode.FORMAT_UNAVAILABLE: "The requested quality is unavailable for this media.",
         ErrorCode.EXTRACTOR_ERROR: "The platform could not be parsed. Try later or use an updated URL.",
         ErrorCode.NETWORK_TIMEOUT: "The platform connection timed out. Please try later.",

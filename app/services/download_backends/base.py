@@ -26,6 +26,7 @@ class DownloadRequest:
     cancel_event: threading.Event | None = None
     progress_hook: ProgressHook | None = None
     known_qualities: tuple[int, ...] | None = None
+    max_bytes: int | None = None
 
 
 @dataclass(slots=True)

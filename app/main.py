@@ -10,6 +10,7 @@ from pathlib import Path
 import uvicorn
 from aiogram import Bot
 from aiogram.types import BotCommand
+from aiogram.utils.backoff import BackoffConfig
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -48,11 +49,9 @@ def _redact(value: object) -> str:
 
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = _redact(record.msg)
-        if isinstance(record.args, tuple):
-            record.args = tuple(_redact(arg) for arg in record.args)
-        elif isinstance(record.args, dict):
-            record.args = {key: _redact(value) for key, value in record.args.items()}
+        # Format first so numeric logging placeholders retain their types.
+        record.msg = _redact(record.getMessage())
+        record.args = ()
         return True
 
 
@@ -76,6 +75,8 @@ async def _run_polling_forever(bot_instance: Bot) -> None:
                 bot_instance,
                 allowed_updates=dispatcher.resolve_used_update_types(),
                 handle_signals=False,
+                close_bot_session=False,
+                backoff_config=BackoffConfig(min_delay=5.0, max_delay=60.0, factor=1.5, jitter=0.5),
             )
         except asyncio.CancelledError:
             raise
@@ -184,6 +185,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         await bot.set_my_commands(
             [
                 BotCommand(command="download", description="تحميل فيديو"),
+                BotCommand(command="github", description="تحميل GitHub والملفات البرمجية"),
                 BotCommand(command="mp3", description="تحميل MP3"),
                 BotCommand(command="cut", description="قص فيديو"),
                 BotCommand(command="split", description="تقسيم فيديو"),

@@ -1,1 +1,1 @@
-RELEASE = "0.6.0-studio-agent-timeline"
+RELEASE = "0.6.1-artifact-downloads"

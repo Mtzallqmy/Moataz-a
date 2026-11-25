@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from app.db import DownloadJob, JobStatus, MediaMetadata, SessionLocal
+from app.services.artifact_urls import ARTIFACT_PLATFORMS
 from app.services.job_service import queue_existing_job
 
 
@@ -71,6 +72,8 @@ async def configure_and_queue_cut(
         job = await session.get(DownloadJob, job_id)
         if job is None:
             raise LookupError("Job not found")
+        if job.platform in ARTIFACT_PLATFORMS:
+            raise ValueError("Software files cannot be edited as media")
         if job.status != JobStatus.READY.value:
             raise ValueError("Job is not READY for cutting")
         metadata = await session.get(MediaMetadata, job_id)

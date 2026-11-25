@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from app.config import Settings, get_settings
 from app.errors import CancelledError, ErrorCode, classify_error
 from app.security import redact_secrets
+from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_platform
 from app.services.download_backends.base import (
     BackendUnavailableError,
     DownloadBackend,
@@ -31,6 +32,8 @@ class PlatformDetector:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower().removeprefix("www.")
         path = parsed.path.lower()
+        if provider := artifact_platform(url):
+            return DetectedMedia(provider, "document")
         if host in {"youtu.be", "youtube.com", "m.youtube.com", "music.youtube.com"}:
             platform = "youtube"
         elif host.endswith("instagram.com"):
@@ -65,6 +68,7 @@ class PlatformDetector:
 
 
 DEFAULT_ROUTES: dict[tuple[str, str], tuple[str, ...]] = {
+    **{(platform, "*"): ("artifact-http",) for platform in ARTIFACT_PLATFORMS},
     ("youtube", "*"): ("yt-dlp", "cobalt", "pytubefix"),
     ("instagram", "story"): ("gallery-dl", "instaloader", "yt-dlp", "cobalt"),
     ("instagram", "highlight"): ("gallery-dl", "instaloader", "yt-dlp", "cobalt"),

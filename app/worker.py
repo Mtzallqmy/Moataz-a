@@ -20,6 +20,7 @@ from app.errors import CancelledError, ErrorCode, classify_error, retry_delay, u
 from app.jobs import is_job_cancelled, record_job_event, set_job_status
 from app.progress import ProgressSnapshot
 from app.security import redact_secrets
+from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_platform, artifact_target
 from app.services.download_cache import cached_source, remember_source
 from app.services.downloader import get_downloader_service
 from app.services.job_service import deserialize_qualities
@@ -150,6 +151,8 @@ async def _download_with_retries(
     async with SessionLocal() as session:
         metadata = await session.get(MediaMetadata, job_id)
         is_local = bool(metadata and metadata.source == "local")
+        job_row = await session.get(DownloadJob, job_id) if artifact_platform(url) else None
+        artifact_limit = settings.telegram_upload_limit_bytes if job_row and job_row.chat_id else None
     if is_local:
         output = await cached_source(job_dir, "local")
         if output is None:
@@ -164,7 +167,8 @@ async def _download_with_retries(
             )
             return audio
         return output
-    if output := await cached_source(job_dir, quality):
+    cached = await cached_source(job_dir, quality, validate_media=False) if artifact_platform(url) else await cached_source(job_dir, quality)
+    if output := cached:
         await record_job_event(job_id, "SOURCE_REUSED", "retry uses downloaded source")
         return output
     for attempt in range(settings.job_max_retries + 1):
@@ -181,6 +185,7 @@ async def _download_with_retries(
                 job_key=str(job_id),
                 progress_hook=progress_hook,
                 known_qualities=known_qualities,
+                **({"max_bytes": artifact_limit} if artifact_limit else {}),
             )
             remember_source(job_dir, output, quality)
             return output
@@ -219,7 +224,11 @@ async def _upload_once(job_id: int, output: Path) -> None:
         media = FSInputFile(output)
         caption = f"✅ {output.stem[:900]}"
         suffix = output.suffix.lower()
-        if suffix == ".mp4":
+        async with SessionLocal() as session:
+            platform = await session.scalar(select(DownloadJob.platform).where(DownloadJob.id == job_id))
+        if platform in ARTIFACT_PLATFORMS:
+            await bot.send_document(chat_id=chat_id, document=media, caption=caption, request_timeout=600)
+        elif suffix == ".mp4":
             await bot.send_video(chat_id=chat_id, video=media, caption=caption, supports_streaming=True, request_timeout=600)
         elif suffix == ".mp3":
             await bot.send_audio(chat_id=chat_id, audio=media, caption=caption, request_timeout=600)
@@ -238,9 +247,11 @@ async def _upload_with_retries(job_id: int, output: Path, cancel_event: threadin
             return
         except Exception as exc:
             info = classify_error(exc)
-            if not info.retryable or attempt >= settings.job_max_retries:
+            if (not info.retryable and not isinstance(exc, TelegramRetryAfter)) or attempt >= settings.job_max_retries:
                 raise
             delay = retry_delay(attempt, base=settings.job_retry_base_seconds, cap=settings.job_retry_cap_seconds)
+            if isinstance(exc, TelegramRetryAfter):
+                delay = max(delay, float(exc.retry_after))
             await set_job_status(job_id, JobStatus.RETRYING, event_message=f"upload {info.code.value}; delay={delay:.2f}")
             await asyncio.sleep(delay)
             await set_job_status(job_id, JobStatus.UPLOADING, event_message="upload retry")
@@ -249,6 +260,8 @@ async def _upload_with_retries(job_id: int, output: Path, cancel_event: threadin
 async def process_download(job_id: int) -> None:
     cancel_event = _cancel_events.setdefault(job_id, threading.Event())
     await _update_worker(1)
+    is_artifact = False
+    source_url = ""
     try:
         async with SessionLocal() as session:
             result = await session.execute(
@@ -271,6 +284,7 @@ async def process_download(job_id: int) -> None:
             job.progress = 0.0
             await session.commit()
             source_url = job.source_url
+            is_artifact = job.platform in ARTIFACT_PLATFORMS
             quality = job.selected_quality or "best"
             cut_start = job.cut_start
             cut_end = job.cut_end
@@ -330,7 +344,7 @@ async def process_download(job_id: int) -> None:
         if await _is_cancelled(job_id, cancel_event):
             raise CancelledError("Job cancelled")
 
-        if cut_start is not None and cut_end is not None:
+        if not is_artifact and cut_start is not None and cut_end is not None:
             await set_job_status(job_id, JobStatus.CUTTING, event_message=f"mode={cut_mode}; {cut_start}-{cut_end}")
             await _edit_status(
                 job_id,
@@ -350,6 +364,11 @@ async def process_download(job_id: int) -> None:
             raise RuntimeError("File too large: output exceeds MAX_FILE_SIZE_MB")
 
         if chat_id != 0 and output.stat().st_size > settings.telegram_upload_limit_bytes:
+            if is_artifact:
+                target = artifact_target(source_url)
+                await set_job_status(job_id, JobStatus.FAILED, error="FILE_TOO_LARGE: Telegram upload limit", event_message="direct download link available")
+                await _edit_status(job_id, f"Job #{job_id}\nالملف يتجاوز حد الرفع في Telegram. استخدم الرابط المباشر.", markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌐 تنزيل مباشر", url=target.url)]]))
+                return
             await set_job_status(job_id, JobStatus.PROCESSING, event_message="adaptive Telegram size fit")
             output = await fit_media_for_upload(
                 output,
@@ -389,7 +408,8 @@ async def process_download(job_id: int) -> None:
         else:
             await record_job_event(job_id, JobStatus.COMPLETED.value, f"dashboard file ready; bytes={file_size}")
 
-        await _edit_status(job_id, f"Job #{job_id}\nStatus: COMPLETED ✅\nQuality: {quality}")
+        artifact_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌐 فتح المصدر", url=artifact_target(source_url).url)], [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="menu:home")]]) if is_artifact else None
+        await _edit_status(job_id, f"Job #{job_id}\nStatus: COMPLETED ✅\nQuality: {quality}", markup=artifact_markup)
     except asyncio.CancelledError:
         # A restart/deploy cancels asyncio tasks; it is not a Cancel button press.
         # Preserve an explicit cancellation already persisted by the user.
@@ -423,10 +443,13 @@ async def process_download(job_id: int) -> None:
                 error=f"{info.code.value}: {safe_message}",
                 event_message=info.code.value,
             )
+            markup = _retry_markup(job_id)
+            if is_artifact and info.code == ErrorCode.FILE_TOO_LARGE:
+                markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌐 تنزيل مباشر", url=artifact_target(source_url).url)]])
             await _edit_status(
                 job_id,
                 f"Job #{job_id}\nStatus: FAILED ❌\n{user_error_message(info)}",
-                markup=_retry_markup(job_id),
+                markup=markup,
             )
     finally:
         _cancel_events.pop(job_id, None)

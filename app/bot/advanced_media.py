@@ -23,6 +23,7 @@ from app.errors import CancelledError, ErrorCode, MediaError, classify_error, us
 from app.jobs import record_job_event, set_job_status
 from app.progress import ProgressSnapshot
 from app.security import canonicalize_url, redact_secrets
+from app.services.artifact_urls import ARTIFACT_PLATFORMS, artifact_target
 from app.services.download_cache import copy_saved_media, remember_source
 from app.services.downloader import MediaInfo
 from app.services.job_service import deserialize_formats, deserialize_qualities, queue_existing_job
@@ -86,6 +87,7 @@ def public_menu_keyboard(language: str = "ar") -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=labels["bulk"], callback_data="menu:bulk"),
                 InlineKeyboardButton(text=labels["saved"], callback_data="menu:saved"),
             ],
+            [InlineKeyboardButton(text="📦 GitHub / Files" if language == "en" else "📦 GitHub والملفات البرمجية", callback_data="menu:artifact")],
             [InlineKeyboardButton(text=labels["ai"], callback_data="menu:ai")],
             [InlineKeyboardButton(text=labels["studio"], callback_data="menu:studio")],
             [
@@ -409,6 +411,11 @@ async def reuse_menu(callback: CallbackQuery) -> None:
     if owned is None:
         return
     job, user = owned
+    if job.platform in ARTIFACT_PLATFORMS:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📦 تنزيل الملف مجددًا", callback_data=f"reuse:{job_id}:video")], [InlineKeyboardButton(text="🌐 رابط التنزيل", url=artifact_target(job.source_url).url)], [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="menu:home")]])
+        await feature_module._edit_callback(callback, f"📦 {job.title}", markup)
+        await callback.answer()
+        return
     text = (
         f"♻️ Reuse link\n{job.title or 'Media'}\nChoose a new operation. A fresh Job will be created."
         if user.language == "en"
@@ -425,7 +432,10 @@ async def reuse_action(callback: CallbackQuery) -> None:
     owned = await _owned_job(callback, source_job_id)
     if owned is None or callback.message is None:
         return
-    _, user = owned
+    original, user = owned
+    if original.platform in ARTIFACT_PLATFORMS and action != "video":
+        await callback.answer("الملفات البرمجية تدعم التنزيل الأصلي فقط.", show_alert=True)
+        return
     try:
         clone, info = await _clone_ready_job(
             source_job_id, user.id, callback.message.chat.id, local=action in {"localcut", "localsplit"},

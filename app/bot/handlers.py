@@ -47,6 +47,7 @@ def main_menu_keyboard(language: str) -> InlineKeyboardMarkup:  # noqa: ARG001
                 InlineKeyboardButton(text="📋 تحميلاتي", callback_data="history:0"),
             ],
             [InlineKeyboardButton(text="📥 تحميل عدة روابط", callback_data="menu:bulk")],
+            [InlineKeyboardButton(text="📦 GitHub والملفات البرمجية", callback_data="menu:artifact")],
             [
                 InlineKeyboardButton(text="🌐 اللغة", callback_data="menu:lang"),
                 InlineKeyboardButton(text="ℹ️ مساعدة", callback_data="menu:help"),

@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.db import DownloadJob, JobEvent, JobStatus, MediaMetadata, SessionLocal, User
 from app.errors import classify_error
 from app.security import canonicalize_url, redact_secrets
+from app.services.artifact_urls import ARTIFACT_PLATFORMS
 from app.services.downloader import MediaFormat, MediaInfo
 
 settings = get_settings()
@@ -285,6 +286,8 @@ async def queue_existing_job(job_id: int, quality: str, *, priority: int | None 
         if job.status not in {JobStatus.READY.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value}:
             raise ValueError("Job is not queueable")
         metadata = await session.get(MediaMetadata, job_id)
+        if job.platform in ARTIFACT_PLATFORMS and quality != "best":
+            raise ValueError("Software files only support the original format")
         if quality not in {"best", "audio", "mp3"}:
             available = deserialize_qualities(metadata.formats_json if metadata else "[]")
             height = int(quality.removesuffix("p"))

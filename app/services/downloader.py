@@ -20,6 +20,7 @@ from yt_dlp.networking.impersonate import ImpersonateTarget
 from app.config import Settings, get_settings
 from app.errors import CancelledError, ErrorCode, ErrorInfo, FormatUnavailableError, classify_error
 from app.security import assert_public_dns, canonicalize_url, redact_secrets
+from app.services.download_backends.artifact_backend import ArtifactBackend
 from app.services.download_backends.base import DownloadRequest, NormalizedMediaResult
 from app.services.download_backends.cobalt_backend import CobaltBackend
 from app.services.download_backends.health import BackendHealthRegistry
@@ -79,6 +80,7 @@ class MediaInfo:
     extractor: str | None = None
     is_playlist: bool = False
     playlist_count: int = 0
+    file_size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,7 +500,7 @@ class DownloaderService:
             cooldown_seconds=self.settings.download_backend_cooldown_seconds,
         )
         self.manager = manager or DownloadManager(
-            ProviderRouter([YtDlpBackend(self._engine), CobaltBackend(self.relay)], health=health)
+            ProviderRouter([YtDlpBackend(self._engine), CobaltBackend(self.relay), ArtifactBackend(self.settings)], health=health)
         )
 
     def _base_options(self) -> dict[str, Any]:
@@ -587,6 +589,7 @@ class DownloaderService:
             extractor=metadata.get("extractor") or result.provider,
             is_playlist=bool(metadata.get("is_playlist")),
             playlist_count=int(metadata.get("playlist_count") or 0),
+            file_size=metadata.get("file_size"),
         )
 
     def probe(self, url: str) -> MediaInfo:
@@ -620,6 +623,7 @@ class DownloaderService:
         job_key: str,
         progress_hook: ProgressHook | None = None,
         known_qualities: list[int] | None = None,
+        max_bytes: int | None = None,
     ) -> Path:
         guarded = self._guard(url)
         event = self._event(job_key)
@@ -635,6 +639,7 @@ class DownloaderService:
                         cancel_event=event,
                         progress_hook=progress_hook,
                         known_qualities=tuple(known_qualities) if known_qualities is not None else None,
+                        max_bytes=max_bytes,
                     )
                 )
             )

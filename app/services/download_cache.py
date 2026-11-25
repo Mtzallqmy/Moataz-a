@@ -40,14 +40,15 @@ def remember_source(directory: Path, path: Path, quality: str) -> None:
     temporary.replace(manifest)
 
 
-async def cached_source(directory: Path, quality: str) -> Path | None:
+async def cached_source(directory: Path, quality: str, *, validate_media: bool = True) -> Path | None:
     manifest = directory / "download-source.json"
     try:
         data = json.loads(manifest.read_text())
         if data["quality"] != quality:
             return None
         source = owned_file(directory / data["file"], directory)
-        await probe_media_file(source)
+        if validate_media:
+            await probe_media_file(source)
         return source
     except (OSError, ValueError, KeyError, TypeError, FFmpegError):
         return None

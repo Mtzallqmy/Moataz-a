@@ -64,6 +64,7 @@ def enhanced_menu_keyboard(language: str = "ar") -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=labels["history"], callback_data="history:0"),
             ],
             [InlineKeyboardButton(text=labels["bulk"], callback_data="menu:bulk")],
+            [InlineKeyboardButton(text="📦 GitHub / Files" if language == "en" else "📦 GitHub والملفات البرمجية", callback_data="menu:artifact")],
             [InlineKeyboardButton(text=labels["ai"], callback_data="menu:ai")],
             [
                 InlineKeyboardButton(text=labels["lang"], callback_data="menu:lang"),
