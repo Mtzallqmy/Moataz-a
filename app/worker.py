@@ -227,7 +227,10 @@ async def _upload_once(job_id: int, output: Path) -> None:
         async with SessionLocal() as session:
             platform = await session.scalar(select(DownloadJob.platform).where(DownloadJob.id == job_id))
         if platform in ARTIFACT_PLATFORMS:
-            await bot.send_document(chat_id=chat_id, document=media, caption=caption, request_timeout=600)
+            # The local server shares this container: file:// uploads the original
+            # file directly without copying it to a multipart spool.
+            document = output.resolve(strict=True).as_uri() if settings.telegram_local_api_enabled else media
+            await bot.send_document(chat_id=chat_id, document=document, caption=caption, request_timeout=1200 if settings.telegram_local_api_enabled else 600)
         elif suffix == ".mp4":
             await bot.send_video(chat_id=chat_id, video=media, caption=caption, supports_streaming=True, request_timeout=600)
         elif suffix == ".mp3":
@@ -364,7 +367,7 @@ async def process_download(job_id: int) -> None:
         if output.stat().st_size > size_limit:
             raise RuntimeError("File too large: output exceeds configured download limit")
 
-        linked_delivery = bool(is_artifact and chat_id != 0 and output.stat().st_size > settings.telegram_upload_limit_bytes)
+        linked_delivery = bool(is_artifact and chat_id != 0 and output.stat().st_size > settings.artifact_telegram_upload_limit_bytes)
         if not is_artifact and chat_id != 0 and output.stat().st_size > settings.telegram_upload_limit_bytes:
             await set_job_status(job_id, JobStatus.PROCESSING, event_message="adaptive Telegram size fit")
             output = await fit_media_for_upload(

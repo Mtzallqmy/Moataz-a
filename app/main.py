@@ -240,6 +240,8 @@ async def root():
         "status": "ok",
         "release": RELEASE,
         "mode": "polling",
+        "telegram_api": "local" if settings.telegram_local_api_enabled else "cloud",
+        "artifact_direct_upload_limit_mb": settings.artifact_telegram_upload_limit_bytes // (1024 * 1024),
         "queue": "inline",
         "render_queue": "inline",
         "dashboard": "/dashboard" if settings.dashboard_password else "disabled",

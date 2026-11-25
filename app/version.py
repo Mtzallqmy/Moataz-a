@@ -1,1 +1,1 @@
-RELEASE = "0.6.2-release-catalog-200mb"
+RELEASE = "0.6.3-local-bot-api-support"

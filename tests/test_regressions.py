@@ -12,7 +12,7 @@ def test_pyproject_has_no_redis_or_arq_runtime_dependency():
 
 def test_railway_uses_single_service_startup():
     text = Path("railway.json").read_text()
-    assert "python -m app.main" in text
+    assert "python -m app.local_bot_api" in text  # supervisor execs app.main in cloud mode
     assert "worker" not in text.lower()
     assert "redis" not in text.lower()
 

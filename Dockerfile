@@ -18,4 +18,4 @@ COPY app ./app
 RUN pip install --upgrade pip \
     && pip install ".[download-specialists]" "gallery-dl>=1.32.11,<2"
 RUN mkdir -p /data/downloads /data/projects /data/tmp
-CMD ["python", "-m", "app.main"]
+CMD ["python", "-m", "app.local_bot_api"]

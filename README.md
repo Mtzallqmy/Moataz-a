@@ -353,3 +353,16 @@ Use `/github` or `/file`, or the **GitHub والملفات البرمجية** en
 - Public Hugging Face `blob` or `resolve` file links and direct PyPI package files on `files.pythonhosted.org`.
 
 Software artifacts use the existing durable job queue and are uploaded unchanged as documents. The independent software download cap is 200 MiB (`ARTIFACT_DOWNLOAD_LIMIT_MB`). Files up to the Telegram upload limit (default 49 MiB) are sent as documents; larger files up to the software cap are delivered via a time-limited signed download link (`ARTIFACT_PUBLIC_BASE_URL`, or Railway public domain), along with the original provider link. Above 200 MiB the original link is displayed. It does not unpack, install or execute downloaded content. No extra database migration or provider credentials are required. Private or login-gated resources are not supported by this feature.
+
+
+### Optional official local Telegram Bot API (direct large documents)
+
+The existing cloud Bot API remains the default. To deliver original artifacts up to the configured 200 MiB limit as a single Telegram document, deploy `Dockerfile.telegram-local` and set the real application credentials and opt-in variables in the same Railway service:
+
+- Obtain your own `api_id` and `api_hash` at https://my.telegram.org/apps. Store them as secret variables `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`; never commit these values to the repository. The existing `BOT_TOKEN` is reused.
+- Set `RAILWAY_DOCKERFILE_PATH=Dockerfile.telegram-local` and `TELEGRAM_LOCAL_API_ENABLED=true` together, preserving the existing volume and database URL. The selected Dockerfile compiles the pinned official Telegram Bot API source without requiring credentials at build time.
+- A supervisor binds the local API to `127.0.0.1:8081`, confirms its listener, performs Telegram's required one-time cloud `logOut`, then confirms bot authentication before starting the existing service. Its migration marker and TDLib state persist under `/data/telegram-bot-api`. No new public API port is exposed. A Telegram cloud login may remain unavailable for ten minutes after the migration, so do not enable until the configured credentials are ready.
+- The application uploads original software files using the shared local path, not a link and not an archive of parts. Other existing media limits remain unchanged.
+- To move back to the cloud, first log the bot out of the local API using Telegram's documented migration process while the local server is running; then disable the local flag, clear the corresponding migration marker for a future switch, and redeploy the ordinary Dockerfile. Do not log in simultaneously to the cloud and local servers.
+
+Official reference: https://core.telegram.org/bots/api#using-a-local-bot-api-server .

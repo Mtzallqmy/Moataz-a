@@ -1,0 +1,35 @@
+# Official Telegram Bot API, built from a pinned upstream revision.
+FROM python:3.12-slim-trixie AS telegram-api-build
+ARG TELEGRAM_BOT_API_COMMIT=5df614c91dab8662cfbb24a501ec89949fdcfebb
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git g++ make cmake gperf libssl-dev zlib1g-dev ca-certificates \
+    && git clone https://github.com/tdlib/telegram-bot-api.git /src/telegram-bot-api \
+    && git -C /src/telegram-bot-api checkout "${TELEGRAM_BOT_API_COMMIT}" \
+    && git -C /src/telegram-bot-api submodule update --init --recursive \
+    && cmake -S /src/telegram-bot-api -B /src/telegram-bot-api/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /src/telegram-bot-api/build --target install -j 2 \
+    && strip /usr/local/bin/telegram-bot-api
+
+FROM python:3.12-slim-trixie
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+ENV PYTUBEFIX_ENABLED=true
+WORKDIR /app
+ARG DENO_VERSION=2.9.6
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip libssl3t64 zlib1g libstdc++6 \
+    && curl -fsSLo /tmp/deno.zip "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+    && echo "394f07f4da2bebe6ce6f1e7ce0fa16429b29b08c35e3fac3fe25972676dff4b2  /tmp/deno.zip" | sha256sum -c - \
+    && unzip -q /tmp/deno.zip -d /usr/local/bin \
+    && chmod 0755 /usr/local/bin/deno \
+    && deno --version \
+    && apt-get purge -y --auto-remove curl unzip \
+    && rm -f /tmp/deno.zip \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=telegram-api-build /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+RUN telegram-bot-api --help >/dev/null
+COPY pyproject.toml README.md ./
+COPY app ./app
+RUN pip install --upgrade pip \
+    && pip install ".[download-specialists]" "gallery-dl>=1.32.11,<2"
+RUN mkdir -p /data/downloads /data/projects /data/tmp
+CMD ["python", "-m", "app.local_bot_api"]

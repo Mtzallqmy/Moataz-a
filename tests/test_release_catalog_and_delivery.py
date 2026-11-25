@@ -211,7 +211,8 @@ async def test_signed_file_endpoint_supports_range_and_rejects_invalid_token(tmp
         assert (await client.get(link.replace('token=', 'token=bad'))).status_code == 404
 
 
-async def test_worker_completes_large_artifact_with_link_without_upload(tmp_path, monkeypatch):
+@pytest.mark.parametrize("local_mode", [False, True])
+async def test_worker_delivers_large_artifact_for_api_mode(tmp_path, monkeypatch, local_mode):
     from unittest.mock import AsyncMock
 
     from app import worker
@@ -220,6 +221,7 @@ async def test_worker_completes_large_artifact_with_link_without_upload(tmp_path
     monkeypatch.setattr(worker.settings, 'download_dir', tmp_path)
     monkeypatch.setattr(worker.settings, 'artifact_public_base_url', 'https://bot.example.com')
     monkeypatch.setattr(worker.settings, 'max_file_size_mb', 32)
+    monkeypatch.setattr(worker.settings, 'telegram_local_api_enabled', local_mode)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
@@ -241,20 +243,27 @@ async def test_worker_completes_large_artifact_with_link_without_upload(tmp_path
     monkeypatch.setattr(worker, '_download_with_retries', AsyncMock(return_value=output))
     monkeypatch.setattr(worker, '_update_worker', AsyncMock())
     monkeypatch.setattr(worker, '_record_backend_route', AsyncMock())
-    uploads = AsyncMock(side_effect=AssertionError('Large artifacts must use link delivery'))
+    uploads = AsyncMock() if local_mode else AsyncMock(side_effect=AssertionError('Cloud large artifacts must use link delivery'))
     monkeypatch.setattr(worker, '_upload_with_retries', uploads)
     edited = AsyncMock()
     monkeypatch.setattr(worker, '_edit_status', edited)
     await worker.process_download(job_id)
-    uploads.assert_not_called()
+    if local_mode:
+        uploads.assert_awaited_once()
+        assert uploads.await_args.args[:2] == (job_id, output)
+    else:
+        uploads.assert_not_called()
     async with SessionLocal() as session:
         job = await session.get(DownloadJob, job_id)
         assert job.status == JobStatus.COMPLETED.value
         assert job.file_size == 129*MIB
         assert job.output_path == str(output)
     markup = edited.await_args.kwargs['markup']
-    assert markup.inline_keyboard[0][0].url.startswith(f'https://bot.example.com/files/artifacts/{job_id}?')
-    assert markup.inline_keyboard[1][0].url == url
+    if local_mode:
+        assert markup.inline_keyboard[0][0].url == url
+    else:
+        assert markup.inline_keyboard[0][0].url.startswith(f'https://bot.example.com/files/artifacts/{job_id}?')
+        assert markup.inline_keyboard[1][0].url == url
 
 
 async def test_release_listing_includes_recent_beta(monkeypatch):

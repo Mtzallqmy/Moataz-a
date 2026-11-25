@@ -219,7 +219,7 @@ async def _show_analysis(
         target = artifact_target(job.source_url)
         limit = settings.artifact_download_limit_bytes
         large = info.file_size is not None and info.file_size > limit
-        link_delivery = info.file_size is not None and info.file_size > settings.telegram_upload_limit_bytes
+        link_delivery = info.file_size is not None and info.file_size > settings.artifact_telegram_upload_limit_bytes
         if language == "en":
             label, link, cancel = "📦 Download original file", "🌐 Open source link", "✖️ Cancel"
             text = f"Job #{job.id}\n📦 {info.title}\nProvider: {info.platform}\nSize: {format_bytes(info.file_size)}\nDownload limit: {format_bytes(limit)}"

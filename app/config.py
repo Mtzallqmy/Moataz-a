@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     max_video_duration_seconds: int = 14_400
     max_file_size_mb: int = 512
     telegram_upload_limit_mb: int = 49
+    telegram_local_api_enabled: bool = False
+    telegram_local_api_port: int = Field(default=8081, ge=1024, le=65535)
     artifact_download_limit_mb: int = Field(default=200, ge=1, le=4096)
     artifact_public_base_url: str = ""
     artifact_link_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
@@ -279,6 +281,12 @@ class Settings(BaseSettings):
     @property
     def artifact_download_limit_bytes(self) -> int:
         return self.artifact_download_limit_mb * 1024 * 1024
+
+    @property
+    def artifact_telegram_upload_limit_bytes(self) -> int:
+        # The official local Bot API supports 2000 MB; keep the configured artifact cap.
+        limit = 2000 if self.telegram_local_api_enabled else min(49, self.telegram_upload_limit_mb)
+        return min(self.artifact_download_limit_bytes, limit * 1024 * 1024)
 
     @property
     def telegram_upload_limit_bytes(self) -> int:
