@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import math
 import re
+import logging
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
